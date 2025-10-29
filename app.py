@@ -738,25 +738,8 @@ def run_crosstab(df, suitable_cols):
         
         st.dataframe(crosstab_df)
         
-        if st.checkbox("ヒートマップで表示", key=f"ct_heatmap_{key_base}"):
-             try:
-                 # import altair as alt (★) L11に移動済み
-                 ct_long = crosstab_df.stack().reset_index().rename(columns={0: 'count'})
-                 heatmap = alt.Chart(ct_long).mark_rect().encode(
-                     x=alt.X(col2, type='ordinal', title=col2), # (★) L615の修正
-                     y=alt.Y(col1, type='ordinal', title=col1), # (★) L615の修正
-                     color=alt.Color('count', type='quantitative', title='Count', scale=alt.Scale(range='heatmap')), # (★) L615の修正
-                     tooltip=[col1, col2, 'count']
-                 ).properties(
-                     title=f"クロス集計: {col1} vs {col2}"
-                 ).interactive()
-                 st.altair_chart(heatmap, use_container_width=True)
-             except ImportError:
-                 st.warning("ヒートマップ表示には `altair` が必要です。`st.dataframe` で表示します。")
-             except Exception as he:
-                 st.warning(f"ヒートマップ描画エラー: {he}。`st.dataframe` で表示します。")
-        
-        return crosstab_df # (★) 
+        if st.checkbox("ヒートマップで表示", key=f"ct_heatmap_{key_base}"):    
+            return crosstab_df # (★) 
     except Exception as e:
         st.error(f"クロス集計の処理中にエラー: {e}")
         logger.error(f"run_crosstab error: {e}", exc_info=True)
