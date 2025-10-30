@@ -7,13 +7,13 @@ import json
 import logging
 import time
 import spacy
-import altair as alt  # (★) L11: Altair (L630から移動)
+import altair as alt  # L11: Altair (L630から移動)
 from io import StringIO, BytesIO
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 
-# (★) L17-L22: 外部ライブラリ ( requirements.txt に必要 )
+# L17-L22: 外部ライブラリ ( requirements.txt に必要 )
 # 必要なライブラリ (Excel)
 try:
     import openpyxl
@@ -25,17 +25,17 @@ try:
 except ImportError:
     st.error("spaCy日本語モデル (ja_core_news_sm) が見つかりません。`python -m spacy download ja_core_news_sm` してください。")
 
-# (★) L27: 定数 (KISS)
+# L27: 定数 (KISS)
 # AIモデルを定数化 (KISS)
 # ( gemini-1.5-flash-latest や gemini-2.5-flash-lite など)
 AI_MODEL_NAME = "gemini-2.5-flash-lite"
-# (★) L31: バッチサイズと待機時間も定数化 (KISS)
+# L31: バッチサイズと待機時間も定数化 (KISS)
 FILTER_BATCH_SIZE = 50
 FILTER_SLEEP_TIME = 4.1  # 15 RPM (60s / 15)
 TAGGING_BATCH_SIZE = 10
 TAGGING_SLEEP_TIME = 4.1  # 15 RPM
 
-# (★) L37: 地名辞書
+# L37: 地名辞書
 # geography_db.py が見つからない場合のエラーハンドリング (KISS)
 try:
     from geography_db import JAPAN_GEOGRAPHY_DB
@@ -65,18 +65,18 @@ if not logger.handlers:
     handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
     logger.addHandler(handler)
 
-# (★) --- L63: キャッシュ (KISS / SRP) ---
+# --- L63: キャッシュ (KISS / SRP) ---
 # LLMとspaCyモデルのロードを @st.cache_resource でキャッシュする
 # これにより、手動での session_state 管理 (L1385など) が不要になる
 
-@st.cache_resource  # (★) キャッシュ
+@st.cache_resource  # キャッシュ
 def get_llm():
     """LLM (Google Gemini) モデルをロード・キャッシュする"""
     try:
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
             logger.error("GOOGLE_API_KEY がありません。")
-            # st.error("APIキーがありません") # (★) 関数内でのUI表示は避ける (SRP)
+            # st.error("APIキーがありません") # 関数内でのUI表示は避ける (SRP)
             return None
             
         llm = ChatGoogleGenerativeAI(
@@ -91,7 +91,7 @@ def get_llm():
         logger.error(f"LLMの初期化に失敗: {e}", exc_info=True)
         return None
 
-@st.cache_resource  # (★) キャッシュ
+@st.cache_resource  # キャッシュ
 def load_spacy_model():
     """spaCyの日本語モデル(ja_core_news_sm)をロード・キャッシュする"""
     try:
@@ -101,7 +101,7 @@ def load_spacy_model():
         return nlp
     except Exception as e:
         logger.error(f"Failed to load spaCy model: {e}", exc_info=True)
-        # (★) st.error は main / render 関数で行う (SRP)
+        # st.error は main / render 関数で行う (SRP)
         return None
 
 # --- L106-L138: ファイル読み込みヘルパー (read_file) ---
@@ -112,18 +112,18 @@ def read_file(file):
     logger.info(f"ファイル読み込み開始: {file_name}")
     try:
         if file_name.endswith('.csv'):
-            # (★) 文字コードを自動判別 (KISS)
+            # 文字コードを自動判別 (KISS)
             try:
                 # 最初にUTF-8-SIG (BOM付き) を試す
                 content = file.getvalue().decode('utf-8-sig')
                 df = pd.read_csv(StringIO(content))
             except UnicodeDecodeError:
-                # (★) Shift_JIS (CP932) で再試行
+                # Shift_JIS (CP932) で再試行
                 logger.warning(f"UTF-8-SIGデコード失敗。CP932で再試行: {file_name}")
                 content = file.getvalue().decode('cp932')
                 df = pd.read_csv(StringIO(content))
         elif file_name.endswith(('.xlsx', '.xls')):
-            # (★) BytesIO を使用 (KISS)
+            # BytesIO を使用 (KISS)
             df = pd.read_excel(BytesIO(file.getvalue()), engine='openpyxl')
         else:
             logger.warning(f"サポート外のファイル形式: {file_name}")
@@ -137,15 +137,15 @@ def read_file(file):
 
 # --- L140: AI関数 (キャッシュ利用版) ---
 
-def get_dynamic_categories(analysis_prompt):  # (★) llm 引数を削除 (SRP)
+def get_dynamic_categories(analysis_prompt):  # llm 引数を削除 (SRP)
     """
     ユーザーの分析指針に基づき、AIが動的なカテゴリをJSON形式で生成する。
     """
-    llm = get_llm()  # (★) キャッシュされたLLMを直接呼び出し
+    llm = get_llm()  # キャッシュされたLLMを直接呼び出し
     if llm is None:
         logger.error("get_dynamic_categories: LLM is not available.")
         st.error("AIモデルが利用できません。サイドバーでAPIキーを設定してください。")
-        return None  # (★)
+        return None  #
         
     logger.info("動的カテゴリ生成AIを呼び出し...")
     prompt = PromptTemplate.from_template(
@@ -177,11 +177,11 @@ def get_dynamic_categories(analysis_prompt):  # (★) llm 引数を削除 (SRP)
         st.error(f"AIカテゴリ生成中にエラーが発生しました: {e}")
         return None
 
-def filter_relevant_data_by_ai(df_batch, analysis_prompt):  # (★) llm 引数を削除 (SRP)
+def filter_relevant_data_by_ai(df_batch, analysis_prompt):  # llm 引数を削除 (SRP)
     """
     AIを使い、分析指針と無関係な行をフィルタリングする (relevant: true/false)。
     """
-    llm = get_llm()  # (★) キャッシュされたLLMを直接呼び出し
+    llm = get_llm()  # キャッシュされたLLMを直接呼び出し
     if llm is None:
         logger.error("filter_relevant_data_by_ai: LLM is not available.")
         st.error("AIモデルが利用できません。APIキーを確認してください。")
@@ -237,9 +237,9 @@ def filter_relevant_data_by_ai(df_batch, analysis_prompt):  # (★) llm 引数�
         st.error(f"AIフィルタリング処理エラー: {e}")
         return df_batch[['id']].copy().assign(relevant=True)
 
-def perform_ai_tagging(df_batch, categories_to_tag, analysis_prompt=""):  # (★) llm 引数を削除 (SRP)
+def perform_ai_tagging(df_batch, categories_to_tag, analysis_prompt=""):  # llm 引数を削除 (SRP)
     """テキストのバッチを受け取り、AIが【指定されたカテゴリ定義】に基づいて直接タグ付けを行う"""
-    llm = get_llm()  # (★) キャッシュされたLLMを直接呼び出し
+    llm = get_llm()  # キャッシュされたLLMを直接呼び出し
     if llm is None:
         logger.error("perform_ai_tagging: LLM is not available.")
         st.error("AIモデルが利用できません。APIキーを確認してください。")
@@ -370,7 +370,7 @@ def perform_ai_tagging(df_batch, categories_to_tag, analysis_prompt=""):  # (★
     except Exception as e:
         logger.error(f"AIタグ付けバッチ処理中エラー: {e}", exc_info=True)
         st.error(f"AIタグ付け処理エラー: {e}")
-        return pd.DataFrame() # (★) 失敗時は空のDFを返す
+        return pd.DataFrame() # 失敗時は空のDFを返す
 
 # --- L322-L438: Step B (分析手法提案) ---
 # (既存の L322-L438 (suggest_analysis_techniques 関数) をそのままここに貼り付け)
@@ -445,7 +445,7 @@ def suggest_analysis_techniques(df):
                 "suitable_cols": flag_cols + other_categorical
             })
 
-        # (★) 優先度3: 共起ネットワーク分析 (L438の指示)
+        # 優先度3: 共起ネットワーク分析 (L438の指示)
         if len(flag_cols) >= 2:
             potential_suggestions.append({
                 "priority": 3, "name": "共起ネットワーク分析",
@@ -454,7 +454,7 @@ def suggest_analysis_techniques(df):
                 "suitable_cols": flag_cols
             })
 
-        # (★) 優先度4: グループ比較 (L438の指示)
+        # 優先度4: グループ比較 (L438の指示)
         if numeric_cols and flag_cols:
             potential_suggestions.append({
                 "priority": 4, "name": "カテゴリ別集計（グループ比較）",
@@ -463,7 +463,7 @@ def suggest_analysis_techniques(df):
                 "suitable_cols": {"numeric": numeric_cols, "grouping": flag_cols}
             })
 
-        # (★) 優先度5: 時系列分析 (L438の指示)
+        # 優先度5: 時系列分析 (L438の指示)
         if datetime_cols and flag_cols:
              potential_suggestions.append({
                 "priority": 5, "name": "時系列キーワード分析",
@@ -472,7 +472,7 @@ def suggest_analysis_techniques(df):
                 "suitable_cols": {"datetime": datetime_cols, "keywords": flag_cols}
             })
 
-        # (★) 優先度6: テキストマイニング (L438の指示)
+        # 優先度6: テキストマイニング (L438の指示)
         potential_suggestions.append({
             "priority": 6, "name": "テキストマイニング（頻出単語など）",
             "description": "原文テキストから頻出する単語を抽出し、どのような言葉が多く使われているか全体像を把握します。",
@@ -480,7 +480,7 @@ def suggest_analysis_techniques(df):
             "suitable_cols": ['ANALYSIS_TEXT_COLUMN']
         })
 
-        # (★) 優先度7: 多変量解析 (L438の指示)
+        # 優先度7: 多変量解析 (L438の指示)
         if len(numeric_cols) >= 3:
              potential_suggestions.append({
                  "priority": 7, "name": "主成分分析 (PCA) / 因子分析",
@@ -492,18 +492,18 @@ def suggest_analysis_techniques(df):
         # 優先度でソートし、上位8件程度を返す (L438の指示)
         suggestions = sorted(potential_suggestions, key=lambda x: x['priority'])
         logger.info(f"提案手法(ソート後): {[s['name'] for s in suggestions]}")
-        return suggestions[:8] # (★) 上限を 8 に変更
+        return suggestions[:8] # 上限を 8 に変更
 
     except Exception as e:
         logger.error(f"分析手法提案中にエラー: {e}", exc_info=True); st.warning(f"分析手法提案中にエラー: {e}")
     return suggestions
 
-def get_suggestions_from_prompt(user_prompt, df, existing_suggestions):  # (★) llm 引数を削除 (SRP)
+def get_suggestions_from_prompt(user_prompt, df, existing_suggestions):  # llm 引数を削除 (SRP)
     """
     ユーザーの自由記述プロンプトとデータ構造に基づき、AIが追加の分析手法を提案する。
     """
     logger.info("AIプロンプトベースの分析提案を開始...")
-    llm = get_llm()  # (★) キャッシュされたLLMを直接呼び出し
+    llm = get_llm()  # キャッシュされたLLMを直接呼び出し
     if llm is None:
         logger.error("get_suggestions_from_prompt: LLM is not available.")
         return []
@@ -564,7 +564,7 @@ def display_suggestions(suggestions, df):
     st.subheader("提案された分析手法:")
     st.markdown("---")
     
-    # (★) L497 のロジック (デフォルト5件選択)
+    # L497 のロジック (デフォルト5件選択)
     default_selection_names = [s['name'] for s in suggestions[:min(len(suggestions), 5)]] 
     
     st.markdown("実行したい分析手法を選択（複数可）:")
@@ -581,7 +581,7 @@ def display_suggestions(suggestions, df):
         if is_checked:
             selected_technique_names.append(name)
     
-    # (★) L515-L519: 不要なコメントアウトを削除 (KISS)
+    # L515-L519: 不要なコメントアウトを削除 (KISS)
     
     if selected_technique_names:
         st.markdown("---")
@@ -595,7 +595,7 @@ def display_suggestions(suggestions, df):
     
     st.markdown("---")
 
-    # (★) L525: キー名変更済みのボタン (execute_button_C_v2)
+    # L525: キー名変更済みのボタン (execute_button_C_v2)
     if st.button("選択した手法で分析を実行 (Step Cへ)", key="execute_button_C_v2", disabled=not selected_technique_names, type="primary"):
          if selected_technique_names:
              st.session_state.chosen_analysis_list = selected_technique_names
@@ -657,7 +657,7 @@ def run_simple_count(df, flag_cols):
     """単純集計（頻度分析）を実行し、Streamlitで可視化する"""
     if not flag_cols:
         st.warning("集計対象のキーワード列（suitable_cols）が見つかりません。")
-        return None # (★)
+        return None #
     
     col_to_analyze = st.selectbox(
         "集計するキーワード列を選択:", 
@@ -667,7 +667,7 @@ def run_simple_count(df, flag_cols):
     
     if not col_to_analyze or col_to_analyze not in df.columns:
         st.error(f"列 '{col_to_analyze}' がデータに存在しません。")
-        return None # (★)
+        return None #
     try:
         s = df[col_to_analyze].astype(str).str.split(', ').explode()
         s = s[s.str.strip() != ''] # 空白を除去
@@ -675,44 +675,44 @@ def run_simple_count(df, flag_cols):
         
         if s.empty:
             st.info("集計対象のキーワードがありませんでした。")
-            return None # (★)
+            return None #
             
         counts = s.value_counts().head(20) # 上位20件
         st.bar_chart(counts)
         with st.expander("詳細データ（上位20件）"):
             st.dataframe(counts)
-        return counts # (★) 
+        return counts # 
             
     except Exception as e:
         st.error(f"単純集計の処理中にエラー: {e}")
         logger.error(f"run_simple_count error: {e}", exc_info=True)
-    return None # (★)
+    return None #
 
 def run_basic_stats(df, numeric_cols):
     """基本統計量を実行し、Streamlitで表示する"""
     if not numeric_cols:
         st.warning("集計対象の数値列（suitable_cols）が見つかりません。")
-        return None # (★)
+        return None #
     
     existing_cols = [col for col in numeric_cols if col in df.columns]
     if not existing_cols:
         st.error("指定された数値列がデータに存在しません。")
-        return None # (★)
+        return None #
         
     stats_df = df[existing_cols].describe()
     st.dataframe(stats_df)
-    return stats_df # (★)
+    return stats_df #
 
 def run_crosstab(df, suitable_cols):
     """クロス集計を実行し、Streamlitで表示する"""
     if not suitable_cols or len(suitable_cols) < 2:
         st.warning("クロス集計には2つ以上の列が必要です。")
-        return None # (★)
+        return None #
 
     existing_cols = [col for col in suitable_cols if col in df.columns]
     if len(existing_cols) < 2:
         st.error(f"データ内に存在する分析対象列が2つ未満です: {existing_cols}")
-        return None # (★)
+        return None #
 
     st.info(f"分析可能な列: {', '.join(existing_cols)}")
     
@@ -722,73 +722,75 @@ def run_crosstab(df, suitable_cols):
     options_col2 = [c for c in existing_cols if c != col1]
     if not options_col2:
         st.error("2つ目の列を選択できません。")
-        return None # (★)
+        return None #
         
     col2 = st.selectbox("列 (Column) に設定する列:", options_col2, key=f"ct_col_{key_base}")
 
     if not col1 or not col2:
-        return None # (★)
+        return None #
 
     try:
         crosstab_df = pd.crosstab(df[col1].astype(str), df[col2].astype(str))
         
         if crosstab_df.empty:
             st.info("クロス集計の結果、データがありませんでした。")
-            return None # (★)
+            return None
         
         st.dataframe(crosstab_df)
         
         if st.checkbox("ヒートマップで表示", key=f"ct_heatmap_{key_base}"):    
-            return crosstab_df # (★) 
+            return crosstab_df # 
     except Exception as e:
         st.error(f"クロス集計の処理中にエラー: {e}")
         logger.error(f"run_crosstab error: {e}", exc_info=True)
-    return None # (★)
+    return None #
 
 def run_timeseries(df, suitable_cols_dict):
     """時系列分析を実行し、Streamlitで可視化する"""
     if not isinstance(suitable_cols_dict, dict) or 'datetime' not in suitable_cols_dict or 'keywords' not in suitable_cols_dict:
         st.warning("時系列分析のための列情報（datetime, keywords）が不十分です。")
-        return None # (★)
+        return None #
         
     dt_cols = [col for col in suitable_cols_dict['datetime'] if col in df.columns]
     kw_cols = [col for col in suitable_cols_dict['keywords'] if col in df.columns]
 
-    if not dt_cols: st.error("日時列が見つかりません。"); return None # (★)
-    if not kw_cols: st.error("キーワード列が見つかりません。"); return None # (★)
+    if not dt_cols: st.error("日時列が見つかりません。"); return None #
+    if not kw_cols: st.error("キーワード列が見つかりません。"); return None #
 
     key_base = dt_cols[0]
     dt_col = st.selectbox("使用する日時列:", dt_cols, key=f"ts_dt_{key_base}")
     kw_col = st.selectbox("集計するキーワード列:", kw_cols, key=f"ts_kw_{key_base}")
 
     if not dt_col or not kw_col:
-        return None # (★)
+        return None #
 
     try:
         df_copy = df[[dt_col, kw_col]].copy()
         
         df_copy[dt_col] = pd.to_datetime(df_copy[dt_col], errors='coerce')
         df_copy = df_copy.dropna(subset=[dt_col])
-        if df_copy.empty: st.info("有効な日時データがありません。"); return None # (★)
+        if df_copy.empty: st.info("有効な日時データがありません。"); return None #
 
         df_copy[kw_col] = df_copy[kw_col].astype(str)
         df_copy = df_copy[df_copy[kw_col].str.strip() != ''] 
-        if df_copy.empty: st.info(f"「{kw_col}」に有効なキーワードがありませんでした。"); return None # (★)
+        if df_copy.empty: st.info(f"「{kw_col}」に有効なキーワードがありませんでした。"); return None #
 
         time_df = df_copy.set_index(dt_col).resample('D').size().rename("投稿数")
         
-        if time_df.empty: st.info("時系列集計の結果、データがありませんでした。"); return None # (★)
-            
+        if time_df.empty: st.info("時系列集計の結果、データがありませんでした。"); return None #
+        
+        time_df.index.name = "日時"
+        
         st.line_chart(time_df)
         with st.expander("詳細データ"):
             st.dataframe(time_df)
         
-        return time_df # (★) 
+        return time_df # 
             
     except Exception as e:
         st.error(f"時系列分析の処理中にエラー: {e}")
         logger.error(f"run_timeseries error: {e}", exc_info=True)
-    return None # (★)
+    return None #
 
 def run_text_mining(df, text_col='ANALYSIS_TEXT_COLUMN'):
     """
@@ -797,9 +799,9 @@ def run_text_mining(df, text_col='ANALYSIS_TEXT_COLUMN'):
     """
     if text_col not in df.columns or df[text_col].empty:
         st.warning(f"分析対象のテキスト列 '{text_col}' がないか、空です。")
-        return None # (★)
+        return None #
 
-    nlp = load_spacy_model() # (★) キャッシュされたモデルを直接呼び出し
+    nlp = load_spacy_model() # キャッシュされたモデルを直接呼び出し
     if nlp is None:
         st.error("spaCy日本語モデルのロードに失敗しました。")
         return None
@@ -810,7 +812,7 @@ def run_text_mining(df, text_col='ANALYSIS_TEXT_COLUMN'):
         texts = df[text_col].dropna().astype(str)
         if texts.empty:
             st.warning("分析対象のテキストがありません。")
-            return None # (★)
+            return None #
             
         words = []
         target_pos = {'NOUN', 'PROPN', 'ADJ'}
@@ -826,7 +828,7 @@ def run_text_mining(df, text_col='ANALYSIS_TEXT_COLUMN'):
 
         if not words:
             st.warning("抽出可能な有効な単語が見つかりませんでした。")
-            return None # (★)
+            return None #
 
         word_counts = pd.Series(words).value_counts().head(30) # 上位30件
 
@@ -835,16 +837,16 @@ def run_text_mining(df, text_col='ANALYSIS_TEXT_COLUMN'):
         with st.expander("詳細データ（Top 30）"):
             st.dataframe(word_counts.reset_index(name="出現回数").rename(columns={"index": "単語"}))
 
-        # (★) L727: 重複した dataframe 呼び出しを削除 (KISS)
+        # L727: 重複した dataframe 呼び出しを削除 (KISS)
         
-        return word_counts # (★) 
+        return word_counts # 
     except Exception as e:
         st.error(f"テキストマイニング処理中にエラー: {e}")
         logger.error(f"run_text_mining error: {e}", exc_info=True)
-    return None # (★)
+    return None #
 
-# --- (★) L752: Part 2 (render関数, main) は次のチャットで提案します ---
-# (★) --- L752: UI更新ヘルパー (DRY原則) ---
+# --- L752: Part 2 (render関数, main) は次のチャットで提案します ---
+# --- L752: UI更新ヘルパー (DRY原則) ---
 def update_progress_ui(progress_placeholder, log_placeholder, processed_rows, total_rows, message_prefix):
     """
     Step A の進捗バーとログエリアを更新する (DRY)
@@ -865,23 +867,23 @@ def render_step_a():
     """Step A: タグ付け処理のUIを描画する"""
     st.title("🏷️ テキストデータのAIタグ付け (Step A)")
 
-    # (★) Step A 固有のセッションステートをここで初期化 (SRP)
+    # Step A 固有のセッションステートをここで初期化 (SRP)
     if 'cancel_analysis' not in st.session_state: st.session_state.cancel_analysis = False
     if 'generated_categories' not in st.session_state: st.session_state.generated_categories = {}
     if 'selected_categories' not in st.session_state: st.session_state.selected_categories = set()
-    if 'api_key_A' not in st.session_state: st.session_state.api_key_A = "" # (★) L1096 (旧 L1383) から移動
-    if 'analysis_prompt_A' not in st.session_state: st.session_state.analysis_prompt_A = "" # (★) L1092 (旧 L1379) から移動
-    if 'selected_text_col' not in st.session_state: st.session_state.selected_text_col = {} # (★) L1094 (旧 L1381) から移動
-    if 'tagged_df_A' not in st.session_state: st.session_state.tagged_df_A = pd.DataFrame() # (★) L1090 (旧 L1377) から移動
+    if 'api_key_A' not in st.session_state: st.session_state.api_key_A = "" # L1096 (旧 L1383) から移動
+    if 'analysis_prompt_A' not in st.session_state: st.session_state.analysis_prompt_A = "" # L1092 (旧 L1379) から移動
+    if 'selected_text_col' not in st.session_state: st.session_state.selected_text_col = {} # L1094 (旧 L1381) から移動
+    if 'tagged_df_A' not in st.session_state: st.session_state.tagged_df_A = pd.DataFrame() # L1090 (旧 L1377) から移動
 
-    # (★) L754-L757: 不要なコメントアウトを削除 (KISS)
+    # L754-L757: 不要なコメントアウトを削除 (KISS)
     
     st.header("Step 1: 分析対象ファイルのアップロード")
     uploaded_files = st.file_uploader("分析したい Excel / CSV ファイル（複数可）", type=['csv', 'xlsx', 'xls'], accept_multiple_files=True, key="uploader_A")
     
     if not uploaded_files:
         st.info("分析を開始するには、ExcelまたはCSVファイルをアップロードしてください。")
-        return # (★) ファイルがなければここで終了 (KISS)
+        return # ファイルがなければここで終了 (KISS)
     
     valid_files_data = {}
     error_messages = []
@@ -900,11 +902,11 @@ def render_step_a():
         placeholder="例: 広島県の観光に関するInstagramの投稿。無関係な地域の投稿や、単なる挨拶・宣伝は除外したい。",
         key="analysis_prompt_input_A"
     )
-    st.session_state.analysis_prompt_A = analysis_prompt # (★) L781: セッションに保存
+    st.session_state.analysis_prompt_A = analysis_prompt # L781: セッションに保存
 
     if not analysis_prompt.strip():
         st.warning("分析指針は必須です。AIがデータを理解するために目的を入力してください。")
-        return # (★) 指針がなければここで終了 (KISS)
+        return # 指針がなければここで終了 (KISS)
 
     st.header("Step 3: AIによるカテゴリ候補の生成")
     if st.button("AIにカテゴリ候補を生成させる", key="gen_cat_button", type="primary"):
@@ -914,7 +916,7 @@ def render_step_a():
             with st.spinner("AIが分析指針を読み解き、カテゴリを考案中..."):
                 logger.info("AIカテゴリ生成ボタンクリック")
                 st.session_state.generated_categories = {"市区町村キーワード": "地名辞書(JAPAN_GEOGRAPHY_DB)から抽出された市区町村名"}
-                # (★) L796: キャッシュ利用版 (llm引数削除)
+                # L796: キャッシュ利用版 (llm引数削除)
                 ai_categories = get_dynamic_categories(analysis_prompt) 
                 if ai_categories:
                     st.session_state.generated_categories.update(ai_categories)
@@ -938,7 +940,7 @@ def render_step_a():
                 value=(cat == "市区町村キーワード" or cat in st.session_state.selected_categories), 
                 help=desc, 
                 key=f"cat_cb_{cat}",
-                disabled=(cat == "市区町村キーワード") # (★) 必須項目は無効化
+                disabled=(cat == "市区町村キーワード") # 必須項目は無効化
             )
             if is_checked:
                 selected_cats.append(cat)
@@ -999,28 +1001,28 @@ def render_step_a():
                 total_filter_batches = (total_filter_rows + FILTER_BATCH_SIZE - 1) // FILTER_BATCH_SIZE
                 all_filtered_results = []
                 
-                for i in range(0, total_filter_rows, FILTER_BATCH_SIZE): # (★) L1033: 定数
+                for i in range(0, total_filter_rows, FILTER_BATCH_SIZE): # L1033: 定数
                     if st.session_state.cancel_analysis: logger.warning(f"フィルタリングキャンセル (バッチ {i//FILTER_BATCH_SIZE + 1})"); st.warning("分析キャンセル"); break
                     
-                    batch_df = master_df.iloc[i:i+FILTER_BATCH_SIZE] # (★) L1036: 定数
-                    current_batch_num = i // FILTER_BATCH_SIZE + 1 # (★) L1037: 定数
+                    batch_df = master_df.iloc[i:i+FILTER_BATCH_SIZE] # L1036: 定数
+                    current_batch_num = i // FILTER_BATCH_SIZE + 1 # L1037: 定数
                     logger.info(f"AIフィルタリング バッチ {current_batch_num}/{total_filter_batches} 処理中...")
                     
-                    # (★) L1048: UI更新をヘルパー関数で呼び出し (DRY)
+                    # L1048: UI更新をヘルパー関数で呼び出し (DRY)
                     update_progress_ui(
                         progress_placeholder, log_placeholder, 
                         min(i + FILTER_BATCH_SIZE, total_filter_rows), total_filter_rows, 
                         "AIフィルタリング"
                     )
                     
-                    # (★) L1053: キャッシュ利用版 (llm引数削除)
+                    # L1053: キャッシュ利用版 (llm引数削除)
                     filtered_df = filter_relevant_data_by_ai(batch_df, analysis_prompt)
                     if filtered_df is not None and not filtered_df.empty:
                         all_filtered_results.append(filtered_df)
                     else:
                         logger.warning(f"AIフィルタリング バッチ {current_batch_num} 結果空")
                         
-                    time.sleep(FILTER_SLEEP_TIME) # (★) L1060: 定数
+                    time.sleep(FILTER_SLEEP_TIME) # L1060: 定数
                 
                 if st.session_state.cancel_analysis:
                     logger.warning("AIフィルタリング処理がキャンセルされました。")
@@ -1041,20 +1043,20 @@ def render_step_a():
                 logger.info(f"選択カテゴリ: {list(selected_category_definitions.keys())}")
                 
                 master_df_for_tagging = filtered_master_df
-                total_rows = len(master_df_for_tagging) # (★) L1082: 総行数を更新
+                total_rows = len(master_df_for_tagging) # L1082: 総行数を更新
                 
                 all_tagged_results = []; 
                 total_batches = (total_rows + TAGGING_BATCH_SIZE - 1) // TAGGING_BATCH_SIZE; 
                 logger.info(f"バッチサイズ {TAGGING_BATCH_SIZE}, 総バッチ数: {total_batches}")
                 
-                for i in range(0, total_rows, TAGGING_BATCH_SIZE): # (★) L1085: 定数
+                for i in range(0, total_rows, TAGGING_BATCH_SIZE): # L1085: 定数
                     if st.session_state.cancel_analysis: logger.warning(f"ループキャンセル (バッチ {i//TAGGING_BATCH_SIZE + 1})"); st.warning("分析キャンセル"); break
                     
-                    batch_df = master_df_for_tagging.iloc[i:i+TAGGING_BATCH_SIZE]; # (★) L1088: 定数
+                    batch_df = master_df_for_tagging.iloc[i:i+TAGGING_BATCH_SIZE]; # L1088: 定数
                     current_batch_num = i // TAGGING_BATCH_SIZE + 1; 
                     logger.info(f"バッチ {current_batch_num}/{total_batches} 処理中...")
                     
-                    # (★) L1089: UI更新をヘルパー関数で呼び出し (DRY)
+                    # L1089: UI更新をヘルパー関数で呼び出し (DRY)
                     update_progress_ui(
                         progress_placeholder, log_placeholder, 
                         min(i + TAGGING_BATCH_SIZE, total_rows), total_rows, 
@@ -1062,12 +1064,12 @@ def render_step_a():
                     )
                     
                     logger.info(f"Calling perform_ai_tagging batch {current_batch_num}...")
-                    # (★) L1094: キャッシュ利用版 (llm引数削除)
+                    # L1094: キャッシュ利用版 (llm引数削除)
                     tagged_df = perform_ai_tagging(batch_df, selected_category_definitions, analysis_prompt)
                     logger.info(f"Finished perform_ai_tagging batch {current_batch_num}.")
                     if tagged_df is not None and not tagged_df.empty: all_tagged_results.append(tagged_df)
                     
-                    time.sleep(TAGGING_SLEEP_TIME) # (★) L1098: 定数
+                    time.sleep(TAGGING_SLEEP_TIME) # L1098: 定数
                 
                 if st.session_state.cancel_analysis:
                     logger.warning("AIタグ付け処理がキャンセルされました。")
@@ -1100,7 +1102,7 @@ def render_step_a():
                 progress_placeholder.progress(1.0, text="エラーにより処理中断")
     
     if st.session_state.cancel_analysis:
-        st.session_state.cancel_analysis = False # (★) L1126: 状態をリセット
+        st.session_state.cancel_analysis = False # L1126: 状態をリセット
     
     if not st.session_state.tagged_df_A.empty:
         st.header("Step 7: 分析結果の確認とエクスポート")
@@ -1122,7 +1124,7 @@ def render_step_c():
     """Step C: 分析結果の可視化を描画する"""
     st.title("🔬 分析結果の可視化 (Step C)")
     
-    # (★) Step C 固有のセッションステートをここで初期化 (SRP)
+    # Step C 固有のセッションステートをここで初期化 (SRP)
     if 'step_c_results' not in st.session_state: st.session_state.step_c_results = {}
     if 'ai_summary_prompt' not in st.session_state: st.session_state.ai_summary_prompt = None
     if 'ai_summary_result' not in st.session_state: st.session_state.ai_summary_result = None
@@ -1164,7 +1166,7 @@ def render_step_c():
             st.subheader(f"📈 分析結果: {name}")
             
             try:
-                result_data = None # (★) 結果格納用
+                result_data = None # 結果格納用
                 if name == "単純集計（頻度分析）":
                     result_data = run_simple_count(df, cols) 
                 elif name == "基本統計量":
@@ -1174,7 +1176,7 @@ def render_step_c():
                 elif name == "クロス集計（キーワード×属性）":
                     result_data = run_crosstab(df, cols)
                 elif name == "共起ネットワーク分析":
-                    st.warning("「共起ネットワーク分析」は現在実装中です。") # (★)
+                    st.warning("「共起ネットワーク分析」は現在実装中です。") #
                 elif name == "カテゴリ別集計（グループ比較）":
                     if isinstance(cols, dict) and 'numeric' in cols and 'grouping' in cols:
                          grouping_cols = cols['grouping']
@@ -1194,7 +1196,7 @@ def render_step_c():
                                      for col in existing_grouping_cols:
                                          df_copy[col] = df_copy[col].astype(str)
                                          
-                                     # (★) L874: 致命的バグ (NameError) 修正
+                                     # L874: 致命的バグ (NameError) 修正
                                      # L874 (旧) を L871 の前に移動
                                      result_df = df_copy.groupby(existing_grouping_cols)[numeric_cols_to_desc].describe()
                                      
@@ -1205,7 +1207,7 @@ def render_step_c():
                                      
                                      final_result_df = result_df.reset_index()
                                      st.dataframe(final_result_df) 
-                                     result_data = final_result_df # (★) 
+                                     result_data = final_result_df # 
                                  except Exception as group_e:
                                      st.error(f"グループ別集計エラー: {group_e}")
                                      logger.error(f"Groupby describe error: {group_e}", exc_info=True)
@@ -1262,7 +1264,7 @@ def render_step_c():
                     st.error("AIの実行には Google APIキー が必要です。（サイドバーで設定してください）")
                 else:
                     with st.spinner("AIがサマリーを生成中... (Rate Limitに注意)"):
-                        llm = get_llm() # (★) キャッシュされたLLMを呼び出し
+                        llm = get_llm() # キャッシュされたLLMを呼び出し
                         if llm:
                             try:
                                 response = llm.invoke(prompt_input) 
@@ -1286,7 +1288,7 @@ def render_step_b():
     """Step B: 分析手法の提案UIを描画する"""
     st.title("📊 分析手法の提案 (Step B)")
     
-    # (★) Step B 固有のセッションステートをここで初期化 (SRP)
+    # Step B 固有のセッションステートをここで初期化 (SRP)
     if 'df_flagged_B' not in st.session_state: st.session_state.df_flagged_B = pd.DataFrame()
     if 'suggestions_B' not in st.session_state: st.session_state.suggestions_B = []
     if 'chosen_analysis_list' not in st.session_state: st.session_state.chosen_analysis_list = []
@@ -1304,7 +1306,7 @@ def render_step_b():
         try:
             uploaded_flagged_file.seek(0)
             df_flagged = pd.read_csv(uploaded_flagged_file, encoding="utf-8-sig")
-            st.session_state.df_flagged_B = df_flagged # (★) L1017: Step C のためにセッションに保存
+            st.session_state.df_flagged_B = df_flagged # L1017: Step C のためにセッションに保存
             st.success(f"ファイル「{uploaded_flagged_file.name}」読込完了")
             st.dataframe(df_flagged.head())
 
@@ -1314,7 +1316,7 @@ def render_step_b():
                     
                     ai_suggestions = []
                     if analysis_prompt_B.strip():
-                        # (★) L1028: キャッシュ利用版 (llm引数削除)
+                        # L1028: キャッシュ利用版 (llm引数削除)
                         ai_suggestions = get_suggestions_from_prompt(
                             analysis_prompt_B, df_flagged, base_suggestions
                         )
@@ -1325,7 +1327,7 @@ def render_step_b():
                     ]
                     all_suggestions = sorted(base_suggestions + filtered_ai_suggestions, key=lambda x: x['priority']) 
                     st.session_state.suggestions_B = all_suggestions
-                    # (★) L1041: 提案時に古いCの結果をクリア (KISS)
+                    # L1041: 提案時に古いCの結果をクリア (KISS)
                     st.session_state.step_c_results = {}
                     st.session_state.ai_summary_prompt = None
                     st.session_state.ai_summary_result = None
@@ -1333,7 +1335,7 @@ def render_step_b():
             if 'suggestions_B' in st.session_state and st.session_state.suggestions_B:
                 display_suggestions(st.session_state.suggestions_B, df_flagged)
             
-            # (★) L1070-L1077: 致命的バグ (NameError) 修正
+            # L1070-L1077: 致命的バグ (NameError) 修正
             # L1070 (旧 L1418) の if st.button(...) ブロック全体を削除
 
         except Exception as e:
@@ -1345,13 +1347,13 @@ def main():
     """Streamlitアプリケーションのメイン実行関数"""
     st.set_page_config(page_title="AI Data Analysis App", layout="wide")
     
-    # (★) L1082: グローバルなセッションステートのみ初期化 (SRP)
+    # L1082: グローバルなセッションステートのみ初期化 (SRP)
     if 'current_step' not in st.session_state:
         st.session_state.current_step = 'A' # 初期ステップ
     if 'log_messages' not in st.session_state:
         st.session_state.log_messages = []
 
-    # (★) L1090-L1099 (旧 L1377-L1385): ステップ固有の初期化を削除 (SRP)
+    # L1090-L1099 (旧 L1377-L1385): ステップ固有の初期化を削除 (SRP)
 
     with st.sidebar:
         st.title("Navigation")
@@ -1362,11 +1364,11 @@ def main():
         if google_api_key:
             os.environ["GOOGLE_API_KEY"] = google_api_key
         
-        # (★) L1109: APIキーがない場合の警告を強化 (KISS)
+        # L1109: APIキーがない場合の警告を強化 (KISS)
         if not os.getenv("GOOGLE_API_KEY"):
             st.warning("AI機能を利用するには Google APIキー を設定してください。")
         else:
-            # (★) L1113: アプリ起動時にLLMとspaCyのロードを試みる (KISS)
+            # L1113: アプリ起動時にLLMとspaCyのロードを試みる (KISS)
             if get_llm() is None:
                 st.error("LLMの初期化に失敗。APIキーが正しいか確認してください。")
             if load_spacy_model() is None:
