@@ -5,3 +5,6 @@ spacy==3.7.5
 openpyxl==3.1.2
 langchain==0.1.16
 langchain-google-genai==1.0.1
+networkx==3.3
+pyvis==0.3.2
+scikit-learn==1.4.2

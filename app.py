@@ -8,6 +8,12 @@ import logging
 import time
 import spacy
 import altair as alt  # L11: Altair (L630から移動)
+import networkx as nx
+from networkx.algorithms import community 
+from pyvis.network import Network
+import streamlit.components.v1 as components
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
 from io import StringIO, BytesIO
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import PromptTemplate
@@ -31,9 +37,9 @@ except ImportError:
 AI_MODEL_NAME = "gemini-2.5-flash-lite"
 # L31: バッチサイズと待機時間も定数化 (KISS)
 FILTER_BATCH_SIZE = 50
-FILTER_SLEEP_TIME = 4.1  # 15 RPM (60s / 15)
+FILTER_SLEEP_TIME = 6.1 
 TAGGING_BATCH_SIZE = 10
-TAGGING_SLEEP_TIME = 4.1  # 15 RPM
+TAGGING_SLEEP_TIME = 6.1
 
 # L37: 地名辞書
 # geography_db.py が見つからない場合のエラーハンドリング (KISS)
@@ -359,7 +365,9 @@ def perform_ai_tagging(df_batch, categories_to_tag, analysis_prompt=""):  # llm 
                             processed_values = sorted(list(set(str(val).strip() for val in raw_value if str(val).strip())))
                         elif raw_value is not None and str(raw_value).strip():
                             processed_values = [str(raw_value).strip()]
-                        row_result[key] = processed_values
+                        
+                        # (★) --- 括弧除去修正: リストをカンマ区切りの文字列に変換 ---
+                        row_result[key] = ", ".join(processed_values)
                 results.append(row_result)
             except json.JSONDecodeError as json_e:
                 logger.warning(f"AIタグ付け回答パース失敗: {cleaned_line} - Error: {json_e}")
@@ -446,12 +454,14 @@ def suggest_analysis_techniques(df):
             })
 
         # 優先度3: 共起ネットワーク分析 (L438の指示)
-        if len(flag_cols) >= 2:
+        all_categorical_cols = [col for col in df.select_dtypes(include='object').columns if col != 'ANALYSIS_TEXT_COLUMN']
+        
+        if len(all_categorical_cols) >= 2:
             potential_suggestions.append({
                 "priority": 3, "name": "共起ネットワーク分析",
-                "description": "テキスト内で同時に出現するキーワード（例: 「広島市」と「厳島神社」）の関係性を線で結び、どの単語が中心的な役割を果たしているかを可視化します。",
-                "reason": f"複数のキーワード列({len(flag_cols)}個)あり。単語間の隠れたつながりを発見できます。",
-                "suitable_cols": flag_cols
+                "description": "CSV内のカテゴリ列（例: 「市区町村」と「年代」）を選び、それらの共起関係をネットワークとして可視化します。",
+                "reason": f"分析可能なカテゴリ列が2つ以上({len(all_categorical_cols)}個)見つかりました。属性間の関連性発見に。",
+                "suitable_cols": all_categorical_cols # ★ flag_cols から all_categorical_cols に変更
             })
 
         # 優先度4: グループ比較 (L438の指示)
@@ -553,6 +563,7 @@ def get_suggestions_from_prompt(user_prompt, df, existing_suggestions):  # llm �
         return []
 
 # --- L468: Step B (提案表示UI) ---
+# --- L468: Step B (提案表示UI) ---
 def display_suggestions(suggestions, df):
     """
     提案された分析手法を表示し、ユーザーが選択できるようにする (★ チェックボックス版)
@@ -588,14 +599,25 @@ def display_suggestions(suggestions, df):
         st.subheader("選択された手法の詳細:")
         selected_suggestions = [s for s in suggestions if s['name'] in selected_technique_names]
         
-        for suggestion in selected_suggestions:
+        # (★) --- UI BUG FIX (L513) ---
+        # session_state.suggestions_B に重複がある場合に備え、描画時に重複を除外する
+        seen_names = set()
+        unique_selected_suggestions = []
+        for s in selected_suggestions:
+            if s['name'] not in seen_names:
+                unique_selected_suggestions.append(s)
+                seen_names.add(s['name'])
+        # --- FIX END ---
+        
+        for suggestion in unique_selected_suggestions: # (★) リストを変数に変更
             with st.expander(f"{suggestion['name']} (優先度: {suggestion['priority']})"):
                 st.markdown(f"**<説明>**\n{suggestion['description']}")
                 st.markdown(f"**<提案理由>**\n{suggestion['reason']}")
     
     st.markdown("---")
 
-    # L525: キー名変更済みのボタン (execute_button_C_v2)
+    # (★) --- (Problem 2) ボタンのインデント修正 (L525) ---
+    # 以下のボタンは for ループの外に、1回だけ定義する
     if st.button("選択した手法で分析を実行 (Step Cへ)", key="execute_button_C_v2", disabled=not selected_technique_names, type="primary"):
          if selected_technique_names:
              st.session_state.chosen_analysis_list = selected_technique_names
@@ -635,19 +657,37 @@ def generate_ai_summary_prompt(results_dict, df):
             context_str += f"{str(data)}\n\n"
     
     final_prompt = f"""
-あなたは優秀なデータアナリストです。
-以下の「分析対象データの概要」と「個別分析の結果サマリー」を読み解き、プロの視点から総合的な「分析サマリーレポート」を作成してください。
-# 指示:
-1. 各分析結果を横断的に解釈し、重要なインサイト（洞察）を抽出する。
-2. 単なる結果の羅列ではなく、ビジネス上の示唆（例: どのキーワードが重要か、どの属性に注目すべきか）を導き出す。
-3. レポートは日本のビジネスマン向けに、見やすいマークダウン形式（見出し、箇条書き）で構成する。
-4. 結論から先に述べ、その後に詳細な根拠を説明する。
+あなたは、データ分析結果をクライアント（日本のビジネスマン）向けのパワーポイント資料にまとめる、優秀なコンサルタントです。
+以下の「分析コンテキスト」には、各分析手法（例：単純集計、共起ネットワーク）から得られた生データ（上位5件の抜粋）が含まれています。
+
+# 指示 (最重要):
+1.  **生データをコピーしない:** 「分析コンテキスト」内の表形式のテキスト（.to_string() の結果）を、あなたの回答に【絶対に】含めないでください。
+2.  **結果の「構造化」:** 以下の「# 回答フォーマット」に【厳格に】従ってください。
+3.  **結論ファースト:** まず「総括（Key Takeaways）」として、ビジネス上の最も重要な発見や提案を2～3点の箇条書きで記述してください。
+4.  **個別分析の要約:** 次に、「個別分析の要点」として、`results_dict` 内の各分析手法から得られた【最も重要なインサイト1点】だけを抜き出し、簡潔な1文の箇条書きにしてください。
+
 ---
 [分析コンテキスト]
 {context_str}
 ---
 [あなたの回答]
-# 分析サマリーレポート
+
+# 回答フォーマット (この構造を厳守)
+
+## 分析サマリーレポート
+
+### 総括 (Key Takeaways)
+* [ここには、全分析結果から導かれる最も重要な「ビジネス上の結論」または「次のアクション提案」を2～3点で記述]
+* [例：〇〇（地名）では「食」への関心が最も高く、特に「〇〇（単語）」との組み合わせが鍵となる。]
+
+---
+
+### 個別分析の要点
+* **[単純集計]**: [単純集計の結果から読み取れる最も重要な事実を1行で記述。 例：「投稿数では『広島市』が突出して1位であった。」]
+* **[共起ネットワーク]**: [共起ネットワーク分析から読み取れる最も重要な「単語の組み合わせ」や「クラスタの特徴」を1行で記述。 例：「『原爆ドーム』クラスタは『平和』や『歴史』と強く結びついていた。」]
+* **[時系列分析]**: [時系列分析の結果から読み取れる最も重要な「時期的なトレンド」を1行で記述。]
+* **[ハッシュタグ分析]**: [ハッシュタグ分析の結果から読み取れる最も重要な「トレンド」を1行で記述。]
+* **[その他、実行された分析]**: [同様に、各分析の最重要ポイントを1行で記述]
 """
     logger.info("AIサマリー用プロンプト生成完了。")
     return final_prompt
@@ -701,6 +741,19 @@ def run_basic_stats(df, numeric_cols):
         
     stats_df = df[existing_cols].describe()
     st.dataframe(stats_df)
+    
+    with st.expander("各項目の説明"):
+        st.markdown("""
+        - **count**: 件数（データの個数）
+        - **mean**: 平均値
+        - **std**: 標準偏差（データのばらつき度合い）
+        - **min**: 最小値
+        - **25% (Q1)**: 第1四分位数（データを小さい順に並べたとき、下から25%地点の値）
+        - **50% (Q2)**: 中央値（median）（50%地点の値）
+        - **75% (Q3)**: 第3四分位数（75%地点の値）
+        - **max**: 最大値
+        """)
+    
     return stats_df #
 
 def run_crosstab(df, suitable_cols):
@@ -801,7 +854,7 @@ def run_text_mining(df, text_col='ANALYSIS_TEXT_COLUMN'):
         st.warning(f"分析対象のテキスト列 '{text_col}' がないか、空です。")
         return None #
 
-    nlp = load_spacy_model() # キャッシュされたモデルを直接呼び出し
+    nlp = load_spacy_model() #キャッシュされたモデルを直接呼び出し
     if nlp is None:
         st.error("spaCy日本語モデルのロードに失敗しました。")
         return None
@@ -817,10 +870,12 @@ def run_text_mining(df, text_col='ANALYSIS_TEXT_COLUMN'):
         words = []
         target_pos = {'NOUN', 'PROPN', 'ADJ'}
         stop_words = {
-            'の', 'に', 'は', 'を', 'が', 'で', 'て', 'です', 'ます', 'こと', 'もの', 'それ', 'あれ',
-            'これ', 'ため', 'いる', 'する', 'ある', 'ない', 'いう', 'よう', 'そう', 'など', 'さん',
-            '的', '的', '的', '的', '人', '自分', '私', '僕', '何', 'その', 'この', 'あの'
-        }
+        'の', 'に', 'は', 'を', 'が', 'で', 'て', 'です', 'ます', 'こと', 'もの', 'それ', 'あれ',
+        'これ', 'ため', 'いる', 'する', 'ある', 'ない', 'いう', 'よう', 'そう', 'など', 'さん',
+        '的', '人', '自分', '私', '僕', '何', 'その', 'この', 'あの',
+        '思う', '行く', '見る', '来る', '感じ', '良い', '良い', 'なる', 'てる', 'られる', 'れる',
+        '場所', '感じ', '時間', '今回', '色々', '中', 'ところ', 'たち', '人達', '多い', 'スポット'
+    }
         for doc in nlp.pipe(texts, disable=["parser", "ner"]):
             for token in doc:
                 if (token.pos_ in target_pos) and (not token.is_stop) and (token.lemma_ not in stop_words) and (len(token.lemma_) > 1):
@@ -845,7 +900,685 @@ def run_text_mining(df, text_col='ANALYSIS_TEXT_COLUMN'):
         logger.error(f"run_text_mining error: {e}", exc_info=True)
     return None #
 
-# --- L752: Part 2 (render関数, main) は次のチャットで提案します ---
+def run_cooccurrence_network(df, suitable_cols):
+    """(★変更) フィルタリングされた自由記述列内の「単語同士」の共起ネットワークを可視化する"""
+    
+    all_cols = df.columns.tolist()
+    
+    if 'ANALYSIS_TEXT_COLUMN' not in all_cols:
+        st.error("分析対象の自由記述列（ANALYSIS_TEXT_COLUMN）が見つかりません。")
+        return None
+
+    # (★) --- (Problem 2) カラーパレットの定義 ---
+    # 凡例と色をマッピングするための固定カラーリスト
+    COLOR_PALETTE = [
+        "#FF5733", "#33FF57", "#3357FF", "#FF33A1", "#33FFF6",
+        "#F3FF33", "#FF8C33", "#8C33FF", "#33FF8C", "#FF338C"
+    ]
+    
+    # (★) UIを「フィルタ列」「フィルタキーワード」の選択に変更
+    st.info("分析したい「キーワード」で投稿を絞り込み、その投稿内容の共起ネットワークを作成します。")
+    
+    flag_col_options = [col for col in suitable_cols if col in df.columns] 
+    if not flag_col_options:
+         st.warning("分析可能なフィルタ列（カテゴリ列）が見つかりません。")
+         return None
+
+    # 1. フィルタ列の選択 (デフォルト: 市区町村キーワード)
+    default_flag_col_index = 0
+    if "市区町村キーワード" in flag_col_options:
+        default_flag_col_index = flag_col_options.index("市区町村キーワード")
+    flag_col = st.selectbox(
+        "1. 絞り込みに使用する列:",
+        flag_col_options,
+        index=default_flag_col_index,
+        key="cn_filter_col",
+        help="ここで選んだ列のキーワード（例：市区町村キーワード）で、分析対象の投稿を絞り込みます。"
+    )
+    
+    # 2. フィルタキーワードの入力 (例: 広島市)
+    try:
+        # (★) --- (Problem 1) nan 除外ロジック (BUG FIX) ---
+        s = df[flag_col].dropna().astype(str).str.split(',').explode().str.strip()
+        s = s[~s.isin(['', 'nan', 'Nan', 'NaN'])] # (★) nan を除外
+        
+        keyword_counts = s.value_counts()
+        
+        # 選択肢 (多すぎると重いためTop50に制限)
+        options = keyword_counts.index.tolist()[:50] 
+        # デフォルト (Top10)
+        default_options = keyword_counts.index.tolist()[:10] 
+    except Exception as e:
+        st.error(f"キーワードの頻度計算中にエラー: {e}")
+        options = []
+        default_options = []
+
+    # セッションステートキー (列名ごとに選択状態を保持)
+    session_key = f'cn_selected_keywords_{flag_col}'
+    
+    # セッションステートが未初期化の場合、デフォルト値(Top10)を設定
+    if session_key not in st.session_state:
+        st.session_state[session_key] = default_options
+
+    st.markdown(f"**2. 絞り込むキーワード（「{flag_col}」列）:**")
+    
+    # --- 全選択 / 全解除ボタン ---
+    def select_all_keywords():
+        st.session_state[session_key] = options
+    def deselect_all_keywords():
+        st.session_state[session_key] = []
+
+    btn_cols = st.columns([1, 1, 3])
+    with btn_cols[0]:
+        st.button("全選択", on_click=select_all_keywords, key=f"btn_all_{flag_col}", use_container_width=True)
+    with btn_cols[1]:
+        st.button("全解除", on_click=deselect_all_keywords, key=f"btn_none_{flag_col}", use_container_width=True)
+
+    # --- キーワード複数選択チェックボックス ---
+    st.multiselect(
+        f"（頻度順 Top 50）:",
+        options,
+        key=session_key, # (★) セッションステートに直接バインド
+        label_visibility="collapsed"
+    )
+
+    # 3. テキスト列の選択
+    text_col_options = [col for col in all_cols if df[col].dtype == 'object']
+    default_text_col_index = text_col_options.index('ANALYSIS_TEXT_COLUMN') if 'ANALYSIS_TEXT_COLUMN' in text_col_options else 0
+    text_col = st.selectbox(
+        "3. 分析対象の自由記述列（サウンドバイト）:",
+        text_col_options,
+        index=default_text_col_index,
+        key="cn_text_col_v2"
+    )
+
+    # (★) --- (Problem 2/3) カラム比率を 25:75 に変更 ---
+    st.markdown("---")
+    ui_cols = st.columns([0.25, 0.75]) # (★) 15:85 -> 25:75
+
+    with ui_cols[0]:
+        st.subheader("グラフ詳細設定")
+        
+        # 1. レイアウトの選択
+        solver = st.selectbox(
+            "レイアウト (layout)", 
+            ['barnesHut', 'fruchterman_reingold', 'repulsion'], 
+            index=0,
+            key="cn_solver",
+            help="グラフの配置アルゴリズム。'barnesHut' は高速で安定性が高い（推奨）"
+        )
+
+        # 2. (★) --- (Problem 2) UIレイアウト崩れ修正: 横並びをやめて縦積みに ---
+        st.markdown("---")
+        st.markdown("**物理演算パラメータ**")
+        
+        gravity = st.slider(
+            "重力 (Gravity)", 
+            min_value=-50000, max_value=-1000, value=-2000, step=1000, 
+            key="cn_gravity",
+            help="グラフの中心にノードを引き寄せる力。負の値を大きくすると、グラフが中央にまとまります。"
+        )
+        node_distance = st.slider(
+            "ノード間の反発力", 100, 500, 200, key="cn_distance", 
+            help="ノード同士が反発する力（距離）。値を大きくすると、各ノードが離れます。"
+        )
+        spring_length = st.slider(
+            "エッジの長さ", 50, 500, 250, key="cn_spring", 
+            help="ノード間を繋ぐ線の基本の長さ。"
+        )
+        
+        # 3. (★) フィルタリングパラメータ
+        st.markdown("---")
+        st.markdown("**フィルタ設定**")
+        
+        top_n_words_limit = st.slider(
+            "分析対象の単語数 (Top N)", 
+            min_value=50, max_value=300, value=100, 
+            key="cn_top_n",
+            help="分析対象とする単語の最大数。値を小さくすると、出現頻度が最も高い単語群に絞り込まれ、グラフのノイズが減ります。"
+        )
+        max_degree_cutoff = st.slider(
+            "最大接続数 (Exclude Hubs)", 10, 100, 50, key="cn_max_degree",
+            help="接続数がこれより多いノード（スーパーハブ）をグラフから除外します。放射状グラフを解消するのに役立ちます。"
+        )
+        min_occurrence = st.slider(
+            "最小共起回数 (Min Freq)", 1, 30, 10, key="cn_slider_v3", 
+            help="ノード間を接続する最小の共起回数。値を大きくすると、関連性の強い線だけが残り、グラフがシンプルになります。"
+        ) 
+        
+        # 4. (★) デザインパラメータ
+        st.markdown("---")
+        st.markdown("**デザイン設定**")
+        default_node_size = st.slider(
+            "基準ノードサイズ", 5, 50, 15, key="cn_node_size_v2", 
+            help="ノード（円）の基本サイズ。"
+        )
+        default_text_size = st.slider(
+            "テキストサイズ", 
+            min_value=10, max_value=100, value=50, # (★) デフォルト 50, レンジ 10-100
+            key="cn_text_size_v2", 
+            help="ノードに表示されるテキストのサイズ。"
+        )
+
+
+    with ui_cols[1]:
+        # (★) L994 から L1102 までのグラフ生成ロジックを「ui_cols[1]」内に移動
+        
+        nlp = load_spacy_model()
+        if nlp is None:
+            st.error("spaCy日本語モデルのロードに失敗しました。")
+            return None
+                
+        # (★) target_pos に 'VERB' (動詞) を追加し、「行動」を抽出
+        target_pos = {'NOUN', 'PROPN', 'ADJ', 'VERB'} 
+        
+        # (★) stop_words を更新 (分析のノイズとなる汎用語のみに限定)
+        stop_words = {
+            'の', 'に', 'は', 'を', 'が', 'で', 'て', 'です', 'ます', 'こと', 'もの', 'それ', 'あれ',
+            'これ', 'ため', 'いる', 'する', 'ある', 'ない', 'いう', 'よう', 'そう', 'など', 'さん',
+            '的', '人', '自分', '私', '僕', '何', 'その', 'この', 'あの', 'れる', 'られる',
+            'てる', 'なる', '中', 'ところ', 'たち', '人達', '今回', '本当', 'とても', '色々'
+            # (★) '食べる', '美味しい', '楽しい', '好き', '行く', '見る', '思う' などを削除
+        }
+        
+        selected_keywords = st.session_state.get(session_key, [])
+        
+        if not selected_keywords:
+            st.warning(f"「2. 絞り込むキーワード」を1つ以上選択してください。")
+            return None
+        
+        # (★) --- タイトル重複修正 (L1023) ---
+        st.subheader(f"共起ネットワーク (トピック: {len(selected_keywords)}個のキーワード)")
+        
+        # (★) --- スコープバグ修正: 変数を try の前に初期化 ---
+        communities_with_words = {}
+        degrees = {}
+            
+        try:
+            G = nx.Graph()
+            
+            # (★) 1. キーワードでDataFrameをフィルタリング
+            escaped_keywords = [re.escape(k) for k in selected_keywords]
+            # | (OR) でパターンを作成
+            pattern = '|'.join(escaped_keywords)
+            
+            df_filtered = df[df[flag_col].astype(str).str.contains(pattern, na=False)]
+            
+            if df_filtered.empty:
+                st.warning(f"選択したキーワードを含む投稿が見つかりませんでした。")
+                return None
+
+            # 2. フィルタされた投稿のテキスト列を処理
+            texts_to_analyze = df_filtered[text_col].dropna().astype(str)
+            
+            # (★) --- (Problem 1a) Top N 単語リストの作成 ---
+            all_words = []
+            for text in texts_to_analyze: # (★) 1回目のループ (TopN計算用)
+                doc = nlp(text)
+                for token in doc:
+                    if (token.pos_ in target_pos) and (not token.is_stop) and (token.lemma_ not in stop_words) and (len(token.lemma_) > 1):
+                        if token.lemma_ not in selected_keywords:
+                            all_words.append(token.lemma_)
+            
+            if not all_words:
+                st.warning("フィルタ結果から分析対象の単語が見つかりませんでした。")
+                return None
+            
+            # (★) 上位N件の単語セットを作成
+            top_n_words_set = set(pd.Series(all_words).value_counts().head(top_n_words_limit).index)
+            logger.info(f"Top {top_n_words_limit} words calculated. Set size: {len(top_n_words_set)}")
+            
+            # (★) itertools をインポート
+            from itertools import combinations
+            
+            for text in texts_to_analyze: # (★) 2回目のループ (ペア作成用)
+                doc = nlp(text)
+                words_in_text = set()
+                for token in doc:
+                    # (★) --- (Problem 1b.b) Top N 単語リストの適用 ---
+                    # TopNセットに含まれる単語のみを抽出
+                    if (token.pos_ in target_pos) and (token.lemma_ in top_n_words_set):
+                        words_in_text.add(token.lemma_)
+                
+                # (★) 1つの投稿内の単語同士でペアを作成
+                for word1, word2 in combinations(sorted(list(words_in_text)), 2):
+                    if G.has_edge(word1, word2):
+                        G[word1][word2]['weight'] += 1
+                    else:
+                        G.add_edge(word1, word2, weight=1) 
+
+            if G.number_of_nodes() == 0:
+                st.info("共起ネットワークを構築できませんでした（有効なキーワードペアなし）。")
+                return None
+
+            # (★) 可視化ロジック (コミュニティ検出)
+            edges_to_remove = [(u, v) for u, v, data in G.edges(data=True) if data['weight'] < min_occurrence]
+            G.remove_edges_from(edges_to_remove)
+            G.remove_nodes_from(list(nx.isolates(G))) 
+
+            # (★) --- スーパーハブの除外 (NEW) ---
+            degrees = dict(G.degree()) # (★) degrees をここで計算
+            nodes_to_remove = [node for node, degree in degrees.items() if degree > max_degree_cutoff]
+            G.remove_nodes_from(nodes_to_remove)
+            G.remove_nodes_from(list(nx.isolates(G))) # 再度孤立ノードを削除
+            logger.info(f"スーパーハブ除外: {len(nodes_to_remove)} 個のノードを削除しました (しきい値: {max_degree_cutoff})")
+            # --- 除外ここまで ---
+
+            if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
+                st.info(f"最小共起回数 ({min_occurrence}) / 最大接続数 ({max_degree_cutoff}) の条件でペアが見つかりませんでした。")
+                return None
+            
+            # (★) --- (Problem 3) UX/Height 修正 (L1062) ---
+            net = Network(height="700px", width="100%", cdn_resources='in_line') # (★) height="700px" に変更
+            
+            degrees = dict(G.degree()) # (★) グラフ修正後に degrees を再計算
+            min_degree, max_degree = (min(degrees.values()) or 1), (max(degrees.values()) or 1)
+            
+            # (★) --- (Problem 2) コミュニティ検出と色分け ---
+            community_map = {}
+            try:
+                communities = community.greedy_modularity_communities(G)
+                # (★) 凡例表示のため、コミュニティを単語リストとして保存
+                communities_with_words = {i: list(comm) for i, comm in enumerate(communities)}
+                community_map = {node: i for i, comm in communities_with_words.items() for node in comm}
+                community_count = len(communities)
+                logger.info(f"コミュニティ検出成功。{community_count}個のクラスタを発見。")
+            except Exception as e:
+                logger.warning(f"コミュニティ検出に失敗: {e}。色分けなしで続行します。")
+
+            
+            for node in G.nodes():
+                if node not in degrees: continue
+                size_factor = degrees.get(node, 0)
+                size = default_node_size + 30 * (size_factor - min_degree) / (max_degree - min_degree + 1e-6)
+                group_id = community_map.get(node, 0) # 属するクラスタ番号
+                color = COLOR_PALETTE[group_id % len(COLOR_PALETTE)] # (★) 固定パレットから色を決定
+                
+                net.add_node(
+                    node, label=node, size=size, title=f"{node} (クラスタ: {group_id}, 結合数: {size_factor})", 
+                    color=color, # (★) group= ではなく color= を使用
+                    font={"size": default_text_size}
+                )
+            # --- (Problem 2) END ---
+
+            for u, v, data in G.edges(data=True):
+                weight = data['weight']
+                net.add_edge(u, v, title=f"共起回数: {weight}", value=weight)
+
+            # (★) --- L1139 (エラー修正) ---
+            # (★) solver の値に応じて、呼び出す関数を変更
+            if solver == 'barnesHut':
+                net.barnes_hut(
+                    gravity=gravity,
+                    overlap=0.1
+                )
+            else: # fruchterman_reingold or repulsion
+                net.repulsion(
+                    node_distance=node_distance, 
+                    spring_length=spring_length
+                )
+            
+            net.solver = solver 
+            net.show_buttons(filter_=['physics', 'nodes', 'layout'])
+            
+            # (★) --- インデント修正 (L1145) ---
+            html_file = "cooccurrence_network.html"
+            net.save_graph(html_file)
+            
+            with open(html_file, 'r', encoding='utf-8') as f:
+                html_content = f.read()
+            # (★) --- (Problem 3) UX/Height 修正 (L1149) ---
+            components.html(html_content, height=710) # (★) height=710 に変更
+            
+            edge_list = pd.DataFrame(G.edges(data=True), columns=["source", "target", "data"])
+            edge_list['weight'] = edge_list['data'].apply(lambda x: x['weight'])
+            
+            # (★) --- (Problem 2) 凡例生成ボタンとロジック (tryブロックの内側に移動) ---
+            st.markdown("---")
+            st.subheader("凡例 (AIによるトピック推定)")
+            
+            legend_session_key = f"cn_legend_{flag_col}_{len(selected_keywords)}_{top_n_words_limit}"
+            
+            if legend_session_key not in st.session_state:
+                st.session_state[legend_session_key] = {}
+            
+            if st.button("🤖 AIで凡例を生成 (β)", key="gen_legend_btn"):
+                llm = get_llm()
+                if llm and communities_with_words:
+                    with st.spinner(f"{len(communities_with_words)}個のクラスタのトピックをAIが分析中..."):
+                        legend_map = {}
+                        
+                        prompt = PromptTemplate.from_template(
+                            """
+                            以下の「単語リスト」は、あるトピックに関するコミュニティです。
+                            このコミュニティの共通テーマを最もよく表す「凡例ラベル」（例：食事・グルメ、平和・歴史、移動手段）を【3語以内】で考案してください。
+                            # 単語リスト (上位10件): {word_list_str}
+                            # 回答 (3語以内):
+                            """
+                        )
+                        chain = prompt | llm | StrOutputParser()
+                        
+                        for group_id, words in communities_with_words.items():
+                            if not words: continue
+                            # AIへの入力は代表的な10単語に絞る
+                            words_top10 = sorted(words, key=lambda w: degrees.get(w, 0), reverse=True)[:10]
+                            words_str = ", ".join(words_top10)
+                            
+                            try:
+                                raw_label = chain.invoke({"word_list_str": words_str})
+                                # (★) --- (Problem 1) AI G3 Clean-up ---
+                                cleaned_label = re.sub(r'^(#|回答)\s*\(.*?\)\s*:\s*', '', raw_label.strip())
+                                legend_map[group_id] = cleaned_label # (★) 修正
+                            except Exception as e:
+                                logger.error(f"AI凡例生成エラー (Group {group_id}): {e}")
+                                legend_map[group_id] = "(AIエラー)"
+                            
+                            time.sleep(1) # API Rate Limit 対策
+                            
+                        st.session_state[legend_session_key] = legend_map
+                else:
+                    st.error("AIモデルが利用できないか、コミュニティが検出されませんでした。")
+            
+            # 凡例の表示
+            if st.session_state[legend_session_key]:
+                st.markdown("##### AIによる推定トピック:")
+                
+                legend_items = []
+                for group_id, topic in st.session_state[legend_session_key].items():
+                    color = COLOR_PALETTE[group_id % len(COLOR_PALETTE)]
+                    # (★) CSSで「タグ」のようなインラインブロック要素として定義
+                    legend_html = f"""
+                    <span style="
+                        display: inline-block;
+                        margin: 4px;
+                        padding: 8px 12px;
+                        border-radius: 8px;
+                        background-color: #f0f2f6;
+                        border: 1px solid #e0e0e0;
+                    ">
+                        <span style='color:{color}; font-size: 20px; font-weight: bold; vertical-align: middle;'>■</span>
+                        <span style="vertical-align: middle; margin-left: 8px; font-size: 14px;">{topic} (G{group_id})</span>
+                    </span>
+                    """
+                    legend_items.append(legend_html.replace("\n", "")) # (★) 念のため改行を削除
+                
+                # (★) --- (Problem 1) L1188 修正: unsafe_allow_html=True を追加 ---
+                st.markdown("<div style='line-height: 1.8;'>" + " ".join(legend_items) + "</div>", unsafe_allow_html=True)
+
+            else:
+                st.info("「AIで凡例を生成」ボタンを押すと、各色のトピックがAIによって推定されます。")
+            # --- (Problem 2) END ---
+            
+            return edge_list[['source', 'target', 'weight']].sort_values(by="weight", ascending=False)
+
+        # (★) --- インデント修正 (L1155) ---
+        except Exception as e:
+            st.error(f"共起ネットワーク分析中にエラー: {e}")
+            logger.error(f"run_cooccurrence_network error: {e}", exc_info=True)
+    
+    # (★) --- インデント修正 (L1158) ---
+    return None
+
+def run_hashtag_analysis(df, text_col='ANALYSIS_TEXT_COLUMN'):
+    """ハッシュタグを抽出し、頻度分析を実行する"""
+    if text_col not in df.columns or df[text_col].empty:
+        st.warning(f"分析対象のテキスト列 '{text_col}' がないか、空です。")
+        return None #
+
+    st.info("テキスト列からハッシュタグを抽出・集計中...")
+
+    try:
+        texts = df[text_col].dropna().astype(str)
+        if texts.empty:
+            st.warning("分析対象のテキストがありません。")
+            return None #
+            
+        # 正規表現でハッシュタグを抽出
+        hashtag_pattern = r'#(\S+)'
+        hashtags = texts.str.findall(hashtag_pattern).explode()
+        
+        # 抽出できなかった場合
+        if hashtags.empty or hashtags.isnull().all():
+            st.warning("テキスト内に有効なハッシュタグ（#...）が見つかりませんでした。")
+            return None #
+
+        # 小文字に統一して集計
+        hashtags = hashtags.str.lower()
+        hashtag_counts = hashtags.value_counts().head(30) # 上位30件
+
+        st.subheader("頻出ハッシュタグ Top 30")
+        
+        # ハッシュタグの前に # を付け直す
+        hashtag_counts.index = "#" + hashtag_counts.index.astype(str)
+        
+        st.bar_chart(hashtag_counts)
+        with st.expander("詳細データ（Top 30）"):
+            st.dataframe(hashtag_counts.reset_index(name="出現回数").rename(columns={"index": "ハッシュタグ"}))
+        
+        return hashtag_counts # 
+
+    except Exception as e:
+        st.error(f"ハッシュタグ分析処理中にエラー: {e}")
+        logger.error(f"run_hashtag_analysis error: {e}", exc_info=True)
+    return None
+
+# --- (★) L843付近に追加: 人気投稿分析 ---
+def run_engagement_analysis(df, text_col='ANALYSIS_TEXT_COLUMN'):
+    """エンゲージメント（いいね数など）に基づき人気投稿を分析する"""
+    if text_col not in df.columns:
+        st.warning(f"テキスト列 '{text_col}' が見つかりません。")
+        return None
+
+    # エンゲージメントに関連する可能性のある列名を推測
+    possible_cols = [
+        'likes', 'like', 'いいね', 'いいね数', 
+        'retweets', 'retweet', 'リツイート', 'リツイート数',
+        'comments', 'comment', 'コメント', 'コメント数',
+        'engagement', 'エンゲージメント'
+    ]
+    
+    # 存在する数値列をフィルタリング
+    numeric_cols = df.select_dtypes(include=np.number).columns
+    engagement_cols = [col for col in numeric_cols if any(c_name in col.lower() for c_name in possible_cols)]
+
+    if not engagement_cols:
+        st.warning("データに「いいね数」「リツイート数」「コメント数」などのエンゲージメントを示す数値列が見つかりません。")
+        st.info(f"（分析可能な数値列: {', '.join(numeric_cols.tolist())}）")
+        return None
+
+    # ユーザーにソート基準の列を選んでもらう
+    sort_col = st.selectbox(
+        "人気投稿の基準（ソートキー）にする列を選択してください:",
+        engagement_cols,
+        key="eng_select_col"
+    )
+    
+    top_n = st.slider("表示件数", 5, 50, 10, key="eng_slider")
+
+    if not sort_col:
+        return None
+
+    try:
+        # ソート対象の列とテキスト列を抽出
+        cols_to_show = [sort_col, text_col]
+        # 他のエンゲージメント列もあれば表示に追加
+        cols_to_show.extend([col for col in engagement_cols if col != sort_col and col in df.columns])
+        
+        popular_posts_df = df[cols_to_show].copy()
+        popular_posts_df = popular_posts_df.sort_values(by=sort_col, ascending=False).head(top_n)
+        
+        st.subheader(f"「{sort_col}」に基づく人気投稿 Top {top_n}")
+        
+        st.dataframe(popular_posts_df)
+        
+        with st.expander("投稿詳細（テキスト全体）"):
+            for idx, row in popular_posts_df.iterrows():
+                st.markdown(f"**{idx+1}. {sort_col}: {row[sort_col]}**")
+                st.text_area(f"Text (Row {idx})", row[text_col], height=100, disabled=True, key=f"eng_text_{idx}")
+                st.markdown("---")
+
+        return popular_posts_df
+
+    except Exception as e:
+        st.error(f"人気投稿分析処理中にエラー: {e}")
+        logger.error(f"run_engagement_analysis error: {e}", exc_info=True)
+    return None
+
+# --- (★) L843付近に追加: 市区町村別 概要・投稿数・センチメント分析 (LLM使用) ---
+def run_geo_summary_llm(df, geo_col="市区町村キーワード", text_col="ANALYSIS_TEXT_COLUMN"):
+    """
+    市区町村キーワードごとにグループ化し、投稿数集計、センチメント分析、投稿概要の要約をLLMで行う。
+    """
+    if geo_col not in df.columns:
+        st.warning(f"分析の軸となる「{geo_col}」列が見つかりません。Step AまたはBでタグ付けされたデータを使用してください。")
+        return None
+    if text_col not in df.columns:
+        st.warning(f"分析対象のテキスト列「{text_col}」が見つかりません。")
+        return None
+
+    # 1. 投稿数の集計 (run_simple_count と同じロジック)
+    st.subheader(f"1. 「{geo_col}」別 投稿数")
+    try:
+        s = df[geo_col].astype(str).str.split(', ').explode()
+        s = s[s.str.strip() != ''] # 空白を除去
+        s = s.str.strip() # 前後の空白を除去
+        
+        if s.empty:
+            st.info("集計対象の市区町村キーワードがありませんでした。")
+            return None #
+            
+        geo_counts = s.value_counts().head(20) # 上位20件
+        st.bar_chart(geo_counts)
+        with st.expander("投稿数データ（上位20件）"):
+            st.dataframe(geo_counts)
+    except Exception as e:
+        st.error(f"市区町村別の投稿数集計中にエラー: {e}")
+        logger.error(f"run_geo_summary_llm (Count) error: {e}", exc_info=True)
+        return None # 投稿数がなければ続行不可
+
+    # 2. センチメント分析 と 3. 投稿概要の要約 (LLM使用)
+    st.markdown("---")
+    st.subheader(f"2. & 3. 「{geo_col}」別 センチメントと投稿概要（AI分析）")
+
+    # 分析対象の市区町村を投稿数TopNから選択
+    target_geos = geo_counts.index.tolist()
+    selected_geos = st.multiselect(
+        "AI分析（センチメント・概要）を実行する市区町村を選択（APIコールが発生します）:",
+        target_geos,
+        default=target_geos[:min(len(target_geos), 3)], # デフォルトTop3
+        key="geo_llm_select"
+    )
+
+    if not selected_geos:
+        st.info("AI分析を実行する市区町村を選択してください。")
+        return geo_counts # 投稿数データのみ返す
+
+    llm = get_llm()
+    if llm is None:
+        st.error("AIモデルが利用できません。サイドバーでAPIキーを設定してください。")
+        return geo_counts
+
+    # プロンプトテンプレートの準備
+    prompt = PromptTemplate.from_template(
+        """
+        あなたはデータアナリストです。以下の「{geo_col}」に関する「サンプル投稿テキスト群」を読み、その地域の「センチメント」と「投稿概要」を分析してください。
+        
+        # 分析対象の市区町村:
+        {target_geo_name}
+        
+        # サンプル投稿テキスト群 (最大10件):
+        {text_samples}
+        
+        # 指示:
+        1. 「センチメント」: テキスト群全体の雰囲気を「ポジティブ」「ネガティブ」「ニュートラル」の3択で判定し、その理由も簡潔に記述してください。
+        2. 「投稿概要」: これらの投稿で主に何が話題にされているか、重要なトピックを300文字程度で要約してください。
+        
+        # 回答フォーマット (厳格なJSON辞書形式のみ):
+        {{
+          "geo_name": "{target_geo_name}",
+          "sentiment": "（ポジティブ/ネガティブ/ニュートラル）",
+          "sentiment_reason": "（判定理由）",
+          "summary": "（300文字程度の要約）"
+        }}
+        """
+    )
+    chain = prompt | llm | StrOutputParser()
+
+    results = []
+    progress_bar = st.progress(0, text="AI分析待機中...")
+    
+    if 'geo_summary_results' not in st.session_state:
+        st.session_state.geo_summary_results = {}
+
+    run_button = st.button(f"選択した {len(selected_geos)} 件のAI分析を実行", key="run_geo_llm", type="primary")
+
+    if run_button:
+        # 実行時にキャッシュをクリア
+        st.session_state.geo_summary_results = {}
+        
+        for i, geo_name in enumerate(selected_geos):
+            progress_bar.progress((i) / len(selected_geos), text=f"AI分析中: {geo_name} ({i+1}/{len(selected_geos)})")
+            
+            # geo_name が含まれる行を抽出
+            try:
+                mask = df.apply(lambda row: isinstance(row[geo_col], str) and geo_name in row[geo_col], axis=1)
+                geo_texts = df.loc[mask, text_col].dropna().sample(n=min(10, mask.sum()), random_state=1).tolist()
+            except Exception:
+                geo_texts = df.loc[mask, text_col].dropna().tolist()[:10]
+
+            if not geo_texts:
+                logger.warning(f"「{geo_name}」のテキストが見つかりません。スキップします。")
+                results.append({"geo_name": geo_name, "sentiment": "データなし", "sentiment_reason": "-", "summary": "投稿テキストが見つかりませんでした。"})
+                continue
+            
+            # テキストサンプルを文字列に
+            text_samples_str = "\n".join([f"- {text[:200]}..." for text in geo_texts]) 
+
+            try:
+                response_str = chain.invoke({
+                    "geo_col": geo_col,
+                    "target_geo_name": geo_name,
+                    "text_samples": text_samples_str
+                })
+                
+                logger.debug(f"AI Geo Summary (Raw) for {geo_name}: {response_str}")
+                match = re.search(r'\{.*\}', response_str, re.DOTALL)
+                if match:
+                    json_str = match.group(0)
+                    data = json.loads(json_str)
+                    results.append(data)
+                else:
+                    raise Exception("JSON形式の応答がありません。")
+                
+            except Exception as e:
+                logger.error(f"AI Geo Summary Error (LLM) for {geo_name}: {e}", exc_info=True)
+                st.error(f"「{geo_name}」のAI分析中にエラー: {e}")
+                results.append({"geo_name": geo_name, "sentiment": "分析エラー", "sentiment_reason": str(e), "summary": "AIの応答取得に失敗しました。"})
+            
+            # APIレート制限のための待機 (app.py L34 の値)
+            time.sleep(TAGGING_SLEEP_TIME) 
+        
+        progress_bar.progress(1.0, text="AI分析完了！")
+        st.session_state.geo_summary_results = results
+        
+    # 結果の表示
+    if st.session_state.geo_summary_results:
+        results_df = pd.DataFrame(st.session_state.geo_summary_results)
+        
+        st.subheader("センチメント分析結果")
+        sentiment_counts = results_df['sentiment'].value_counts()
+        st.bar_chart(sentiment_counts)
+        
+        st.subheader("市区町村別 概要")
+        for res in st.session_state.geo_summary_results:
+            with st.expander(f"**{res.get('geo_name')}** (センチメント: {res.get('sentiment')})"):
+                st.markdown(f"**<AIによる投稿概要>**\n{res.get('summary')}")
+                st.caption(f"センチメント判定理由: {res.get('sentiment_reason')}")
+        
+        return results_df 
+    
+    return geo_counts
+
 # --- L752: UI更新ヘルパー (DRY原則) ---
 def update_progress_ui(progress_placeholder, log_placeholder, processed_rows, total_rows, message_prefix):
     """
@@ -1122,6 +1855,7 @@ def render_step_a():
 # --- L833: Step C (可視化UI) ---
 def render_step_c():
     """Step C: 分析結果の可視化を描画する"""
+    st.markdown("<script>window.scrollTo(0, 0);</script>", unsafe_allow_html=True)
     st.title("🔬 分析結果の可視化 (Step C)")
     
     # Step C 固有のセッションステートをここで初期化 (SRP)
@@ -1163,7 +1897,8 @@ def render_step_c():
         cols = suggestion.get('suitable_cols', []) 
         
         with st.container(border=True):
-            st.subheader(f"📈 分析結果: {name}")
+            if name != "共起ネットワーク分析": # (★) この if 文を追加
+                st.subheader(f"📈 分析結果: {name}")
             
             try:
                 result_data = None # 結果格納用
@@ -1176,9 +1911,37 @@ def render_step_c():
                 elif name == "クロス集計（キーワード×属性）":
                     result_data = run_crosstab(df, cols)
                 elif name == "共起ネットワーク分析":
-                    st.warning("「共起ネットワーク分析」は現在実装中です。") #
-                elif name == "カテゴリ別集計（グループ比較）":
+                    result_data = run_cooccurrence_network(df, cols) 
+                
+                elif name == "市区町村地域ごとの投稿概要と投稿数":
+                    st.info("AIによる分析（センチメント・概要）が含まれます。")
+                    result_data = run_geo_summary_llm(df, geo_col="市区町村キーワード", text_col="ANALYSIS_TEXT_COLUMN")
+
+                elif name == "投稿量分析":
+                    st.info("「時系列キーワード分析」を実行します。")
+                    if isinstance(cols, dict) and 'datetime' in cols and 'keywords' in cols:
+                        result_data = run_timeseries(df, cols)
+                    else:
+                        st.warning("この分析には「日時列」と「キーワード列」が必要です。Step Bの提案定義を確認してください。")
+
+                elif name == "センチメント分析":
+                    st.warning("この分析は「市区町村地域ごとの投稿概要と投稿数」分析に含まれています。そちらを実行してください。")
+
+                elif name == "ハッシュタグ分析":
+                    result_data = run_hashtag_analysis(df, text_col='ANALYSIS_TEXT_COLUMN')
+
+                elif name == "カテゴリ分類":
+                    st.info("「単純集計（頻度分析）」を実行します。")
+                    result_data = run_simple_count(df, cols) 
+
+                elif name == "エンゲージメントに基づく人気投稿分析":
+                    result_data = run_engagement_analysis(df, text_col='ANALYSIS_TEXT_COLUMN')
+
+                elif name == "二群間の比較分析":
+                    st.info("「カテゴリ別集計（グループ比較）」または「クロス集計」を実行します。")
                     if isinstance(cols, dict) and 'numeric' in cols and 'grouping' in cols:
+                         st.markdown("（カテゴリ別集計（グループ比較）を実行）")
+                         # (L895-L933 のロジックを流用)
                          grouping_cols = cols['grouping']
                          numeric_cols_to_desc = [col for col in cols['numeric'] if col in df.columns]
                          
@@ -1196,8 +1959,6 @@ def render_step_c():
                                      for col in existing_grouping_cols:
                                          df_copy[col] = df_copy[col].astype(str)
                                          
-                                     # L874: 致命的バグ (NameError) 修正
-                                     # L874 (旧) を L871 の前に移動
                                      result_df = df_copy.groupby(existing_grouping_cols)[numeric_cols_to_desc].describe()
                                      
                                      flat_cols = []
@@ -1207,24 +1968,65 @@ def render_step_c():
                                      
                                      final_result_df = result_df.reset_index()
                                      st.dataframe(final_result_df) 
-                                     result_data = final_result_df # 
+                                     result_data = final_result_df 
+                                 except Exception as group_e:
+                                     st.error(f"グループ別集計エラー: {group_e}")
+                                     logger.error(f"Groupby describe error: {group_e}", exc_info=True)
+                    else:
+                         st.markdown("（クロス集計を実行）")
+                         result_data = run_crosstab(df, cols) 
+
+                elif name == "エリア別抽出パターン分析":
+                    st.info("「クロス集計（キーワード間）」を実行します。")
+                    result_data = run_crosstab(df, cols)
+                
+                elif name == "カテゴリ別集計（グループ比較）":
+                    # (L895-L933 のロジック)
+                    if isinstance(cols, dict) and 'numeric' in cols and 'grouping' in cols:
+                         grouping_cols = cols['grouping']
+                         numeric_cols_to_desc = [col for col in cols['numeric'] if col in df.columns]
+                         if not numeric_cols_to_desc: st.warning("分析対象の数値列がデータにありません。")
+                         elif not grouping_cols: st.warning("分析対象のグループ列がありません。")
+                         else:
+                             if not isinstance(grouping_cols, list):
+                                 grouping_cols = [grouping_cols]
+                             existing_grouping_cols = [col for col in grouping_cols if col in df.columns]
+                             if not existing_grouping_cols:
+                                 st.warning(f"グループ化列 {grouping_cols} がデータに存在しません。")
+                             else:
+                                 try:
+                                     df_copy = df.copy()
+                                     for col in existing_grouping_cols:
+                                         df_copy[col] = df_copy[col].astype(str)
+                                     result_df = df_copy.groupby(existing_grouping_cols)[numeric_cols_to_desc].describe()
+                                     flat_cols = []
+                                     for col in result_df.columns:
+                                         flat_cols.append(f"{col[0]}_{col[1]}") 
+                                     result_df.columns = flat_cols
+                                     final_result_df = result_df.reset_index()
+                                     st.dataframe(final_result_df) 
+                                     result_data = final_result_df 
                                  except Exception as group_e:
                                      st.error(f"グループ別集計エラー: {group_e}")
                                      logger.error(f"Groupby describe error: {group_e}", exc_info=True)
                     else:
                          st.warning(f"「{name}」の列定義が不適切です: {cols}")
+
                 elif name == "時系列キーワード分析":
                     if isinstance(cols, dict) and 'datetime' in cols and 'keywords' in cols:
                         result_data = run_timeseries(df, cols)
                     else:
                          st.warning(f"「{name}」の列定義が不適切です: {cols}")
+
                 elif name == "テキストマイニング（頻出単語など）":
                     if cols and isinstance(cols, list) and cols[0] == 'ANALYSIS_TEXT_COLUMN':
                         result_data = run_text_mining(df, 'ANALYSIS_TEXT_COLUMN')
                     else:
                         st.warning(f"「{name}」の列定義が不適切です: {cols}")
+
                 elif name == "主成分分析 (PCA) / 因子分析":
-                    st.warning("「主成分分析」は現在実装中です。")
+                    result_data = run_pca(df, cols)
+                
                 else:
                     st.warning(f"「{name}」の可視化ロジックはまだ実装されていません。")
                 
