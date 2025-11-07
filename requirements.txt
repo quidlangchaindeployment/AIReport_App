@@ -8,3 +8,6 @@ langchain-google-genai==1.0.1
 networkx==3.3
 pyvis==0.3.2
 scikit-learn==1.4.2
+python-pptx
+streamlit-sortables
+matplotlib

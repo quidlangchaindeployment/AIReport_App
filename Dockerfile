@@ -1,12 +1,14 @@
 # ベースイメージとして公式のPython 3.10スリム版を使用
 FROM python:3.10-slim
 
-# (★) ビルドに必要なシステムライブラリをインストール
-# gcc (コンパイラ) を追加
+# (★) --- 日本語フォントとグラフ用ライブラリのインストール ---
+# gcc (コンパイラ) と 日本語フォント (fonts-ipafont-gothic) を追加
 RUN apt-get update && apt-get install -y \
     build-essential \
     gcc \
+    fonts-ipafont-gothic \
     && rm -rf /var/lib/apt/lists/*
+# (★) --- ここまでが変更点 ---
 
 # 作業ディレクトリを設定
 WORKDIR /app
@@ -29,4 +31,5 @@ COPY geography_db.py .
 EXPOSE 8501
 
 # コンテナ起動時にStreamlitアプリケーションを実行するコマンド
-CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.headless", "true", "--server.enableCORS", "false"]
+# (★) 警告が出ていた --server.enableCORS を削除
+CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.headless", "true"]
