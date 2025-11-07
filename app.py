@@ -33,6 +33,7 @@ matplotlib.use('Agg') # (★) Streamlitのバックエンドで動作させる�
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 import base64
+from wordcloud import WordCloud
 
 # (★) --- matplotlib 日本語フォント設定 ---
 # DockerfileでインストールしたIPAフォントのパスを指定
@@ -1015,7 +1016,7 @@ def suggest_analysis_techniques_py(df: pd.DataFrame) -> List[Dict[str, Any]]:
         if '市区町村キーワード' in flag_cols:
             potential_suggestions.append({
                 "priority": 1, "name": "市区町村別投稿数",
-                "description": "「市区町村キーワード」列の出現頻度を分析します。",
+                "description": "「市区町村キーワード」列の出現頻度を分析します。これは、エリア別の傾向を比較する際の基礎データとなります。",
                 "reason": "地域別の投稿ボリュームを把握します。",
                 "suitable_cols": ['市区町村キーワード'],
                 "type": "python"
@@ -1310,6 +1311,31 @@ def generate_graph_image(
             nx.draw_networkx_labels(G, pos, font_size=10, font_family='IPAGothic') # (★) 日本語フォント指定
             plt.axis('off')
 
+        # (★) --- ワードクラウド生成ロジックを追加 ---
+        elif plot_type == 'wordcloud' and not df.empty:
+            # df には 'word' と 'count' 列があると仮定
+            if 'word' not in df.columns or 'count' not in df.columns:
+                 raise ValueError("ワードクラウドには 'word' と 'count' 列が必要です。")
+            
+            # (★) 頻度辞書を作成
+            frequencies = df.set_index('word')['count'].to_dict()
+            
+            if not frequencies:
+                 raise ValueError("ワードクラウド用の単語がありません。")
+
+            # (★) WordCloud オブジェクトを日本語フォントパス指定で生成
+            wc = WordCloud(
+                font_path=font_path, # (★) L40で設定した日本語フォントパス
+                width=800,
+                height=500,
+                background_color='white',
+                colormap='viridis', # (★) PDF P5 [cite: 70-106] のカラフルさに近いマップ
+                max_words=100
+            ).generate_from_frequencies(frequencies)
+            
+            plt.imshow(wc, interpolation='bilinear')
+            plt.axis('off')
+
         else:
             logger.warning(f"未対応のプロットタイプ: {plot_type}")
             return None
@@ -1572,10 +1598,10 @@ def run_text_mining(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Dict[str, A
         # (★) グラフ生成 (ワードクラウドの代わりに棒グラフ)
         results["image_base64"] = generate_graph_image(
             df=word_counts_df,
-            plot_type='bar',
-            x_col='word',
-            y_col='count',
-            title="頻出単語 TOP20"
+            plot_type='wordcloud', # (★) 'bar' から 'wordcloud' に変更
+            # x_col='word', (★) wordcloud では不要
+            # y_col='count', (★) wordcloud では不要
+            title="頻出単語 ワードクラウド (TOP100)" # (★) タイトル変更
         )
         return results
         
@@ -2861,11 +2887,16 @@ def render_step_c():
                 for i, slide in enumerate(report_data):
                     title = slide.get('slide_title', '（タイトルなし）')
                     layout = slide.get('slide_layout', 'N/A')
-                    content_preview = slide.get('slide_content', [])[0] if slide.get('slide_content') else "（コンテンツなし）"
-                    has_image = "有り" if slide.get("image_base64") else "無し"
-                    
-                    with st.expander(f"**{i+1}: {title}** (Layout: {layout}, Image: {has_image})"):
-                        st.markdown(f"**内容 (抜粋):**\n- {content_preview}...")
+                
+                slide_content_list = slide.get('slide_content')                
+                if isinstance(slide_content_list, list) and slide_content_list:
+                    content_preview = str(slide_content_list[0]) if slide_content_list[0] else "（空のコンテンツ）"
+                else:
+                    content_preview = "（コンテンツなし）"
+                has_image = "有り" if slide.get("image_base64") else "無し"
+                
+                with st.expander(f"**{i+1}: {title}** (Layout: {layout}, Image: {has_image})"):
+                    st.markdown(f"**内容 (抜粋):**\n- {content_preview}...")
             else:
                 st.error("AIの回答が期待したスライドのリスト形式ではありません。")
                 st.text_area("AIの生回答 (JSON):", value=st.session_state.step_c_report_json, height=200, disabled=True)

@@ -12,3 +12,4 @@ python-pptx
 streamlit-sortables
 matplotlib
 python-dotenv
+wordcloud
