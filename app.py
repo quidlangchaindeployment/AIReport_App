@@ -2439,79 +2439,205 @@ JSON以外のテキスト（例：「承知しました」）は【絶対に】�
         # (★) --- フォールバック用の最小限のプロンプト ---
         return f"# (★) プロンプト自動生成失敗: {e}\n\n# 指示:\nあなたは優秀な経営コンサルタントです。提供される「分析データ（JSONL）」を読み、以下のJSON形式でPowerPoint用の分析レポートを作成してください。\n\n[ {{ \"slide_title\": \"...\", \"slide_layout\": \"title_and_content\", \"slide_content\": [\"...\", \"...\"], \"image_base64\": null }} ]"
 
+# --- 9. (★) Step C: AIレポート生成 (逐次処理) ---
+# (★) 廃止: generate_step_c_prompt() は不要になったため削除します。
+
 def run_step_c_analysis(
-    analysis_prompt: str,
     jsonl_data_string: str,
-    model_name: str # (★) --- 修正: 引数 model_name を追加 ---
+    model_name: str,
+    progress_bar: st.delta_generator.DeltaGenerator,
+    log_placeholder: st.delta_generator.DeltaGenerator
 ) -> str:
     """
-    (Step C) gemini-2.5-pro を使用して、分析データから構造化レポート (JSON) を生成する。
-    (★) モデル: MODEL_PRO (gemini-2.5-pro)
+    (★) Step C: AIレポート生成 (逐次処理・RateLimit対応版)
+    analysis_data.json (JSONL) を1行ずつ処理し、AIにスライド1枚ずつ生成させる。
     """
-    logger.info(f"Step C AIレポート生成 ({model_name}) 実行...") # (★) 修正
+    logger.info(f"Step C AIレポート生成 (逐次) 開始... (Model: {model_name})")
+
+    # (★) --- 1. モデルに基づきRate Limit (RPM) のための待機時間を設定 ---
+    # (★) 添付画像 image_74e2dd.png に基づく無料枠のRPM
+    if model_name == MODEL_PRO:
+        rpm_limit = 2
+    elif model_name == MODEL_FLASH:
+        rpm_limit = 10
+    else:
+        rpm_limit = 10 # デフォルト
+
+    # (★) 60秒 / RPM (リクエストマージン 0.5秒)
+    sleep_time = (60 / rpm_limit) + 0.5 
+    logger.info(f"Rate Limit設定: {rpm_limit} RPM -> {sleep_time:.1f} 秒/リクエスト")
+
+    # (★) --- 2. 逐次処理用のAIプロンプトテンプレートを定義 ---
+    # (★) (旧 generate_step_c_prompt に代わる、スライド1枚生成用のプロンプト)
+    ITERATIVE_SLIDE_PROMPT_TEMPLATE = """
+    あなたはシニアデータアナリストであり、クライアント向けレポートの「スライド1枚」を作成しています。
+    提供される「分析タスクデータ（JSONL形式の1行）」を読み、このタスク専用の【スライド1枚分のJSONオブジェクト】を生成してください。
+
+    # 分析タスクデータ (JSONLの1行):
+    {task_data_line}
+
+    # 指示:
+    1.  **タイトル**: `task_data_line` の `analysis_task` 名に基づき、 professional な「slide_title」を考案してください。
+    2.  **考察**: `task_data_line` の `summary` と `data`（もしあれば`image_base64`）を解釈し、クライアントが知るべき【インサイト（発見）】を「slide_content」として2〜4点の詳細な箇条書き（文字列リスト）で記述してください。
+    3.  **レイアウト**:
+        * `task_data_line` に `image_base64` が **存在し、nullでない** 場合、`"slide_layout"` は `"text_and_image"` としてください。
+        * `task_data_line` の `image_base64` が **null** の場合、`"slide_layout"` は `"title_and_content"` としてください。
+    4.  **画像**: `task_data_line` の `image_base64` の値をそのままコピーしてください（nullの場合もnullをコピー）。
+
+    # 出力形式 (厳守):
+    * JSON以外のテキストは絶対に含めず、【単一のJSONオブジェクト】`{{ ... }}` のみを出力してください。
+    * 以下の構造を厳格に守ってください。
+        {{
+          "slide_title": "（指示1で考案したタイトル）",
+          "slide_layout": "（指示3で決定したレイアウト）",
+          "slide_content": [
+            "（指示2で記述したインサイト1）",
+            "（指示2で記述したインサイト2）"
+          ],
+          "image_base64": "（指示4でコピーしたBase64文字列またはnull）"
+        }}
+
+    # 回答 (単一のJSONオブジェクトのみ):
+    """
     
-    # (★) --- 修正: 引数で渡されたモデル名を使用 ---
+    prompt = PromptTemplate.from_template(ITERATIVE_SLIDE_PROMPT_TEMPLATE)
     llm = get_llm(model_name=model_name, temperature=0.2)
     if llm is None:
-        logger.error(f"run_step_c_analysis: LLM ({model_name}) が利用できません。")
-        st.error(f"AIモデル({model_name})が利用できません。APIキーを確認してください。")
-        return f'[{{"slide_title": "AIモデル({model_name})が利用できませんでした。", "slide_layout": "title_and_content", "slide_content": [], "image_base64": null}}]'
-    # (★) --- ここまでが修正点 ---
+        st.error(f"AIモデル({model_name})が利用できません。")
+        return "[]" # 空のJSONリスト
+        
+    chain = prompt | llm | StrOutputParser()
 
-    # (★) 最終的に Pro モデルに渡すプロンプト
-    # 指示プロンプト (Flashが生成) + 完全なJSONLデータ
-    final_prompt_to_pro = f"""
-    {analysis_prompt}
+    # (★) --- 3. 逐次処理ループ ---
+    report_slides_list = []
+    log_messages_ui = []
     
-    # 分析データ (JSONL):
-    {jsonl_data_string}
+    tasks_all = jsonl_data_string.strip().splitlines()
     
-    # 回答 (指示されたJSON形式のみ):
-    """
+    # (★) 処理対象タスクをフィルタリング (OverallSummaryはスライドにしない)
+    tasks_to_process = [line for line in tasks_all if '"analysis_task": "OverallSummary"' not in line]
+    total_tasks = len(tasks_to_process)
     
-    # (★) トークン数（参考値）のロギング
-    # (日本語は1文字あたり約1〜2トークンと仮定)
-    estimated_tokens = len(final_prompt_to_pro) * 1.5 
-    logger.info(f"Step C ({model_name}) 実行。推定入力トークン数: {estimated_tokens:,.0f}")
-    if estimated_tokens > 800000: # (★) Pro 1M context window の 80%
-         logger.warning(f"入力トークンが非常に多い ({estimated_tokens:,.0f})。処理に時間がかかるか、失敗する可能性があります。")
-
+    # (★) 0. 表紙スライドを追加
+    report_slides_list.append({
+        "slide_title": "SNSデータ分析レポート",
+        "slide_layout": "title_only",
+        "slide_content": ["AI-Generated Analysis (Powered by Gemini)"],
+        "image_base64": None
+    })
     
+    # (★) 0. 目次スライドを追加
     try:
-        response = llm.invoke(final_prompt_to_pro)
-        response_str = response.content # (★) .content を取得
+        agenda_items = [f"{i+1}. {json.loads(line).get('analysis_task', '分析タスク')}" for i, line in enumerate(tasks_to_process)]
+        # (★) 最後に「結論と提言」スライドを追加することをAIに期待
+        agenda_items.append(f"{total_tasks + 1}. 結論と戦略的提言")
         
-        logger.info(f"Step C AIレポート生成 ({model_name}) 完了。") # (★) 修正
-        logger.debug(f"Step C 生回答 (先頭500文字): {response_str[:500]}")
-        
-        # (★) 回答から JSON リスト ( [...] ) を抽出
-        # (★) AIがマークダウン(```json ... ```)を付けても対応できるように修正
-        match = re.search(r'```(?:json)?\s*(\[.*\])\s*```', response_str, re.DOTALL)
-        if not match:
-             match = re.search(r'\[.*\]', response_str, re.DOTALL) # マークダウンなしの場合
-
-        if match:
-            json_report_str = match.group(1)
-            
-            # (★) JSONとして有効か検証
-            try:
-                json.loads(json_report_str)
-                logger.info(f"Step C ({model_name}) 回答のJSONパース成功。 (サイズ: {len(json_report_str):,} bytes)") # (★) 修正
-                return json_report_str # (★) 成功: JSON文字列を返す
-            except json.JSONDecodeError as json_e:
-                logger.error(f"AI ({model_name}) の回答がJSONパースに失敗: {json_e}") # (★) 修正
-                logger.error(f"AI ({model_name}) 生回答 (パース失敗箇所周辺): {json_report_str[max(0, json_e.pos-100):json_e.pos+100]}") # (★) 修正
-                return f'[{{"slide_title": "AI回答パースエラー", "slide_layout": "title_and_content", "slide_content": ["AIの回答がJSON形式ではありませんでした。", "{str(json_e)}", "Raw: {response_str[:500]}..."], "image_base64": null}}]'
-        
-        else:
-            logger.error(f"AI ({model_name}) の回答にJSONリスト [...] が見つかりません。") # (★) 修正
-            return f'[{{"slide_title": "AI回答形式エラー", "slide_layout": "title_and_content", "slide_content": ["AIがJSONリスト形式 [...] で回答しませんでした。", "Raw: {response_str[:500]}..."], "image_base64": null}}]'
-
+        report_slides_list.append({
+            "slide_title": "本日のアジェンダ",
+            "slide_layout": "title_and_content",
+            "slide_content": agenda_items,
+            "image_base64": None
+        })
     except Exception as e:
-        logger.error(f"run_step_c_analysis ({model_name}) error: {e}", exc_info=True) # (★) 修正
-        st.error(f"AIレポート生成 ({model_name}) 実行中にエラー: {e}") # (★) 修正
-        return f'[{{"slide_title": "実行時エラー", "slide_layout": "title_and_content", "slide_content": ["{str(e)}"], "image_base64": null}}]'
+        logger.error(f"目次スライドの生成に失敗: {e}")
 
+
+    # (★) 1. メインの分析スライドをループ処理
+    for i, task_line in enumerate(tasks_to_process):
+        try:
+            task_name = json.loads(task_line).get("analysis_task", f"Task {i+1}")
+        except Exception:
+            task_name = f"Task {i+1}"
+        
+        # (★) --- 3.1. UI（進捗バー・ログ）の更新 ---
+        progress_percent = (i + 1) / total_tasks
+        progress_bar.progress(progress_percent, text=f"Step C (スライド生成中): {i+1}/{total_tasks} ({task_name})")
+        log_messages_ui.append(f"[{i+1}/{total_tasks}] '{task_name}' のスライド生成を開始 (Model: {model_name})...")
+        log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key=f"step_c_log_{i}")
+
+        try:
+            # (★) --- 3.2. AIへのリクエスト (1タスクごと) ---
+            response_str = chain.invoke({"task_data_line": task_line})
+            
+            # (★) AIの回答 (単一のJSONオブジェクト) をパース
+            match = re.search(r'\{.*\}', response_str, re.DOTALL)
+            if match:
+                slide_json_str = match.group(0)
+                slide_object = json.loads(slide_json_str)
+                report_slides_list.append(slide_object)
+                log_messages_ui.append(f"  -> SUCCESS: スライド '{slide_object.get('slide_title')}' を生成しました。")
+            else:
+                raise Exception("AIがJSONオブジェクト`{{...}}`を返しませんでした。")
+        
+        except Exception as e:
+            logger.error(f"タスク '{task_name}' の処理に失敗: {e}")
+            log_messages_ui.append(f"  -> ERROR: '{task_name}' の処理に失敗。{e}")
+            # (★) エラースライドを挿入
+            report_slides_list.append({
+                "slide_title": f"エラー: {task_name}",
+                "slide_layout": "title_and_content",
+                "slide_content": [f"このスライドの生成に失敗しました。", f"エラー: {e}"],
+                "image_base64": None
+            })
+        
+        # (★) --- 3.3. Rate Limit のための待機 ---
+        if i < total_tasks - 1: # 最後のタスク以外
+            log_messages_ui.append(f"  -> Rate Limit (RPM) のため {sleep_time:.1f} 秒待機します...")
+            log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key=f"step_c_log_{i}_sleep")
+            time.sleep(sleep_time)
+
+    # (★) 4. 結論スライドの自動生成を試みる
+    # (★) (最後のタスクとして、Pro/Flashに「まとめ」を依頼する)
+    try:
+        log_messages_ui.append(f"[{total_tasks+1}/{total_tasks+1}] 結論と提言スライドを生成中...")
+        log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key="step_c_log_final")
+
+        # (★) 全体のサマリーデータ (OverallSummary) をコンテキストとして使用
+        summary_line = next((line for line in tasks_all if '"analysis_task": "OverallSummary"' in line), "{}")
+        
+        CONCLUSION_PROMPT = f"""
+        あなたはシニアデータアナリストです。
+        以下の「分析サマリー」と「これまで生成したスライドのタイトルリスト」に基づき、
+        レポートの締めくくりとなる【結論と戦略的提言】のスライド1枚分のJSONオブジェクトを生成してください。
+
+        # 分析サマリー:
+        {summary_line}
+        
+        # 生成済みスライドタイトル:
+        {json.dumps([s.get('slide_title') for s in report_slides_list], ensure_ascii=False)}
+
+        # 指示:
+        1.  タイトルは「結論と戦略的提言」とします。
+        2.  レイアウトは「title_and_content」とします。
+        3.  内容は、分析全体から導かれる「結論」と、クライアントが次に取るべき「具体的なアクション（提言）」を3〜5点の箇条書きで記述してください。
+        4.  画像 (image_base64) は null とします。
+
+        # 回答 (単一のJSONオブジェクトのみ):
+        """
+        
+        response_str = llm.invoke(CONCLUSION_PROMPT) # (★) 最後のAPIコール
+        match = re.search(r'\{.*\}', response_str, re.DOTALL)
+        if match:
+            report_slides_list.append(json.loads(match.group(0)))
+            log_messages_ui.append(f"  -> SUCCESS: 結論スライドを生成しました。")
+        else:
+            raise Exception("AIが結論スライドのJSONを返しませんでした。")
+            
+    except Exception as e:
+         logger.error(f"結論スライドの生成に失敗: {e}")
+         log_messages_ui.append(f"  -> ERROR: 結論スライドの生成に失敗。{e}")
+         report_slides_list.append({
+                "slide_title": "結論と戦略的提言",
+                "slide_layout": "title_and_content",
+                "slide_content": [f"結論スライドの自動生成に失敗しました。", f"エラー: {e}"],
+                "image_base64": None
+            })
+
+    # (★) 5. 最終的なJSON文字列を返す
+    progress_bar.progress(1.0, text="Step C: 完了！")
+    log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key="step_c_log_done")
+    
+    return json.dumps(report_slides_list, ensure_ascii=False, indent=2) # (★) 読みやすさのためindent=2を追加
 
 def render_step_c():
     """(Step C) AIレポート生成UIを描画する"""
@@ -2521,15 +2647,13 @@ def render_step_c():
     if 'step_c_jsonl_data' not in st.session_state:
         st.session_state.step_c_jsonl_data = None
     if 'step_c_prompt' not in st.session_state:
-        st.session_state.step_c_prompt = None
+        st.session_state.step_c_prompt = None # (★) この変数はもう使用しませんが、他への影響を避けるため残置
     if 'step_c_report_json' not in st.session_state:
         st.session_state.step_c_report_json = None
-    # (★) --- 修正: モデル選択のセッションステートを追加 ---
     if 'step_c_model' not in st.session_state:
         st.session_state.step_c_model = MODEL_FLASH # (★) デフォルトをFlashに
-    # (★) --- ここまでが修正点 ---
 
-    # --- 1. ファイルアップロード (要件⑧) ---
+    # --- 1. ファイルアップロード ---
     st.header("Step 1: 分析データ (JSON) のアップロード")
     st.info("Step B でエクスポートした `analysis_data.json` をアップロードしてください。")
     uploaded_report_file = st.file_uploader(
@@ -2540,18 +2664,13 @@ def render_step_c():
 
     if uploaded_report_file:
         try:
+            # (★) ファイルがアップロードされても、プロンプト生成は *行わない*
             if st.session_state.step_c_jsonl_data is None:
                 jsonl_data_string = uploaded_report_file.getvalue().decode('utf-8')
                 st.session_state.step_c_jsonl_data = jsonl_data_string
-                st.session_state.step_c_prompt = None
-                st.session_state.step_c_report_json = None
+                st.session_state.step_c_report_json = None # (★) 結果をリセット
                 st.success(f"ファイル「{uploaded_report_file.name}」読込完了")
-            
-            if st.session_state.step_c_prompt is None:
-                with st.spinner(f"AI ({MODEL_FLASH_LITE}) が Step B のデータを下読みし、Proモデルへの指示を生成中..."):
-                    st.session_state.step_c_prompt = generate_step_c_prompt(st.session_state.step_c_jsonl_data)
-                st.success("Proモデルへの指示プロンプトが自動生成されました。")
-
+        
         except Exception as e:
             logger.error(f"Step C ファイル読込エラー: {e}", exc_info=True)
             st.error(f"ファイル読み込み中にエラー: {e}")
@@ -2563,40 +2682,24 @@ def render_step_c():
         st.warning("分析を続けるには、Step B で生成した JSON ファイルをアップロードしてください。")
         return
 
-    # --- 2. プロンプトの確認・編集 (要件⑨) ---
-    st.header(f"Step 2: AI への指示プロンプト")
-    if st.session_state.step_c_prompt:
-        st.markdown(f"AI ({MODEL_FLASH_LITE}) が以下の指示プロンプトを自動生成しました。実行前に編集可能です。")
-        
-        # (★) --- 修正: \n がそのまま表示される問題 ---
-        prompt_value = st.session_state.step_c_prompt
-        if isinstance(prompt_value, str):
-             prompt_value = prompt_value.replace("\\n", "\n")
-        # (★) --- ここまでが修正点 ---
+    # (★) --- 修正: 旧Step 2 (プロンプト編集) を削除 ---
+    # (★) 逐次処理モデルに変更したため、巨大なプロンプトの編集は不要になりました。
+    # st.header(f"Step 2: AI ({MODEL_PRO}) への指示プロンプト")
+    # ... (st.text_area(...) ... を含むブロック全体を削除) ...
+    # (★) --- ここまでが修正点 ---
 
-        edited_prompt = st.text_area(
-            "AIへの指示プロンプト（編集可）:",
-            value=prompt_value, # (★) 修正後の値を渡す
-            height=400,
-            key="step_c_prompt_editor"
-        )
-        st.session_state.step_c_prompt = edited_prompt
-    else:
-        st.warning("プロンプトがありません。ファイルを再アップロードしてください。")
-        return
 
-    # --- 3. 分析レポートの実行 (要件⑨) ---
-    st.header("Step 3: AI分析レポートの実行")
+    # --- 2. 分析レポートの実行 (★ 旧Step 3) ---
+    st.header("Step 2: AI分析レポートの実行") # (★) ステップ番号を 2 に変更
 
-    # (★) --- 修正: モデル選択UIの復活 ---
+    # (★) --- 修正: モデル選択UI ---
     st.markdown("分析に使用するAIモデルを選択してください。")
     
-    # (★) モデル名から選択肢のインデックスを取得 (デフォルトをFlashにするため)
-    model_options = [MODEL_FLASH, MODEL_PRO] # 選択肢
+    model_options = [MODEL_FLASH, MODEL_PRO]
     try:
         default_index = model_options.index(st.session_state.step_c_model)
     except ValueError:
-        default_index = 0 # (★) 見つからなければFlash (0番目)
+        default_index = 0
         
     selected_model_name = st.radio(
         "使用モデル",
@@ -2609,48 +2712,51 @@ def render_step_c():
 
     if selected_model_name == MODEL_PRO:
         st.warning(
-            f"**無料枠の制限にご注意ください**\n"
-            f"`{MODEL_PRO}` (無料枠) は、1リクエストあたりのトークン上限が **125K** です。\n"
-            f"StepBでグラフを多く生成した場合、この上限を超過しエラー (429) が発生する可能性が非常に高いです。"
+            f"**`{MODEL_PRO}` (無料枠) は 2 RPM (30秒/リクエスト) の制限があります。**\n"
+            f"スライド10枚の生成には約5分かかります。ご注意ください。"
         )
     else:
         st.info(
-            f"`{MODEL_FLASH}` (無料枠) は、トークン上限が **250K** のため、"
-            f"グラフ画像を含む大きな分析でも実行できる可能性が高い、推奨の選択肢です。"
+            f"**`{MODEL_FLASH}` (無料枠) は 10 RPM (6秒/リクエスト) の制限があります。**\n"
+            f"比較的 高速に生成できます。（推奨）"
         )
     # (★) --- ここまでが修正点 ---
 
     
-    if st.button(f"分析レポートを生成 (Step 3)", key="execute_button_C", type="primary", use_container_width=True):
-        if not st.session_state.step_c_jsonl_data or not st.session_state.step_c_prompt:
-            st.error("データまたはプロンプトがありません。")
+    if st.button(f"分析レポートを生成 (Step 2)", key="execute_button_C", type="primary", use_container_width=True):
+        if not st.session_state.step_c_jsonl_data:
+            st.error("データがありません。Step 1でファイルをアップロードしてください。")
             return
         
-        # (★) 選択されたモデルを使って実行
+        # (★) --- 修正: 進捗バーとログ用のプレースホルダを定義 ---
+        progress_bar = st.progress(0.0, text="Step C: 分析待機中...")
+        log_placeholder = st.empty()
+        # (★) --- ここまでが修正点 ---
+
         selected_model = st.session_state.step_c_model
         
-        with st.spinner(f"AI ({selected_model}) が分析レポートを生成中です... (数分かかる場合があります)"):
-            
-            # (★) --- 修正: 呼び出すLLMを動的に変更 ---
-            # (★) run_step_c_analysis は内部で get_llm(model_name) を呼ぶ
-            # (★) そのため、run_step_c_analysis自体を修正する必要がある
-            # (★) 
-            # (★) 
-            # (★) -> 以前の修正 (Solution 6) を取り消し、
-            # (★) run_step_c_analysis が引数でモデル名を受け取るように修正します
-            
-            # (★) run_step_c_analysis を修正 (引数に model_name を追加)
+        # (★) スピナーを削除 (プログレスバーが代わりになるため)
+        # with st.spinner(f"AI ({selected_model}) が分析レポートを生成中です..."):
+        try:
+            # (★) 修正: 逐次処理を行う run_step_c_analysis に変更
             st.session_state.step_c_report_json = run_step_c_analysis(
-                st.session_state.step_c_prompt,
                 st.session_state.step_c_jsonl_data,
-                selected_model # (★) 選択したモデル名を渡す
+                selected_model,
+                progress_bar, # (★) 進捗バーを渡す
+                log_placeholder # (★) ログ表示を渡す
             )
-        
-        st.success("AIによる分析レポートが生成されました！")
+            st.success("AIによる分析レポートが生成されました！")
+            
+        except Exception as e:
+            # (★) 実行時エラーのキャッチ
+            logger.error(f"Step C 実行中に予期せぬエラー: {e}", exc_info=True)
+            st.error(f"分析実行中に予期せぬエラーが発生しました: {e}")
+            progress_bar.progress(1.0, text="エラーにより中断")
 
-    # --- 4. 結果のプレビューとエクスポート (要件⑩) ---
+
+    # --- 3. 結果のプレビューとエクスポート (★ 旧Step 4) ---
     if st.session_state.step_c_report_json:
-        st.header("Step 4: 分析レポート（JSON）の確認とエクスポート")
+        st.header("Step 3: 分析レポート（JSON）の確認とエクスポート") # (★) ステップ番号を 3 に変更
         st.info("以下の構造化JSONは、Step D (PowerPoint生成) で使用します。")
 
         st.download_button(
@@ -3192,12 +3298,10 @@ def render_step_d():
 def main():
     """Streamlitアプリケーションのメイン実行関数"""
     
-    # (★) --- 修正: st.set_page_config() を最初に実行 ---
+    # (★) --- st.set_page_config() を最初に実行 ---
     st.set_page_config(page_title="AI Data Analysis App", layout="wide")
     
-    # (★) --- 修正: セッションステートの初期化を *全て* ここに移動 ---
-    # (★) エラー(AttributeError: 'log_messages') 修正のため、
-    # (★) load_dotenv() が logger を呼び出す *前* に 'log_messages' を初期化する
+    # (★) --- セッションステートの初期化を *全て* ここに移動 ---
     if 'log_messages' not in st.session_state:
         st.session_state.log_messages = []
     if 'current_step' not in st.session_state:
@@ -3215,10 +3319,8 @@ def main():
         load_dotenv()
         logger.info(".env ファイルの読み込み試行完了。")
     except Exception as e:
-        logger.warning(f".env ファイルの読み込みに失敗: {e}") # (★) これで安全に呼び出せる
+        logger.warning(f".env ファイルの読み込みに失敗: {e}") 
     
-    # (★) グローバルなセッションステート (上記に移動したため、ここは空)
-
     # --- サイドバー (ナビゲーション) ---
     with st.sidebar:
         st.title("AI レポーティング App")
@@ -3273,16 +3375,11 @@ def main():
             if st.session_state.current_step != 'D':
                 st.session_state.current_step = 'D'; st.rerun()
                 
-        # (★) --- グローバルTipsの生成トリガー ---
-        st.markdown("---")
-        if st.button("分析TIPSを更新", key="reload_tips", use_container_width=True):
-             with st.spinner("AI (Flash Lite) でTIPSを生成中..."):
-                 # (★) キャッシュをクリアして強制的に再生成
-                 st.cache_data.clear()
-                 st.session_state.tips_list = get_analysis_tips_list_from_ai()
-                 st.session_state.current_tip_index = 0
-                 st.session_state.last_tip_time = time.time()
-                 st.success("TIPSを更新しました！")
+        # (★) --- 修正: グローバルTipsの生成トリガーを削除 ---
+        # st.markdown("---")
+        # if st.button("分析TIPSを更新", key="reload_tips", use_container_width=True):
+        #      ... (ブロック全体を削除) ...
+        # (★) --- ここまでが修正点 ---
 
 
     # --- メインコンテンツ (ステップに応じて描画) ---
