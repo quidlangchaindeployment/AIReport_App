@@ -583,7 +583,7 @@ def perform_ai_tagging(
 def update_progress_ui(
     progress_placeholder: st.delta_generator.DeltaGenerator,
     log_placeholder: st.delta_generator.DeltaGenerator,
-    tip_placeholder: st.delta_generator.DeltaGenerator,  # (★) Tips用プレースホルダを追加
+    tip_placeholder: st.delta_generator.DeltaGenerator,  # (★) Tips用プレースホルダ
     processed_rows: int,
     total_rows: int,
     message_prefix: str
@@ -627,8 +627,10 @@ def update_progress_ui(
                 st.session_state.current_tip_index = (st.session_state.current_tip_index + 1) % len(st.session_state.tips_list)
             st.session_state.last_tip_time = now
         
-        current_tip = st.session_state.tips_list[st.session_state.current_tip_index]
-        tip_placeholder.info(f"💡 データ分析TIPS: {current_tip}")
+        # (★) リストが空でないかチェック
+        if st.session_state.tips_list:
+            current_tip = st.session_state.tips_list[st.session_state.current_tip_index]
+            tip_placeholder.info(f"💡 データ分析TIPS: {current_tip}")
         # (★) --- ここまでが変更点 ---
 
     except Exception as e:
@@ -699,7 +701,7 @@ def render_step_a():
     st.markdown(f"（(★) 使用モデル: `{MODEL_FLASH_LITE}`）")
     if st.button("AIにカテゴリ候補を生成させる (Step 3)", key="gen_cat_button", type="primary"):
         if not os.getenv("GOOGLE_API_KEY"):
-            st.error("Google APIキーが設定されていません。（サイドバーで設定してください）")
+            st.error("Google APIキーが設定されていません。（.envファイルを確認してください）")
         else:
             with st.spinner(f"AI ({MODEL_FLASH_LITE}) が分析指針を読み解き、カテゴリを考案中..."):
                 logger.info("AIカテゴリ生成ボタンクリック")
@@ -746,15 +748,13 @@ def render_step_a():
         cols_list = list(df.columns)
         default_index = 0
         
-        # 以前の選択を記憶
         if st.session_state.selected_text_col.get(f_name) in cols_list:
             default_index = cols_list.index(st.session_state.selected_text_col.get(f_name))
-        # 'text' や 'body' といった一般的な列名を推測
         elif any(c in cols_list for c in ['text', 'body', 'content', '投稿', '本文']):
             try:
                 default_index = next(i for i, c in enumerate(cols_list) if c in ['text', 'body', 'content', '投稿', '本文'])
             except StopIteration:
-                default_index = 0 # フォールバック
+                default_index = 0
                 
         selected_col = st.selectbox(f"**{f_name}** のテキスト列:", cols_list, index=default_index, key=f"col_select_{f_name}")
         selected_text_col_map[f_name] = selected_col
@@ -773,14 +773,14 @@ def render_step_a():
     with col_run:
         if st.button("分析実行 (Step 6)", type="primary", key="run_analysis_A", use_container_width=True):
             st.session_state.cancel_analysis = False
-            st.session_state.log_messages = []  # ログリセット
-            st.session_state.tagged_df_A = pd.DataFrame()  # 結果リセット
+            st.session_state.log_messages = []
+            st.session_state.tagged_df_A = pd.DataFrame()
             
+            # (★) --- Tips表示の初期化 ---
+            tip_placeholder = st.empty()
             try:
-                # (★) --- Tips表示の初期化 ---
-                tip_placeholder = st.empty()
                 with st.spinner("分析TIPSをAIで生成中..."):
-                    if 'tips_list' not in st.session_state:
+                    if 'tips_list' not in st.session_state or not st.session_state.tips_list:
                         st.session_state.tips_list = get_analysis_tips_list_from_ai()
                 
                 if not st.session_state.tips_list: # フォールバック
@@ -789,10 +789,13 @@ def render_step_a():
                 st.session_state.current_tip_index = random.randint(0, len(st.session_state.tips_list) - 1)
                 st.session_state.last_tip_time = time.time()
                 tip_placeholder.info(f"💡 データ分析TIPS: {st.session_state.tips_list[st.session_state.current_tip_index]}")
+            except Exception as e:
+                logger.error(f"Tips初期化エラー: {e}")
+            # (★) --- ここまでが変更点 ---
 
+            try:
                 with st.spinner(f"Step A: AI分析処理中 ({MODEL_FLASH_LITE})..."):
                     logger.info("Step A 分析実行ボタンクリック")
-                    # (★) 要件: 進捗を0～100％で表示
                     progress_placeholder = st.progress(0.0, text="処理待機中...")
                     log_placeholder = st.empty()
 
@@ -827,7 +830,6 @@ def render_step_a():
                         batch_df = master_df.iloc[i:i + FILTER_BATCH_SIZE]
                         current_batch_num = (i // FILTER_BATCH_SIZE) + 1
                         
-                        # (★) 進捗表示 (0-100%)
                         update_progress_ui(
                             progress_placeholder, log_placeholder, tip_placeholder,
                             min(i + FILTER_BATCH_SIZE, total_filter_rows), total_filter_rows,
@@ -838,7 +840,7 @@ def render_step_a():
                         if filtered_df is not None and not filtered_df.empty:
                             all_filtered_results.append(filtered_df)
                         
-                        time.sleep(FILTER_SLEEP_TIME) # (★) Rate Limit 対策
+                        time.sleep(FILTER_SLEEP_TIME)
                     
                     if not all_filtered_results:
                         raise Exception("AIフィルタリング処理に失敗しました。")
@@ -851,9 +853,9 @@ def render_step_a():
 
                     if filtered_master_df.empty:
                         st.warning("AIキュレーションの結果、分析対象のデータが0件になりました。")
-                        st.session_state.tagged_df_A = pd.DataFrame() # 空のDFをセット
+                        st.session_state.tagged_df_A = pd.DataFrame()
                         progress_placeholder.progress(1.0, text="処理完了 (対象データ0件)")
-                        return # 処理中断
+                        return
 
                     # --- 4. (★) AIタグ付け ---
                     selected_category_definitions = {
@@ -873,9 +875,8 @@ def render_step_a():
                         batch_df = master_df_for_tagging.iloc[i:i + TAGGING_BATCH_SIZE]
                         current_batch_num = (i // TAGGING_BATCH_SIZE) + 1
                         
-                        # (★) 進捗表示 (0-100%)
                         update_progress_ui(
-                            progress_placeholder, log_placeholder,
+                            progress_placeholder, log_placeholder, tip_placeholder,
                             min(i + TAGGING_BATCH_SIZE, total_rows), total_rows,
                             f"AIタグ付け (バッチ {current_batch_num}/{total_batches})"
                         )
@@ -884,7 +885,7 @@ def render_step_a():
                         if tagged_df is not None and not tagged_df.empty:
                             all_tagged_results.append(tagged_df)
                         
-                        time.sleep(TAGGING_SLEEP_TIME) # (★) Rate Limit 対策
+                        time.sleep(TAGGING_SLEEP_TIME)
 
                     if not all_tagged_results:
                         raise Exception("AIタグ付け処理に失敗しました。")
@@ -894,11 +895,8 @@ def render_step_a():
                     tagged_results_df = pd.concat(all_tagged_results, ignore_index=True)
 
                     logger.info("最終マージ処理開始...");
-                    # 元データとタグ付け結果を 'id' でマージ
                     final_df = pd.merge(master_df_for_tagging, tagged_results_df, on='id', how='right')
                     
-                    # 'id' が重複してマージされた場合 (e.g., tagging_df に id 以外の列が重複)
-                    # 最終的な列セットを定義
                     final_cols = list(master_df_for_tagging.columns) + [col for col in tagged_results_df.columns if col not in master_df_for_tagging.columns]
                     final_df = final_df[final_cols]
 
@@ -906,18 +904,24 @@ def render_step_a():
                     logger.info("Step A 分析処理 正常終了");
                     st.success("AIによる分析処理が完了しました。");
                     progress_placeholder.progress(1.0, text="処理完了")
-                    # (★) update_progress_ui に tip_placeholder を渡す
-                    update_progress_ui(progress_placeholder, log_placeholder, tip_placeholder, total_rows, total_rows, "処理完了")
-                    tip_placeholder.empty()
+                    
+                    # (★) --- 修正: 最後の呼び出し ---
+                    # (★) ここが5引数になっていたため、6引数に修正します
+                    update_progress_ui(
+                        progress_placeholder, log_placeholder, tip_placeholder, 
+                        total_rows, total_rows, "処理完了"
+                    )
+                    # (★) --- ここまでが修正点 ---
+
+                    tip_placeholder.empty() # 処理完了後、Tipsを消す
 
             except Exception as e:
                 logger.error(f"Step A 分析実行中にエラー: {e}", exc_info=True)
                 st.error(f"分析実行中にエラーが発生しました: {e}")
                 if 'progress_placeholder' in locals():
                     progress_placeholder.progress(1.0, text="エラーにより処理中断")
-                # (★) エラー時もTipsを消す
                 if 'tip_placeholder' in locals():
-                    tip_placeholder.empty()
+                    tip_placeholder.empty() # エラー時もTipsを消す
 
     # (★) 要件④: エクスポートリンクを表示
     if not st.session_state.tagged_df_A.empty:
