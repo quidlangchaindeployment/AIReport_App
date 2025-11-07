@@ -475,13 +475,21 @@ def suggest_analysis_techniques(df):
 
         # 優先度5: 時系列分析 (L438の指示)
         if datetime_cols and flag_cols:
-             potential_suggestions.append({
+            potential_suggestions.append({
                 "priority": 5, "name": "時系列キーワード分析",
                 "description": f"特定のキーワードの出現数が時間（{datetime_cols[0]}など）とともにどう変化したかトレンドを可視化します。",
                 "reason": f"キーワード列と日時列({len(datetime_cols)}個)あり、時間変化の把握に。",
                 "suitable_cols": {"datetime": datetime_cols, "keywords": flag_cols}
             })
-
+            
+        # (★) --- (L405) 'if' ブロックの外側、'try' ブロックの内側 (インデント修正) ---
+        if datetime_cols: # (★) 日時列がある場合のみ提案
+            potential_suggestions.append({
+               "priority": 5, "name": "投稿量分析",
+               "description": f"全体の投稿数が時間（{datetime_cols[0]}など）とともにどう変化したかトレンドを可視化します。",
+               "reason": f"日時列({len(datetime_cols)}個)あり、時間変化の把握に。",
+               "suitable_cols": {"datetime": datetime_cols, "keywords": flag_cols} # (★) 同じ suitable_cols を渡す
+            })
         # 優先度6: テキストマイニング (L438の指示)
         potential_suggestions.append({
             "priority": 6, "name": "テキストマイニング（頻出単語など）",
@@ -798,7 +806,7 @@ def run_crosstab(df, suitable_cols):
         logger.error(f"run_crosstab error: {e}", exc_info=True)
     return None #
 
-def run_timeseries(df, suitable_cols_dict):
+def run_timeseries(df, suitable_cols_dict, name=""): # (★) name 引数を追加
     """時系列分析を実行し、Streamlitで可視化する"""
     if not isinstance(suitable_cols_dict, dict) or 'datetime' not in suitable_cols_dict or 'keywords' not in suitable_cols_dict:
         st.warning("時系列分析のための列情報（datetime, keywords）が不十分です。")
@@ -808,25 +816,33 @@ def run_timeseries(df, suitable_cols_dict):
     kw_cols = [col for col in suitable_cols_dict['keywords'] if col in df.columns]
 
     if not dt_cols: st.error("日時列が見つかりません。"); return None #
-    if not kw_cols: st.error("キーワード列が見つかりません。"); return None #
 
-    key_base = dt_cols[0]
+    # (★) --- (Problem 2) 重複キーエラー修正 ---
+    key_base = dt_cols[0] + "_" + name # (★) name を使って key_base を一意にする
+    
     dt_col = st.selectbox("使用する日時列:", dt_cols, key=f"ts_dt_{key_base}")
-    kw_col = st.selectbox("集計するキーワード列:", kw_cols, key=f"ts_kw_{key_base}")
+    
+    # (★) --- キーワード選択を任意（オプショナル）に変更 ---
+    kw_options = ["(全体の投稿量)"] + kw_cols
+    kw_col = st.selectbox("集計対象:", kw_options, key=f"ts_kw_{key_base}", help="「(全体の投稿量)」を選ぶと、キーワードに関わらず全ての投稿数を集計します。")
 
-    if not dt_col or not kw_col:
+    if not dt_col:
         return None #
 
     try:
-        df_copy = df[[dt_col, kw_col]].copy()
+        # (★) --- (Problem 1) KeyError 修正: インデントを修正 ---
+        if kw_col == "(全体の投稿量)":
+            df_copy = df[[dt_col]].copy()
+        else:
+            df_copy = df[[dt_col, kw_col]].copy()
+            # (★) 以下のクリーニング処理は 'else' ブロックの内側
+            df_copy[kw_col] = df_copy[kw_col].astype(str).str.replace(r"[\[\]'\"]", "", regex=True)
+            df_copy = df_copy[df_copy[kw_col].str.strip() != ''] 
+            if df_copy.empty: st.info(f"「{kw_col}」に有効なキーワードがありませんでした。"); return None #
         
         df_copy[dt_col] = pd.to_datetime(df_copy[dt_col], errors='coerce')
         df_copy = df_copy.dropna(subset=[dt_col])
         if df_copy.empty: st.info("有効な日時データがありません。"); return None #
-
-        df_copy[kw_col] = df_copy[kw_col].astype(str)
-        df_copy = df_copy[df_copy[kw_col].str.strip() != ''] 
-        if df_copy.empty: st.info(f"「{kw_col}」に有効なキーワードがありませんでした。"); return None #
 
         time_df = df_copy.set_index(dt_col).resample('D').size().rename("投稿数")
         
@@ -838,7 +854,7 @@ def run_timeseries(df, suitable_cols_dict):
         with st.expander("詳細データ"):
             st.dataframe(time_df)
         
-        return time_df # 
+        return time_df
             
     except Exception as e:
         st.error(f"時系列分析の処理中にエラー: {e}")
@@ -1920,7 +1936,7 @@ def render_step_c():
                 elif name == "投稿量分析":
                     st.info("「時系列キーワード分析」を実行します。")
                     if isinstance(cols, dict) and 'datetime' in cols and 'keywords' in cols:
-                        result_data = run_timeseries(df, cols)
+                        result_data = run_timeseries(df, cols, name) # (★) name を追加
                     else:
                         st.warning("この分析には「日時列」と「キーワード列」が必要です。Step Bの提案定義を確認してください。")
 
@@ -2014,7 +2030,7 @@ def render_step_c():
 
                 elif name == "時系列キーワード分析":
                     if isinstance(cols, dict) and 'datetime' in cols and 'keywords' in cols:
-                        result_data = run_timeseries(df, cols)
+                        result_data = run_timeseries(df, cols, name) # (★) name を追加
                     else:
                          st.warning(f"「{name}」の列定義が不適切です: {cols}")
 
