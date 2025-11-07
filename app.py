@@ -3131,29 +3131,32 @@ def render_step_d():
 def main():
     """Streamlitアプリケーションのメイン実行関数"""
     
-    # (★) --- .envファイルから環境変数を読み込む ---
-    try:
-        load_dotenv()
-        logger.info(".env ファイルの読み込み試行完了。")
-    except Exception as e:
-        logger.warning(f".env ファイルの読み込みに失敗: {e}")
-    
+    # (★) --- 修正: st.set_page_config() を最初に実行 ---
     st.set_page_config(page_title="AI Data Analysis App", layout="wide")
     
-    # グローバルなセッションステート
-    if 'current_step' not in st.session_state:
-        st.session_state.current_step = 'A' # 初期ステップ
+    # (★) --- 修正: セッションステートの初期化を *全て* ここに移動 ---
+    # (★) エラー(AttributeError: 'log_messages') 修正のため、
+    # (★) load_dotenv() が logger を呼び出す *前* に 'log_messages' を初期化する
     if 'log_messages' not in st.session_state:
         st.session_state.log_messages = []
-    # (★) --- Tips用セッションステート (Global) ---
+    if 'current_step' not in st.session_state:
+        st.session_state.current_step = 'A' # 初期ステップ
     if 'tips_list' not in st.session_state:
         st.session_state.tips_list = []
     if 'current_tip_index' not in st.session_state:
         st.session_state.current_tip_index = 0
     if 'last_tip_time' not in st.session_state:
         st.session_state.last_tip_time = time.time()
-    # (★) --- ここまでが変更点 ---
+    # (★) --- ここまでが修正点 ---
 
+    # (★) --- .envファイルから環境変数を読み込む ---
+    try:
+        load_dotenv()
+        logger.info(".env ファイルの読み込み試行完了。")
+    except Exception as e:
+        logger.warning(f".env ファイルの読み込みに失敗: {e}") # (★) これで安全に呼び出せる
+    
+    # (★) グローバルなセッションステート (上記に移動したため、ここは空)
 
     # --- サイドバー (ナビゲーション) ---
     with st.sidebar:
@@ -3219,7 +3222,6 @@ def main():
                  st.session_state.current_tip_index = 0
                  st.session_state.last_tip_time = time.time()
                  st.success("TIPSを更新しました！")
-        # (★) --- ここまでが変更点 ---
 
 
     # --- メインコンテンツ (ステップに応じて描画) ---
