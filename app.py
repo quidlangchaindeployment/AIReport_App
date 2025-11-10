@@ -953,10 +953,60 @@ def render_step_a():
 import networkx as nx # (★) Step B (共起ネットワーク) で必要
 from itertools import combinations # (★) Step B (共起ネットワーク) で必要
 
+def find_col(df: pd.DataFrame, patterns: List[str]) -> Optional[str]:
+    """DataFrameから、複数のパターンに最初に一致する列名(str)を1つ返す"""
+    cols = df.columns
+    for pattern in patterns:
+        try:
+            # 1. 完全一致 (大文字小文字無視)
+            for col in cols:
+                if col.lower() == pattern.lower():
+                    return col
+            # 2. 部分一致 (大文字小文字無視)
+            for col in cols:
+                if re.search(pattern, col, re.IGNORECASE):
+                    return col
+        except re.error:
+            continue # (e.g. invalid regex pattern)
+    return None
+
+def find_cols(df: pd.DataFrame, patterns: List[str]) -> List[str]:
+    """DataFrameから、複数のパターンに一致する列名(list)をすべて返す"""
+    cols = df.columns
+    found_cols = set()
+    for pattern in patterns:
+        try:
+            # 1. ･･･キーワード (hard-coded rule from old function)
+            for col in cols:
+                 if col.endswith('キーワード'):
+                     found_cols.add(col)
+            # 2. 部分一致 (大文字小文字無視)
+            for col in cols:
+                if re.search(pattern, col, re.IGNORECASE):
+                    found_cols.add(col)
+        except re.error:
+            continue
+    return sorted(list(found_cols))
+
+def find_engagement_cols(df: pd.DataFrame, patterns: List[str]) -> List[str]:
+    """DataFrameから、パターンに一致する「数値」列名(list)をすべて返す"""
+    numeric_cols = df.select_dtypes(include=np.number).columns
+    found_cols = set()
+    for pattern in patterns:
+        try:
+            for col in numeric_cols: # (★) Only search numeric cols
+                if re.search(pattern, col, re.IGNORECASE):
+                    found_cols.add(col)
+        except re.error:
+            continue
+    return sorted(list(found_cols))
+# (★) --- END NEW HELPER FUNCTIONS ---
+
+
 def suggest_analysis_techniques_py(df: pd.DataFrame) -> List[Dict[str, Any]]:
     """
     (Step B) データフレームを分析し、Pythonで実行可能な基本的な分析手法を提案する。
-    (旧 `suggest_analysis_techniques` をリファクタリング)
+    (★) 修正: 2024/11/10 - re.search を使用し、列名を柔軟に検索するよう堅牢化
     """
     suggestions = []
     if df is None or df.empty:
@@ -964,71 +1014,68 @@ def suggest_analysis_techniques_py(df: pd.DataFrame) -> List[Dict[str, Any]]:
         return suggestions
         
     try:
-        numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
-        object_cols = df.select_dtypes(include='object').columns.tolist()
-        datetime_cols = []
-
-        # 日付列の候補を object 型から探す
-        for col in object_cols:
-             if df[col].isnull().sum() / len(df) > 0.5: continue # 欠損が5割超ならスキップ
-             sample = df[col].dropna().head(50)
-             if sample.empty: continue
-             try:
-                 # サンプルで日付変換を試みる
-                 pd.to_datetime(sample, errors='raise')
-                 # 成功したら全体をチェック
-                 temp_dt = pd.to_datetime(df[col], errors='coerce').dropna()
-                 if not temp_dt.empty and (temp_dt.dt.year.nunique() > 1 or temp_dt.dt.month.nunique() > 1 or temp_dt.dt.day.nunique() > 1 or col.lower() in ['date', 'time', 'timestamp', '日付', '日時']):
-                     datetime_cols.append(col)
-                     logger.info(f"列 '{col}' を日時列として認識しました。")
-             except (ValueError, TypeError, OverflowError, pd.errors.ParserError):
-                 pass # 日付でなければ無視
-
-        numeric_cols = [col for col in numeric_cols if col != 'id'] # id列除外
-        categorical_cols = [col for col in object_cols if col != 'ANALYSIS_TEXT_COLUMN' and col not in datetime_cols]
-        flag_cols = [col for col in categorical_cols if col.endswith('キーワード')]
-        other_categorical = [col for col in categorical_cols if not col.endswith('キーワード')]
+        # (★) --- 1. 柔軟な列名の特定 ---
+        all_cols = list(df.columns)
         
-        logger.info(f"提案分析(PY) - 数値:{numeric_cols}, カテゴリ(フラグ):{flag_cols}, カテゴリ(他):{other_categorical}, 日時:{datetime_cols}")
+        # (★) 主要な列を見つける
+        text_col = find_col(df, ['ANALYSIS_TEXT_COLUMN', 'text', 'content', '本文'])
+        topic_col = find_col(df, ['話題カテゴリ', 'topic', 'category'])
+        location_col = find_col(df, ['市区町村キーワード', 'location', 'city', '地域'])
+        tour_spot_col = find_col(df, ['観光地キーワード', 'tourist_spot', 'spot'])
+        hashtag_col = find_col(df, ['hash', 'ハッシュタグ'])
+        sentiment_col = find_col(df, ['sent', 'センチメント'])
+        date_col = find_col(df, ['date', 'time', '日付', '日時'])
+        
+        # (★) 複数の可能性がある列
+        engagement_cols = find_engagement_cols(df, ['eng', 'like', 'いいね', 'エンゲージメント'])
+        # (★) `...キーワード` で終わる列 + `topic_col` や `location_col` など
+        flag_cols = find_cols(df, ['key', 'keyword', 'キーワード'])
+        flag_cols = sorted(list(set(flag_cols + [c for c in [topic_col, location_col, tour_spot_col, hashtag_col] if c])))
+
+        other_categorical = [
+            col for col in df.select_dtypes(include='object').columns
+            if col not in flag_cols and col != text_col and col != date_col
+        ]
+        
+        logger.info(f"提案分析(PY) - Text:{text_col}, Topic:{topic_col}, Location:{location_col}")
+        logger.info(f"提案分析(PY) - FlagCols(All):{flag_cols}")
+        logger.info(f"提案分析(PY) - Engagement:{engagement_cols}, Sentiment:{sentiment_col}, Date:{date_col}")
 
         potential_suggestions = []
 
-        # (★) --- 1. 全体メトリクス ---
+        # (★) --- 2. 提案ロジック (堅牢化版) ---
+
+        # --- 1. 全体メトリクス ---
+        # (★) センチメント列とエンゲージメント列を `suitable_cols` に渡す
+        overall_metric_cols = [c for c in [sentiment_col] + engagement_cols if c]
         potential_suggestions.append({
             "priority": 1, "name": "全体のメトリクス",
             "description": "投稿数、エンゲージメント、センチメント傾向など、データセット全体の概要を計算します。",
             "reason": "データ全体の状況把握に必須です。",
-            "suitable_cols": [col for col in df.columns if 'センチメント' in col or 'いいね' in col or 'エンゲージメント' in col],
+            "suitable_cols": overall_metric_cols, # (★) 
             "type": "python"
         })
 
-        # 優先度1: 基本集計
+        # --- 3. 単純集計（頻度分析）---
+        # (★) 見つかったすべての「フラグ列」に対して提案
         if flag_cols:
-            potential_suggestions.append({
-                "priority": 1, "name": "単純集計（頻度分析）",
-                "description": "各キーワード（カテゴリ）がどのくらいの頻度で出現したかトップNを分析します。",
-                "reason": f"キーワード列({len(flag_cols)}個)あり。基本指標です。",
-                "suitable_cols": flag_cols,
-                "type": "python" # (★) Python実行フラグ
-            })
+            for col in flag_cols:
+                potential_suggestions.append({
+                    "priority": 1, 
+                    "name": f"単純集計: {col}", # (★) 例: "単純集計: 市区町村キーワード"
+                    "description": f"「{col}」列の出現頻度（TOP50）を分析します。",
+                    "reason": f"StepAで生成されたキーワード列({col})の基本指標です。",
+                    "suitable_cols": [col], # (★) 1列のみ
+                    "type": "python"
+                })
 
-        # (★) --- 1. 市区町村別投稿数 (単純集計の具体化) ---
-        if '市区町村キーワード' in flag_cols:
-            potential_suggestions.append({
-                "priority": 1, "name": "市区町村別投稿数",
-                "description": "「市区町村キーワード」列の出現頻度を分析します。これは、エリア別の傾向を比較する際の基礎データとなります。",
-                "reason": "地域別の投稿ボリュームを把握します。",
-                "suitable_cols": ['市区町村キーワード'],
-                "type": "python"
-            })
-
-        # 優先度2: クロス集計
+        # --- 2. クロス集計 ---
         if len(flag_cols) >= 2:
             potential_suggestions.append({
                 "priority": 2, "name": "クロス集計（キーワード間）",
                 "description": "キーワード間の組み合わせで多く出現するパターンを探ります。",
                 "reason": f"複数キーワード列({len(flag_cols)}個)あり、関連性の発見に。",
-                "suitable_cols": flag_cols,
+                "suitable_cols": flag_cols, 
                 "type": "python"
             })
         if flag_cols and other_categorical:
@@ -1036,75 +1083,82 @@ def suggest_analysis_techniques_py(df: pd.DataFrame) -> List[Dict[str, Any]]:
                 "priority": 2, "name": "クロス集計（キーワード×属性）",
                 "description": f"キーワード({flag_cols[0]}など)と他の属性({', '.join(other_categorical)})の関係性を分析します。",
                 "reason": f"キーワード列と他カテゴリ列({len(other_categorical)}個)あり。",
-                "suitable_cols": flag_cols + other_categorical,
+                "suitable_cols": flag_cols + other_categorical, 
                 "type": "python"
             })
             
-        # (★) --- 2. 話題カテゴリ別 観光地TOP10 (クロス集計の具体化) ---
-        # (★) Step Aで '話題カテゴリ' と '観光地キーワード' が生成されている前提
-        if '話題カテゴリ' in df.columns and '観光地キーワード' in df.columns:
+        # (★) 修正: `topic_col` と `tour_spot_col` が両方見つかった場合
+        if topic_col and tour_spot_col:
             potential_suggestions.append({
-                "priority": 2, "name": "話題カテゴリ別 観光地TOP10",
-                "description": "「話題カテゴリ」と「観光地キーワード」をクロス集計し、カテゴリ別の人気観光地を分析します。",
+                "priority": 2, "name": f"{topic_col}別 {tour_spot_col} TOP10",
+                "description": f"「{topic_col}」と「{tour_spot_col}」をクロス集計し、カテゴリ別の人気観光地を分析します。",
                 "reason": "カテゴリと観光地の関連性を分析します。",
-                "suitable_cols": ['話題カテゴリ', '観光地キーワード'],
+                "suitable_cols": [topic_col, tour_spot_col],
                 "type": "python"
             })
 
-        # 優先度3: 時系列分析
-        if datetime_cols and flag_cols:
+        # --- 3. 時系列分析 ---
+        if date_col and flag_cols:
             potential_suggestions.append({
                 "priority": 3, "name": "時系列キーワード分析",
-                "description": f"特定のキーワードの出現数が時間（{datetime_cols[0]}など）とともにどう変化したかトレンドを分析します。",
-                "reason": f"キーワード列と日時列({len(datetime_cols)}個)あり。",
-                "suitable_cols": {"datetime": datetime_cols, "keywords": flag_cols},
+                "description": f"特定のキーワードの出現数が時間（{date_col}など）とともにどう変化したかトレンドを分析します。",
+                "reason": f"キーワード列と日時列({date_col})あり。",
+                "suitable_cols": {"datetime": [date_col], "keywords": flag_cols}, # (★) 
                 "type": "python"
             })
             
-        # (★) --- 3. 共起ネットワーク ---
-        if 'ANALYSIS_TEXT_COLUMN' in df.columns:
+        # --- 3. 共起ネットワーク ---
+        if text_col:
             potential_suggestions.append({
                 "priority": 3, "name": "共起ネットワーク",
                 "description": "投稿テキスト内の単語の出現パターンを分析し、関連性の高い単語のネットワークを構築します。",
                 "reason": "テキストデータから隠れたトピックや関連性を発見します。",
-                "suitable_cols": ['ANALYSIS_TEXT_COLUMN'],
+                "suitable_cols": [text_col],
                 "type": "python"
             })
             
-        # 優先度4: テキストマイニング
-        if 'ANALYSIS_TEXT_COLUMN' in df.columns:
+        # --- 4. テキストマイニング ---
+        if text_col:
             potential_suggestions.append({
                 "priority": 4, "name": "テキストマイニング（頻出単語）",
                 "description": "原文テキストから頻出する単語を抽出し、どのような言葉が多く使われているか全体像を把握します。",
                 "reason": "原文テキストがあり、タグ付け以外のインサイト発見に。",
-                "suitable_cols": ['ANALYSIS_TEXT_COLUMN'],
+                "suitable_cols": [text_col],
                 "type": "python"
             })
 
-        # (★) --- 4. 話題カテゴリ別 サマリ (Python + AI) ---
-        if '話題カテゴリ' in df.columns and 'ANALYSIS_TEXT_COLUMN' in df.columns:
+        # --- 4. 話題カテゴリ別 サマリ (Python + AI) ---
+        if topic_col and text_col:
             potential_suggestions.append({
                 "priority": 4, "name": "話題カテゴリ別 投稿数とサマリ",
                 "description": "指定された話題カテゴリ（グルメ、自然など）ごとに投稿数を集計し、AIが投稿内容のサマリを生成します。",
                 "reason": "カテゴリごとの主要な話題を把握します。",
-                "suitable_cols": ['話題カテゴリ', 'ANALYSIS_TEXT_COLUMN'],
-                "type": "python" # (★) AIを呼び出すが、メインロジックはPython
+                "suitable_cols": [topic_col, text_col], # (★)
+                "type": "python"
             })
 
-        # (★) --- 4. 話題カテゴリ別 エンゲージメントTOP5 (Python + AI) ---
-        engagement_cols = [col for col in numeric_cols if any(c in col.lower() for c in ['いいね', 'like', 'エンゲージメント', 'engagement'])]
-        if '話題カテゴリ' in df.columns and 'ANALYSIS_TEXT_COLUMN' in df.columns and engagement_cols:
+        # --- 4. 話題カテゴリ別 エンゲージメントTOP5 (Python + AI) ---
+        if topic_col and text_col and engagement_cols:
             potential_suggestions.append({
                 "priority": 4, "name": "話題カテゴリ別 エンゲージメントTOP5と概要",
                 "description": f"指定された話題カテゴリごとに、エンゲージメント（{engagement_cols[0]}）が高いTOP5投稿を抽出し、AIがその概要を生成します。",
                 "reason": "カテゴリごとに「バズった」投稿の内容を把握します。",
-                "suitable_cols": ['話題カテゴリ', 'ANALYSIS_TEXT_COLUMN'] + engagement_cols,
-                "type": "python" # (★) AIを呼び出すが、メインロジックはPython
+                "suitable_cols": {'topic': [topic_col], 'text': [text_col], 'engagement': engagement_cols},
+                "type": "python"
             })
 
         suggestions = sorted(potential_suggestions, key=lambda x: x['priority'])
-        logger.info(f"Pythonベース提案(ソート後): {[s['name'] for s in suggestions]}")
-        return suggestions
+        
+        # (★) 重複する提案を削除 (例: "単純集計: 話題カテゴリ" と "話題カテゴリ別 ...")
+        final_suggestions = []
+        seen_names = set()
+        for s in suggestions:
+             if s['name'] not in seen_names:
+                 final_suggestions.append(s)
+                 seen_names.add(s['name'])
+                 
+        logger.info(f"Pythonベース提案(ソート後): {[s['name'] for s in final_suggestions]}")
+        return final_suggestions
 
     except Exception as e:
         logger.error(f"Python分析手法提案中にエラー: {e}", exc_info=True)
@@ -2178,7 +2232,7 @@ def render_step_b():
     """(Step B) 分析手法の提案・実行・データ出力UIを描画する"""
     st.title("📊 Step B: 分析の実行とデータ出力")
 
-    # (★) --- 新しいセッションステートの初期化 ---
+    # (★) --- セッションステートの初期化 ---
     if 'df_flagged_B' not in st.session_state:
         st.session_state.df_flagged_B = pd.DataFrame()
     if 'suggestions_B' not in st.session_state:
@@ -2242,8 +2296,8 @@ def render_step_b():
     numeric_cols = [col for col in all_cols if pd.api.types.is_numeric_dtype(df_B[col])]
     engagement_cols = [col for col in numeric_cols if any(c in col.lower() for c in ['いいね', 'like', 'エンゲージメント', 'engagement'])]
 
-    # --- 2. 分析手法の提案 ---
-    st.header("Step 2: 分析手法の提案")
+    # --- 2. 分析手法の提案と一括実行 --- (★) タイトル変更
+    st.header("Step 2: 分析手法の提案と一括実行")
     st.markdown(f"（(★) AI提案モデル: `{MODEL_FLASH_LITE}`）")
     
     analysis_prompt_B = st.text_area(
@@ -2261,8 +2315,9 @@ def render_step_b():
                     st.session_state.last_tip_time = time.time()
             
         with st.spinner(f"データ構造と指示内容を分析し、手法を提案中 ({MODEL_FLASH_LITE})..."):
-            st.session_state.step_b_results = {}
-            st.session_state.step_b_json_output = None
+            st.session_state.step_b_results = {} # (★) 提案のたびに結果をリセット
+            st.session_state.step_b_json_output = None # (★) 出力もリセット
+            
             base_suggestions = suggest_analysis_techniques_py(df_B)
             ai_suggestions = []
             if analysis_prompt_B.strip():
@@ -2275,16 +2330,59 @@ def render_step_b():
             
             # (★) 提案を「辞書」としてセッションステートに保存
             st.session_state.suggestions_B = {s['name']: s for s in all_suggestions}
-            st.success(f"分析手法の提案が完了しました ({len(all_suggestions)}件)。Step 3 で各分析を実行・確認してください。")
+            st.success(f"分析手法の提案が完了しました ({len(all_suggestions)}件)。Step 2.5 で一括実行してください。")
+            st.rerun() # (★) 一括実行ボタンを即時表示するためにリラン
+
+    # (★) --- NEW Step 2.5: Bulk Execution ---
+    # (★) 提案 (suggestions_B) が存在する場合にのみ表示
+    if st.session_state.suggestions_B:
+        st.markdown("---")
+        st.info("以下のボタンで、提案されたすべての分析をデフォルトパラメータで一括実行できます。")
+        
+        if st.button("🏃 全分析をデフォルトで一括実行 (Step 2.5)", type="primary", use_container_width=True):
+            st.session_state.progress_text = "一括実行を開始します..."
+            total_tasks = len(st.session_state.suggestions_B)
+            progress_bar = st.progress(0.0, text="一括実行 待機中...")
+            
+            # (★) Tips表示
+            tip_placeholder_b_bulk = st.empty()
+            if st.session_state.tips_list:
+                try:
+                    current_tip = st.session_state.tips_list[st.session_state.current_tip_index]
+                    tip_placeholder_b_bulk.info(f"💡 データ分析TIPS: {current_tip}")
+                except IndexError:
+                    st.session_state.current_tip_index = 0
+            
+            with st.spinner(f"全 {total_tasks} 件の分析を一括実行中..."):
+                for i, (task_name, suggestion_details) in enumerate(st.session_state.suggestions_B.items()):
+                    st.session_state.progress_text = f"({i+1}/{total_tasks}) 「{task_name}」を実行中..."
+                    progress_bar.progress((i+1)/total_tasks, text=f"実行中: {task_name}")
+                    
+                    try:
+                        result_data = execute_analysis(task_name, df_B, suggestion_details)
+                        st.session_state.step_b_results[task_name] = result_data
+                    except Exception as e:
+                        logger.error(f"一括実行エラー ({task_name}): {e}", exc_info=True)
+                        st.session_state.step_b_results[task_name] = {
+                            "data": f"一括実行中にエラーが発生しました: {e}",
+                            "image_base64": None,
+                            "summary": f"エラー: {e}"
+                        }
+                
+                st.session_state.progress_text = "全分析の一括実行が完了しました。"
+                progress_bar.progress(1.0, text="一括実行 完了")
+                tip_placeholder_b_bulk.empty()
+                st.success("全分析の一括実行が完了しました。Step 3 で結果を確認してください。")
+                st.rerun() # (★) プレビューを更新するためにリラン
 
 
-    # (★) --- 3. (NEW) 分析の実行・プレビュー・修正 ---
+    # --- 3. 分析のプレビューとパラメータ修正 ---
     if not st.session_state.suggestions_B:
         st.info("Step 2 で「分析手法を提案させる」ボタンを押してください。")
         return
 
     st.header("Step 3: 分析のプレビューとパラメータ修正")
-    st.info("各分析項目の「▼」を開き、パラメータ（分析対象の列など）を修正して、個別に分析を実行・プレビューできます。")
+    st.info("各分析項目の「▼」を開き、プレビューを確認してください。パラメータ（分析対象の列など）を修正して、個別に「再実行/更新」も可能です。")
     
     # (★) Tips表示
     tip_placeholder = st.empty()
@@ -2301,7 +2399,12 @@ def render_step_b():
          progress_text_placeholder.info(st.session_state.progress_text)
          
     # (★) 提案されたタスクをループ処理
-    for task_name, suggestion_details in st.session_state.suggestions_B.items():
+    for task_name, suggestion_details_from_session in st.session_state.suggestions_B.items():
+        
+        # (★) 状態がリセットされないよう、セッションの辞書を直接操作せず、
+        # (★) 描画ループ用のローカルコピーを作成する
+        suggestion_details = suggestion_details_from_session.copy()
+        
         st.markdown("---")
         
         # (★) 各タスクのプレビューエリア (Expander の *外*)
@@ -2339,7 +2442,7 @@ def render_step_b():
 
         
         # (★) 各タスクの編集・実行エリア
-        with st.expander(f"「{task_name}」のパラメータ修正・実行"):
+        with st.expander(f"「{task_name}」のパラメータ修正・再実行"):
             
             st.markdown(f"**説明:** {suggestion_details['description']}")
             st.markdown("##### (オプション) パラメータの変更")
@@ -2350,7 +2453,7 @@ def render_step_b():
                 if task_name.startswith("単純集計:"):
                     default_col = suggestion_details['suitable_cols'][0]
                     new_col = st.selectbox(f"集計対象の列 ({task_name})", options=keyword_cols, index=keyword_cols.index(default_col) if default_col in keyword_cols else 0, key=f"sel_{task_name}")
-                    suggestion_details['suitable_cols'] = [new_col]
+                    suggestion_details['suitable_cols'] = [new_col] # (★) ローカルコピーを更新
                 
                 # (★) クロス集計
                 elif task_name.startswith("クロス集計"):
@@ -2359,7 +2462,7 @@ def render_step_b():
                     c1, c2 = st.columns(2)
                     new_col1 = c1.selectbox(f"列 1 ({task_name})", options=all_cols, index=all_cols.index(default_col1) if default_col1 in all_cols else 0, key=f"sel_{task_name}_1")
                     new_col2 = c2.selectbox(f"列 2 ({task_name})", options=all_cols, index=all_cols.index(default_col2) if default_col2 in all_cols else 1, key=f"sel_{task_name}_2")
-                    suggestion_details['suitable_cols'] = [new_col1, new_col2]
+                    suggestion_details['suitable_cols'] = [new_col1, new_col2] # (★) ローカルコピーを更新
 
                 # (★) 時系列
                 elif task_name == "時系列キーワード分析":
@@ -2368,13 +2471,13 @@ def render_step_b():
                     c1, c2 = st.columns(2)
                     new_dt = c1.selectbox(f"日時列 ({task_name})", options=date_cols, index=date_cols.index(default_dt) if default_dt in date_cols else 0, key=f"sel_{task_name}_dt")
                     new_kw = c2.selectbox(f"キーワード列 ({task_name})", options=keyword_cols, index=keyword_cols.index(default_kw) if default_kw in keyword_cols else 0, key=f"sel_{task_name}_kw")
-                    suggestion_details['suitable_cols'] = {"datetime": [new_dt], "keywords": [new_kw]}
+                    suggestion_details['suitable_cols'] = {"datetime": [new_dt], "keywords": [new_kw]} # (★) ローカルコピーを更新
                 
                 # (★) テキストマイニング / 共起ネットワーク
                 elif task_name in ["テキストマイニング（頻出単語）", "共起ネットワーク"]:
                     default_col = suggestion_details['suitable_cols'][0]
                     new_col = st.selectbox(f"テキスト列 ({task_name})", options=text_cols, index=text_cols.index(default_col) if default_col in text_cols else 0, key=f"sel_{task_name}_txt")
-                    suggestion_details['suitable_cols'] = [new_col]
+                    suggestion_details['suitable_cols'] = [new_col] # (★) ローカルコピーを更新
                 
                 # (★) 5. エンゲージメントTOP5
                 elif task_name == "話題カテゴリ別 エンゲージメントTOP5と概要":
@@ -2383,7 +2486,7 @@ def render_step_b():
                     new_topic = c1.selectbox(f"話題カテゴリ列 ({task_name})", options=keyword_cols, index=keyword_cols.index(defaults['topic'][0]) if defaults['topic'][0] in keyword_cols else 0, key=f"sel_{task_name}_top")
                     new_eng = c2.selectbox(f"エンゲージメント列 ({task_name})", options=engagement_cols, index=engagement_cols.index(defaults['engagement'][0]) if defaults['engagement'][0] in engagement_cols else 0, key=f"sel_{task_name}_eng")
                     # (★) text_col は変更しない
-                    suggestion_details['suitable_cols'] = {'topic': [new_topic], 'text': defaults['text'], 'engagement': [new_eng]}
+                    suggestion_details['suitable_cols'] = {'topic': [new_topic], 'text': defaults['text'], 'engagement': [new_eng]} # (★) ローカルコピーを更新
 
             except Exception as e:
                 st.error(f"パラメータUIの描画に失敗: {e}")
@@ -2391,14 +2494,18 @@ def render_step_b():
 
 
             # (★) 個別実行ボタン
-            if st.button(f"「{task_name}」を実行/更新", key=f"run_{task_name}"):
-                st.session_state.progress_text = f"「{task_name}」を実行中..."
+            if st.button(f"「{task_name}」を再実行/更新", key=f"run_{task_name}"): # (★) 文言変更
+                st.session_state.progress_text = f"「{task_name}」を個別に実行中..."
                 with st.spinner(f"「{task_name}」を実行中..."):
                     try:
-                        # (★) 編集された suggestion_details を渡す
+                        # (★) 編集されたローカルコピー (suggestion_details) を渡す
                         result_data = execute_analysis(task_name, df_B, suggestion_details)
                         # (★) 実行結果をセッションステートに保存
                         st.session_state.step_b_results[task_name] = result_data
+                        
+                        # (★) !!! 重要: 修正したパラメータをセッションステートに書き戻す !!!
+                        st.session_state.suggestions_B[task_name] = suggestion_details
+                        
                         st.session_state.progress_text = f"「{task_name}」の実行が完了しました。"
                         st.rerun() # (★) UIを即時更新してプレビューを表示
                     except Exception as e:
@@ -2416,7 +2523,7 @@ def render_step_b():
     total_results = len(st.session_state.step_b_results)
     
     if total_results < total_suggestions:
-        st.warning(f"まだすべての分析が実行されていません ({total_results} / {total_suggestions} 件)。")
+        st.warning(f"まだすべての分析が実行されていません ({total_results} / {total_suggestions} 件)。(Step 2.5 の一括実行を推奨します)")
     else:
         st.success(f"すべての分析 ({total_results} / {total_suggestions} 件) が実行されました。JSONを生成できます。")
 
@@ -3097,6 +3204,18 @@ except ImportError:
         "pip install python-pptx を実行してください。"
     )
 
+try:
+    import pptx
+    from pptx import Presentation
+    from pptx.util import Inches, Pt
+    from pptx.enum.shapes import MSO_SHAPE
+    from pptx.enum.dml import MSO_THEME_COLOR
+except ImportError:
+    st.error(
+        "PowerPoint生成ライブラリ(python-pptx)が見つかりません。"
+        "pip install python-pptx を実行してください。"
+    )
+
 def find_layout_by_name(prs: pptx.presentation.Presentation, layout_name: str) -> Optional[pptx.slide.SlideLayout]:
     """
     (★) プレゼンテーションのマスターから、指定されたレイアウト名（完全一致）でスライドレイアウトを探す。
@@ -3143,12 +3262,16 @@ def create_powerpoint_presentation(
         
         if layout_map["title_only"] is None:
              layout_map["title_only"] = fallback_title_layout
+             logger.warning("「表紙」レイアウトが見つからないため、デフォルトの「タイトル スライド」を使用します。")
         if layout_map["agenda"] is None:
              layout_map["agenda"] = fallback_layout
+             logger.warning("「目次」レイアウトが見つからないため、デフォルトの「タイトルとコンテンツ」を使用します。")
         if layout_map["title_and_content"] is None:
              layout_map["title_and_content"] = fallback_layout
+             logger.warning("「テキスト」レイアウトが見つからないため、デフォルトの「タイトルとコンテンツ」を使用します。")
         if layout_map["text_and_image"] is None:
              layout_map["text_and_image"] = fallback_layout # 画像ありも最悪これで代用
+             logger.warning("「画像+テキスト」レイアウトが見つからないため、デフォルトの「タイトルとコンテンツ」を使用します。")
 
         logger.info(f"使用レイアウトマッピング: {layout_map_names}")
 
@@ -3162,7 +3285,8 @@ def create_powerpoint_presentation(
                 slide.shapes.title.text = first_slide_data.get("slide_title", "分析レポート")
             except: pass
             try:
-                if slide.placeholders[1]:
+                # (★) 多くのテンプレートでは Title Layout の Placeholder[1] が Subtitle
+                if len(slide.placeholders) > 1 and slide.placeholders[1]:
                      slide.placeholders[1].text = first_slide_data.get("slide_content", [""])[0]
             except: pass
             
@@ -3179,16 +3303,18 @@ def create_powerpoint_presentation(
                 title_shape = agenda_slide.shapes.title
             except AttributeError:
                 for shape in agenda_slide.placeholders:
-                    if shape.placeholder_format.idx == 0:
+                    # 0 or 100 (Title) or 136 (Center Title)
+                    if shape.placeholder_format.idx == 0 or shape.placeholder_format.idx == 100 or shape.placeholder_format.idx == 136:
                         title_shape = shape
                         break
             if title_shape:
-                title_shape.text = "目次"
+                title_shape.text = "本日のアジェンダ"
             
             # (★) 目次用の本文プレースホルダを探す
             agenda_body_shape = None
             for shape in agenda_slide.placeholders:
-                 if shape.placeholder_format.idx > 0: # 0はタイトル
+                 # 1 (Body) or 101 (Content)
+                 if shape.placeholder_format.idx == 1 or shape.placeholder_format.idx == 101: 
                      agenda_body_shape = shape
                      break
             
@@ -3210,7 +3336,9 @@ def create_powerpoint_presentation(
             slide_title = slide_data.get("slide_title", f"スライド {i+3}")
             slide_layout_key = slide_data.get("slide_layout", "title_and_content")
             slide_content = slide_data.get("slide_content", ["（コンテンツなし）"])
-            image_base64 = slide_data.get("image_base64")
+            image_base64 = slide_data.get("image_base664") # (★) 既存コードの typo を修正 (664 -> 64)
+            if image_base64 is None:
+                image_base64 = slide_data.get("image_base64") # (★) 正しいキーでも取得
 
             if image_base64 and slide_layout_key == "title_and_content":
                 slide_layout_key = "text_and_image"
@@ -3228,25 +3356,26 @@ def create_powerpoint_presentation(
             except Exception as e:
                 logger.warning(f"スライド {i+3} のタイトル設定失敗: {e}")
 
-            # (★) --- コンテンツと画像の配置 ---
+            # (★) --- コンテンツと画像の配置 (ロジックを堅牢化) ---
             try:
-                content_placeholders = [
-                    shape for shape in slide.placeholders 
-                    if shape.placeholder_format.idx > 0 and not shape.has_text_frame
-                ] # 画像用プレースホルダ候補
-                text_placeholders = [
-                    shape for shape in slide.placeholders
-                    if shape.placeholder_format.idx > 0 and shape.has_text_frame
-                ] # テキスト用プレースホルダ候補
-
-                # (★) 画像がある場合の処理
-                if image_base64:
-                    text_ph = text_placeholders[0] if text_placeholders else None
-                    image_ph = content_placeholders[0] if content_placeholders else (text_placeholders[1] if len(text_placeholders) > 1 else None)
+                # (★) プレースホルダをタイプ別に分類
+                text_placeholders = []
+                image_placeholders = []
+                
+                for shape in slide.placeholders:
+                    if shape.placeholder_format.idx == 0: continue # タイトルは除外
                     
-                    # 1. テキストを挿入
-                    if text_ph:
-                        tf = text_ph.text_frame
+                    if shape.has_text_frame:
+                        text_placeholders.append(shape)
+                    # (★) 画像用プレースホルダ (idx 101-107, 114-118 など) を推測
+                    elif shape.placeholder_format.idx > 100: 
+                        image_placeholders.append(shape)
+
+                # (★) 画像がある場合の処理 (text_and_image)
+                if image_base64:
+                    # (★) 1. テキストを挿入 (最初に見つかったテキストプレースホルダに)
+                    if text_placeholders:
+                        tf = text_placeholders[0].text_frame
                         tf.clear()
                         p = tf.paragraphs[0]
                         p.text = str(slide_content[0])
@@ -3254,7 +3383,14 @@ def create_powerpoint_presentation(
                             p = tf.add_paragraph()
                             p.text = str(item)
                     
-                    # 2. 画像を挿入
+                    # (★) 2. 画像を挿入 (最初に見つかった画像プレースホルダに)
+                    image_ph = None
+                    if image_placeholders:
+                        image_ph = image_placeholders[0]
+                    elif len(text_placeholders) > 1:
+                        # (★) 画像用がなければ、2番目のテキストプレースホルダを代用
+                        image_ph = text_placeholders[1] 
+
                     if image_ph:
                         try:
                             img_bytes = base64.b64decode(image_base64)
@@ -3264,11 +3400,11 @@ def create_powerpoint_presentation(
                         except Exception as e:
                             logger.error(f"スライド '{slide_title}': グラフ画像の挿入に失敗: {e}")
                             if image_ph.has_text_frame:
-                                image_ph.text = f"（画像挿入エラー: {e}）"
+                                image_ph.text_frame.text = f"（画像挿入エラー: {e}）"
                     else:
                          logger.warning(f"スライド '{slide_title}': 画像用プレースホルダが見つかりません。")
 
-                # (★) 画像がない場合の処理
+                # (★) 画像がない場合の処理 (title_and_content)
                 else:
                     if not text_placeholders:
                          logger.warning(f"スライド '{slide_title}': コンテンツプレースホルダが見つかりません。")
@@ -3336,13 +3472,18 @@ def render_step_d():
         try:
             # (★) アップロード時にレイアウト名を読み込む
             template_file.seek(0)
-            prs = Presentation(BytesIO(template_file.getvalue()))
+            template_bytes = template_file.getvalue()
+            prs = Presentation(BytesIO(template_bytes))
             template_layout_names = [layout.name for layout in prs.slide_layouts]
             
-            if st.session_state.step_d_template_file is None: # (★) 初回読み込み時のみ
-                st.success(f"テンプレート「{template_file.name}」を読み込みました。")
+            # (★) テンプレートが変更されたら、レイアウトマップをリセットするためにNoneをセット
+            if (st.session_state.step_d_template_file is None or 
+                st.session_state.step_d_template_file.getvalue() != template_bytes):
                 
-            st.session_state.step_d_template_file = BytesIO(template_file.getvalue())
+                st.success(f"テンプレート「{template_file.name}」を読み込みました。")
+                st.session_state.step_d_template_file = BytesIO(template_bytes)
+                st.session_state.step_d_layout_map = {} # (★) マップをリセット
+            
         except Exception as e:
             st.error(f"テンプレートの読み込みに失敗: {e}")
             template_layout_names = []
@@ -3350,8 +3491,9 @@ def render_step_d():
 
     else:
         # (★) ファイルがクリアされたらリセット
-        st.session_state.step_d_template_file = None
-        st.session_state.step_d_layout_map = {}
+        if st.session_state.step_d_template_file is not None:
+             st.session_state.step_d_template_file = None
+             st.session_state.step_d_layout_map = {}
 
 
     # --- 2. Step C 分析結果のアップロード ---
@@ -3370,9 +3512,10 @@ def render_step_d():
             report_data = json.loads(report_json_string)
             
             if isinstance(report_data, list) and all(isinstance(item, dict) for item in report_data):
-                if not st.session_state.step_d_report_data: # 初回読み込み
+                # (★) データの参照を更新する
+                if st.session_state.step_d_report_data != report_data:
                     st.success(f"分析レポート「{report_file.name}」を読み込みました ({len(report_data)}スライド)。")
-                st.session_state.step_d_report_data = report_data
+                    st.session_state.step_d_report_data = report_data
             else:
                 st.error("アップロードされたJSONが期待する形式（スライドのリスト）ではありません。")
                 st.session_state.step_d_report_data = []
@@ -3403,9 +3546,24 @@ def render_step_d():
 
     # (★) デフォルトのインデックスを探すヘルパー
     def get_default_index(default_name_key):
+        # (★) 1. セッションステートに保存された値があればそれを優先
+        if default_name_key in st.session_state.step_d_layout_map:
+            saved_name = st.session_state.step_d_layout_map[default_name_key]
+            if saved_name in layout_options:
+                return layout_options.index(saved_name)
+        
+        # (★) 2. なければ、デフォルト名（"タイトル スライド" など）を探す
         target_name = default_layouts[default_name_key]
         if target_name in layout_options:
             return layout_options.index(target_name)
+            
+        # (★) 3. それもなければ、部分一致（"タイトル"など）で探す
+        for i, opt in enumerate(layout_options):
+            if default_name_key in opt.lower(): # "title"
+                return i
+            if target_name.split(' ')[0] in opt: # "タイトル"
+                return i
+
         return 0 # 見つからなければ先頭
 
     layout_map = {}
@@ -3429,6 +3587,7 @@ def render_step_d():
             index=get_default_index("content_image"), key="layout_select_image"
         )
     
+    # (★) 選択結果をセッションステートに即時保存
     st.session_state.step_d_layout_map = layout_map
 
 
@@ -3451,7 +3610,7 @@ def render_step_d():
             
             title = item.get('slide_title', '（タイトルなし）')
             layout = item.get('slide_layout', 'N/A')
-            has_image = "🖼️" if item.get("image_base64") else "📄"
+            has_image = "🖼️" if (item.get("image_base64") or item.get("image_base664")) else "📄" # (★) Typo修正
             header_str = f"**{i+1}: {title}** (Layout: `{layout}`, {has_image})"
             headers_list.append(header_str)
             header_to_item_map[header_str] = item
@@ -3605,10 +3764,12 @@ def main():
         else:
             st.success("Google APIキー 読込完了")
             # (★) アプリ起動時にLLMとspaCyのロードを試みる
-            if get_llm(MODEL_FLASH_LITE) is None: 
-                st.error("LLMの初期化に失敗。APIキーが正しいか確認してください。")
-            if load_spacy_model() is None:
-                st.error("spaCyモデルのロードに失敗。")
+            if 'llm_checked' not in st.session_state:
+                if get_llm(MODEL_FLASH_LITE) is None: 
+                    st.error("LLMの初期化に失敗。APIキーが正しいか確認してください。")
+                if load_spacy_model() is None:
+                    st.error("spaCyモデルのロードに失敗。")
+                st.session_state.llm_checked = True # (★) 毎リラン時にチェックしないよう
         
         st.markdown("---")
         
@@ -3649,6 +3810,15 @@ def main():
         # if st.button("分析TIPSを更新", key="reload_tips", use_container_width=True):
         #      ... (ブロック全体を削除) ...
         # (★) --- ここまでが修正点 ---
+
+    # (★) 既存の main() 関数のロジック (セッションステート初期化) を移動
+    if 'llm_checked' not in st.session_state:
+        if os.getenv("GOOGLE_API_KEY"):
+            if get_llm(MODEL_FLASH_LITE) is None: 
+                pass # (★) エラーはサイドバーで表示
+            if load_spacy_model() is None:
+                pass # (★) エラーはサイドバーで表示
+        st.session_state.llm_checked = True
 
 
     # --- メインコンテンツ (ステップに応じて描画) ---
