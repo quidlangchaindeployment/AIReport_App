@@ -1172,13 +1172,10 @@ def suggest_analysis_techniques_ai(
 ) -> List[Dict[str, Any]]:
     """
     (Step B) ユーザーの自由記述プロンプトに基づき、AIが追加の分析手法を提案する。
-    (★) モデル: MODEL_FLASH_LITE (gemini-2.5-flash-lite)
-    (旧 `get_suggestions_from_prompt` をリファクタリング)
     """
     logger.info("AIプロンプトベースの分析提案 (Flash Lite) を開始...")
     
-    # (★) Step B の要件に基づき、FLASH_LITE モデルを明示的に指定
-    llm = get_llm(model_name=MODEL_FLASH_LITE, temperature=0.1) # 少しだけ創造性を持たせる
+    llm = get_llm(model_name=MODEL_FLASH_LITE, temperature=0.1)
     if llm is None:
         logger.error("suggest_analysis_techniques_ai: LLM (Flash Lite) が利用できません。")
         return []
@@ -1187,7 +1184,7 @@ def suggest_analysis_techniques_ai(
         col_info = []
         for col in df.columns:
             col_info.append(f"- {col} (型: {df[col].dtype}, 例: {df[col].dropna().iloc[0] if not df[col].dropna().empty else 'N/A'})")
-        column_info_str = "\n".join(col_info[:15]) # 列が多すぎても困るので最大15
+        column_info_str = "\n".join(col_info[:15])
         
         existing_names = [s['name'] for s in existing_suggestions]
         
@@ -1240,7 +1237,6 @@ def suggest_analysis_techniques_ai(
         json_str = match.group(0)
         ai_suggestions = json.loads(json_str)
         
-        # 'type': 'ai' が付与されているか確認 (AIの揺らぎ吸収)
         for s in ai_suggestions:
             s['type'] = 'ai'
             if 'priority' not in s: s['priority'] = 5
@@ -2318,6 +2314,7 @@ def render_step_b():
             st.session_state.step_b_results = {} # (★) 提案のたびに結果をリセット
             st.session_state.step_b_json_output = None # (★) 出力もリセット
             
+            # (★) 堅牢化された関数 (上記 1. で修正) が呼ばれる
             base_suggestions = suggest_analysis_techniques_py(df_B)
             ai_suggestions = []
             if analysis_prompt_B.strip():
@@ -2328,10 +2325,21 @@ def render_step_b():
             filtered_ai_suggestions = [s for s in ai_suggestions if s['name'] not in base_names]
             all_suggestions = sorted(base_suggestions + filtered_ai_suggestions, key=lambda x: x['priority'])
             
-            # (★) 提案を「辞書」としてセッションステートに保存
-            st.session_state.suggestions_B = {s['name']: s for s in all_suggestions}
-            st.success(f"分析手法の提案が完了しました ({len(all_suggestions)}件)。Step 2.5 で一括実行してください。")
-            st.rerun() # (★) 一括実行ボタンを即時表示するためにリラン
+            # (★) --- BEGIN FIX (Loop Prevention) ---
+            if not all_suggestions:
+                # (★) 提案が0件だった場合の処理
+                st.session_state.suggestions_B = {}
+                st.warning(
+                    "分析手法の提案が 0件 でした。\n"
+                    "アップロードしたCSVファイルに、分析可能な列（`...キーワード`で終わる列や、`ANALYSIS_TEXT_COLUMN`など）が"
+                    "正しく含まれているか確認してください。"
+                )
+                # (★) st.rerun() を *しない* で、このままスクリプトを続行させる
+            else:
+                # (★) 提案が1件以上あった場合の処理
+                st.session_state.suggestions_B = {s['name']: s for s in all_suggestions}
+                st.success(f"分析手法の提案が完了しました ({len(all_suggestions)}件)。Step 2.5 で一括実行してください。")
+                st.rerun()
 
     # (★) --- NEW Step 2.5: Bulk Execution ---
     # (★) 提案 (suggestions_B) が存在する場合にのみ表示
