@@ -976,19 +976,17 @@ def find_engagement_cols(df: pd.DataFrame, patterns: List[str]) -> List[str]:
     found_cols = set()
     for pattern in patterns:
         try:
-            for col in numeric_cols: # (★) Only search numeric cols
+            for col in numeric_cols: # 数値列のみを検索
                 if re.search(pattern, col, re.IGNORECASE):
                     found_cols.add(col)
         except re.error:
             continue
     return sorted(list(found_cols))
-# (★) --- END NEW HELPER FUNCTIONS ---
-
 
 def suggest_analysis_techniques_py(df: pd.DataFrame) -> List[Dict[str, Any]]:
     """
     (Step B) データフレームを分析し、Pythonで実行可能な基本的な分析手法を提案する。
-    (★) 修正: 2024/11/10 - re.search を使用し、列名を柔軟に検索するよう堅牢化
+    (列名に依存しない、汎用的な分析手法を提案するよう修正)
     """
     suggestions = []
     if df is None or df.empty:
@@ -996,100 +994,94 @@ def suggest_analysis_techniques_py(df: pd.DataFrame) -> List[Dict[str, Any]]:
         return suggestions
         
     try:
-        # (★) --- 1. 柔軟な列名の特定 ---
+        # --- 1. 柔軟な列名の特定 ---
         all_cols = list(df.columns)
         
-        # (★) 主要な列を見つける
         text_col = find_col(df, ['ANALYSIS_TEXT_COLUMN', 'text', 'content', '本文'])
-        topic_col = find_col(df, ['話題カテゴリ', 'topic', 'category'])
         location_col = find_col(df, ['市区町村キーワード', 'location', 'city', '地域'])
-        tour_spot_col = find_col(df, ['観光地キーワード', 'tourist_spot', 'spot'])
-        hashtag_col = find_col(df, ['hash', 'ハッシュタグ'])
         sentiment_col = find_col(df, ['sent', 'センチメント'])
-        date_col = find_col(df, ['date', 'time', '日付', '日時'])
         
-        # (★) 複数の可能性がある列
+        # 日付列の堅牢な検索
+        date_col = None
+        object_cols_for_date = df.select_dtypes(include='object').columns.tolist()
+        date_patterns = ['date', 'time', '日付', '日時']
+        for col in object_cols_for_date:
+            if any(re.search(p, col, re.IGNORECASE) for p in date_patterns):
+                 if df[col].isnull().all(): continue
+                 try:
+                     if pd.to_datetime(df[col].dropna().sample(n=min(5, df[col].count())), errors='coerce').notna().any():
+                         date_col = col
+                         break
+                 except Exception:
+                     pass
+            if date_col:
+                break
+        
         engagement_cols = find_engagement_cols(df, ['eng', 'like', 'いいね', 'エンゲージメント'])
-        # (★) `...キーワード` で終わる列 + `topic_col` や `location_col` など
-        flag_cols = find_cols(df, ['key', 'keyword', 'キーワード'])
-        flag_cols = sorted(list(set(flag_cols + [c for c in [topic_col, location_col, tour_spot_col, hashtag_col] if c is not None]))) # (★) Noneを除外
+        
+        # 汎用カテゴリ列 (flag_cols) の特定
+        base_flag_cols = find_cols(df, ['key', 'keyword', 'キーワード', 'カテゴリ', 'topic', 'ハッシュタグ'])
+        flag_cols = sorted(list(set([c for c in base_flag_cols if c is not None and c != location_col])))
 
+        # その他のカテゴリ列
         other_categorical = [
             col for col in df.select_dtypes(include='object').columns
-            if col not in flag_cols and col != text_col and col != date_col
+            if col not in flag_cols and col != text_col and col != date_col and col != location_col
         ]
         
-        logger.info(f"提案分析(PY) - Text:{text_col}, Topic:{topic_col}, Location:{location_col}")
-        logger.info(f"提案分析(PY) - FlagCols(All):{flag_cols}")
+        # 全てのカテゴリ列 (汎用 + 地域 + その他)
+        all_categorical = flag_cols + ([location_col] if location_col else []) + other_categorical
+        
+        logger.info(f"提案分析(PY) - Text:{text_col}, Location:{location_col}")
+        logger.info(f"提案分析(PY) - FlagCols(汎用カテゴリ):{flag_cols}")
         logger.info(f"提案分析(PY) - Engagement:{engagement_cols}, Sentiment:{sentiment_col}, Date:{date_col}")
 
         potential_suggestions = []
 
-        # (★) --- 2. 提案ロジック (堅牢化版) ---
+        # --- 2. 提案ロジック (汎用化版) ---
 
-        # --- 1. 全体メトリクス ---
-        # (★) センチメント列とエンゲージメント列を `suitable_cols` に渡す
-        overall_metric_cols = [c for c in [sentiment_col] + engagement_cols if c is not None] # (★) Noneを除外
+        # 1. 全体メトリクス
+        overall_metric_cols = [c for c in [sentiment_col] + engagement_cols if c is not None]
         potential_suggestions.append({
             "priority": 1, "name": "全体のメトリクス",
             "description": "投稿数、エンゲージメント、センチメント傾向など、データセット全体の概要を計算します。",
             "reason": "データ全体の状況把握に必須です。",
-            "suitable_cols": overall_metric_cols, # (★) 
+            "suitable_cols": overall_metric_cols,
             "type": "python"
         })
 
-        # --- 3. 単純集計（頻度分析）---
-        # (★) 見つかったすべての「フラグ列」に対して提案
-        if flag_cols:
-            for col in flag_cols:
-                potential_suggestions.append({
-                    "priority": 1, 
-                    "name": f"単純集計: {col}", # (★) 例: "単純集計: 市区町村キーワード"
-                    "description": f"「{col}」列の出現頻度（TOP50）を分析します。",
-                    "reason": f"StepAで生成されたキーワード列({col})の基本指標です。",
-                    "suitable_cols": [col], # (★) 1列のみ
-                    "type": "python"
-                })
-
-        # --- 2. クロス集計 ---
-        if len(flag_cols) >= 2:
+        # 3. 単純集計（頻度分析）
+        for col in flag_cols + ([location_col] if location_col else []):
             potential_suggestions.append({
-                "priority": 2, "name": "クロス集計（キーワード間）",
-                "description": "キーワード間の組み合わせで多く出現するパターンを探ります。",
-                "reason": f"複数キーワード列({len(flag_cols)}個)あり、関連性の発見に。",
-                "suitable_cols": flag_cols, 
-                "type": "python"
-            })
-        if flag_cols and other_categorical:
-             potential_suggestions.append({
-                "priority": 2, "name": "クロス集計（キーワード×属性）",
-                "description": f"キーワード({flag_cols[0]}など)と他の属性({', '.join(other_categorical)})の関係性を分析します。",
-                "reason": f"キーワード列と他カテゴリ列({len(other_categorical)}個)あり。",
-                "suitable_cols": flag_cols + other_categorical, 
-                "type": "python"
-            })
-            
-        # (★) 修正: `topic_col` と `tour_spot_col` が両方見つかった場合
-        if topic_col and tour_spot_col:
-            potential_suggestions.append({
-                "priority": 2, "name": f"{topic_col}別 {tour_spot_col} TOP10",
-                "description": f"「{topic_col}」と「{tour_spot_col}」をクロス集計し、カテゴリ別の人気観光地を分析します。",
-                "reason": "カテゴリと観光地の関連性を分析します。",
-                "suitable_cols": [topic_col, tour_spot_col],
+                "priority": 1, 
+                "name": f"単純集計: {col}",
+                "description": f"「{col}」列の出現頻度（TOP50）を分析します。",
+                "reason": f"カテゴリ列({col})の基本指標です。",
+                "suitable_cols": [col],
                 "type": "python"
             })
 
-        # --- 3. 時系列分析 ---
-        if date_col and flag_cols:
+        # 2. クロス集計
+        if len(all_categorical) >= 2:
+            potential_suggestions.append({
+                "priority": 2, "name": "クロス集計（カテゴリ間）",
+                "description": "2つのカテゴリ列（例: '話題カテゴリ' vs '市区町村'）を選択し、その組み合わせを分析します。",
+                "reason": f"複数カテゴリ列({len(all_categorical)}個)あり、関連性の発見に。",
+                "suitable_cols": all_categorical, 
+                "type": "python"
+            })
+
+        # 3. 時系列分析
+        if date_col and all_categorical:
             potential_suggestions.append({
                 "priority": 3, "name": "時系列キーワード分析",
-                "description": f"特定のキーワードの出現数が時間（{date_col}など）とともにどう変化したかトレンドを分析します。",
-                "reason": f"キーワード列と日時列({date_col})あり。",
-                "suitable_cols": {"datetime": [date_col], "keywords": flag_cols}, # (★) 
+                "description": f"特定のカテゴリ列（例: '話題カテゴリ'）の出現数が時間（{date_col}）とともにどう変化したか分析します。",
+                "reason": f"カテゴリ列と日時列({date_col})あり。",
+                "suitable_cols": {"datetime": [date_col], "keywords": all_categorical},
                 "type": "python"
             })
             
-        # --- 3. 共起ネットワーク ---
+        # 3. 共起ネットワーク
         if text_col:
             potential_suggestions.append({
                 "priority": 3, "name": "共起ネットワーク",
@@ -1099,7 +1091,7 @@ def suggest_analysis_techniques_py(df: pd.DataFrame) -> List[Dict[str, Any]]:
                 "type": "python"
             })
             
-        # --- 4. テキストマイニング ---
+        # 4. テキストマイニング
         if text_col:
             potential_suggestions.append({
                 "priority": 4, "name": "テキストマイニング（頻出単語）",
@@ -1109,29 +1101,38 @@ def suggest_analysis_techniques_py(df: pd.DataFrame) -> List[Dict[str, Any]]:
                 "type": "python"
             })
 
-        # --- 4. 話題カテゴリ別 サマリ (Python + AI) ---
-        if topic_col and text_col:
+        # 4. カテゴリ列の集計と深掘り (Python + AI)
+        if flag_cols and text_col:
             potential_suggestions.append({
-                "priority": 4, "name": "話題カテゴリ別 投稿数とサマリ",
-                "description": "指定された話題カテゴリ（グルメ、自然など）ごとに投稿数を集計し、AIが投稿内容のサマリを生成します。",
+                "priority": 4, "name": "カテゴリ列の集計と深掘り",
+                "description": "指定したカテゴリ列（例: '話題カテゴリ'）ごとに投稿数を集計し、AIが投稿内容のサマリを生成します。",
                 "reason": "カテゴリごとの主要な話題を把握します。",
-                "suitable_cols": [topic_col, text_col], # (★)
+                "suitable_cols": {'category_cols': flag_cols, 'text_col': [text_col]},
                 "type": "python"
             })
 
-        # --- 4. 話題カテゴリ別 エンゲージメントTOP5 (Python + AI) ---
-        if topic_col and text_col and engagement_cols:
+        # 4. カテゴリ別 数値列TOP5分析 (Python + AI)
+        if flag_cols and text_col and engagement_cols:
             potential_suggestions.append({
-                "priority": 4, "name": "話題カテゴリ別 エンゲージメントTOP5と概要",
-                "description": f"指定された話題カテゴリごとに、エンゲージメント（{engagement_cols[0]}）が高いTOP5投稿を抽出し、AIがその概要を生成します。",
+                "priority": 4, "name": "カテゴリ別 数値列TOP5分析",
+                "description": f"指定したカテゴリ列ごとに、指定した数値列（例: '{engagement_cols[0]}'）が高いTOP5投稿を抽出し、AIがその概要を生成します。",
                 "reason": "カテゴリごとに「バズった」投稿の内容を把握します。",
-                "suitable_cols": {'topic': [topic_col], 'text': [text_col], 'engagement': engagement_cols},
+                "suitable_cols": {'category_cols': flag_cols, 'text_col': [text_col], 'numeric_cols': engagement_cols},
+                "type": "python"
+            })
+        
+        # 5. A/B 比較分析
+        if all_categorical and location_col:
+             potential_suggestions.append({
+                "priority": 5, "name": "A/B 比較分析",
+                "description": "2つの異なる投稿グループ（例：カテゴリA vs B、またはエリアA vs B）を選択し、投稿数や人気観光地（市区町村）の順位変動を比較します。",
+                "reason": "グループ間の傾向の違いを明確にし、戦略立案に役立てます。",
+                "suitable_cols": {'category_cols': all_categorical, 'location_col': [location_col]},
                 "type": "python"
             })
 
         suggestions = sorted(potential_suggestions, key=lambda x: x['priority'])
         
-        # (★) 重複する提案を削除 (例: "単純集計: 話題カテゴリ" と "話題カテゴリ別 ...")
         final_suggestions = []
         seen_names = set()
         for s in suggestions:
@@ -1170,6 +1171,22 @@ def suggest_analysis_techniques_ai(
         
         existing_names = [s['name'] for s in existing_suggestions]
         
+        # (Bug 1.2 / 差分問題) 重複タスクをAIに厳格に禁止する
+        forbidden_tasks = [
+            "全体のメトリクス", "単純集計", "市区町村別投稿数", "クロス集計", 
+            "時系列キーワード分析", "共起ネットワーク", "テキストマイニング",
+            "カテゴリ列の集計と深掘り", "カテゴリ別 数値列TOP5分析", 
+            "A/B 比較分析", "センチメント", "Sentiment",
+            # AIが生成しがちな重複タスク名も明示的に禁止
+            "話題カテゴリ別 投稿数とサマリ", 
+            "話題カテゴリ別投稿数とサマリ",
+            "話題カテゴリ別 エンゲージメントTOP5と概要", 
+            "話題カテゴリ別エンゲージメント上位投稿TOP5",
+            "市区町村別投稿数集計",
+            "全体のセンチメント分析"
+        ]
+        existing_names_str = ", ".join(list(set(existing_names + forbidden_tasks)))
+
         prompt = PromptTemplate.from_template(
             """
             あなたはデータ分析の専門家です。ユーザーの「分析指示」と「データ構造」を読み、実行可能な「分析タスク」をJSONリスト形式で提案してください。
@@ -1185,10 +1202,10 @@ def suggest_analysis_techniques_ai(
             
             # 指示:
             1. 「ユーザーの分析指示」を解釈し、具体的な分析タスク（例：「広島市と観光地の相関分析」）に分解する。
-            2. 各タスクを以下のJSON形式で定義する。
-            3. `name`はタスク名、`description`はAI（あなた自身）がこの後実行するタスクの具体的な指示（プロンプト）とする。
-            4. `priority`は 5 固定、`type`は "ai" 固定とする。
-            5. 指示が空、または解釈不能な場合は、空リスト [] を返す。
+            2. 【重要】「既に提案済みのタスク」リストにあるタスクや、それに酷似したタスク（例：「単純集計」や「カテゴリ別サマリ」など）は【絶対に】提案しないでください。
+            3. 各タスクを以下のJSON形式で定義する。
+            4. `name`はタスク名、`description`はAI（あなた自身）がこの後実行するタスクの具体的な指示（プロンプト）とする。
+            5. `priority`は 5 固定、`type`は "ai" 固定とする。
             
             # 回答 (JSONリスト形式のみ):
             [
@@ -1207,7 +1224,7 @@ def suggest_analysis_techniques_ai(
         response_str = chain.invoke({
             "column_info": column_info_str,
             "user_prompt": user_prompt,
-            "existing_tasks": ", ".join(existing_names)
+            "existing_tasks": existing_names_str
         })
 
         logger.info(f"AI追加提案(生): {response_str}")
@@ -1231,13 +1248,7 @@ def suggest_analysis_techniques_ai(
         st.warning(f"AI追加提案の生成中にエラーが発生しました: {e}")
         return []
 
-import networkx as nx # (★) Step B (共起ネットワーク) で必要
-from itertools import combinations # (★) Step B (共起ネットワーク) で必要
-import math # (★) グラフのレイアウト計算用
-
-
-# --- 8.0. (★) グラフ生成ヘルパー (グラフサイズ修正) ---
-
+# --- 8.0. グラフ生成ヘルパー ---
 def generate_graph_image(
     df: pd.DataFrame,
     plot_type: str,
@@ -1246,24 +1257,23 @@ def generate_graph_image(
     title: str = "分析グラフ"
 ) -> Optional[str]:
     """
-    (★) DataFrameからmatplotlibグラフを生成し、Base64エンコードされた画像文字列を返す。
-    (★) 1. 2. グラフサイズ修正
+    DataFrameからmatplotlibグラフを生成し、Base64エンコードされた画像文字列を返す。
+    (グラフサイズを動的に変更)
     """
     logger.info(f"グラフ生成開始: {title} (タイプ: {plot_type})")
     if df is None or df.empty:
         logger.warning("グラフ生成スキップ: DataFrameが空です。")
         return None
 
-    # (★) --- 修正: プロットタイプに応じてFigureサイズを変更 ---
+    # プロットタイプに応じてFigureサイズを変更
     if plot_type == 'network':
-        plt.figure(figsize=(12, 12)) # (★) 2. 共起ネットワーク: 正方形 (12x12)
+        plt.figure(figsize=(12, 12)) # 共起ネットワーク: 正方形 (12x12)
     elif plot_type == 'timeseries':
-        plt.figure(figsize=(15, 7)) # (★) 1. 時系列: 横長 (15x7)
+        plt.figure(figsize=(15, 7)) # 時系列: 横長 (15x7)
     else:
-        plt.figure(figsize=(10, 7)) # (★) デフォルト (棒グラフなど)
+        plt.figure(figsize=(10, 7)) # デフォルト (棒グラフなど)
     
     plt.rcParams['font.size'] = 12
-    # (★) --- ここまでが修正点 ---
     
     try:
         if plot_type == 'bar' and x_col and y_col:
@@ -1322,9 +1332,8 @@ def generate_graph_image(
             except Exception:
                 node_colors = '#7280C1'
             
-            # (★) --- 修正: 2. 共起ネットワークのレイアウト調整 ---
-            # (★) k値を調整 (ノードを広げる)
-            k_val = 2.5 / math.sqrt(len(G.nodes())) # (★) 1.5 -> 2.5 に変更
+            # 共起ネットワークのレイアウト調整
+            k_val = 2.5 / math.sqrt(len(G.nodes())) # k値を調整 (ノードを広げる)
             pos = nx.spring_layout(G, k=max(k_val, 0.5), iterations=50, seed=42)
             
             node_sizes = []
@@ -1338,11 +1347,30 @@ def generate_graph_image(
             edge_weights = [d['weight'] / df_plot['weight'].max() * 8 for u, v, d in G.edges(data=True)]
 
             nx.draw_networkx_nodes(G, pos, node_size=node_sizes, node_color=node_colors, alpha=0.9)
-            # (★) 2. エッジのalphaを調整 (細く)
-            nx.draw_networkx_edges(G, pos, width=edge_weights, alpha=0.1, edge_color='grey')
+            nx.draw_networkx_edges(G, pos, width=edge_weights, alpha=0.1, edge_color='grey') # alphaを調整
             nx.draw_networkx_labels(G, pos, font_size=10, font_family='IPAGothic')
-            # (★) --- ここまでが修正点 ---
             
+            plt.axis('off')
+        
+        elif plot_type == 'wordcloud' and not df.empty:
+            if 'word' not in df.columns or 'count' not in df.columns:
+                 raise ValueError("ワードクラウドには 'word' と 'count' 列が必要です。")
+            
+            frequencies = df.set_index('word')['count'].to_dict()
+            
+            if not frequencies:
+                 raise ValueError("ワードクラウド用の単語がありません。")
+
+            wc = WordCloud(
+                font_path=font_path,
+                width=800,
+                height=500,
+                background_color='white',
+                colormap='viridis',
+                max_words=100
+            ).generate_from_frequencies(frequencies)
+            
+            plt.imshow(wc, interpolation='bilinear')
             plt.axis('off')
 
         else:
@@ -1353,7 +1381,7 @@ def generate_graph_image(
         plt.tight_layout()
 
         buf = BytesIO()
-        plt.savefig(buf, format='png', dpi=96) # (★) 150 -> 96 (トークン数削減)
+        plt.savefig(buf, format='png', dpi=96)
         buf.seek(0)
         
         image_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
@@ -1367,254 +1395,7 @@ def generate_graph_image(
         plt.clf()
         plt.close('all')
 
-
-# --- 8. (★) Step B: 分析提案関連 ---
-
-def suggest_analysis_techniques_py(df: pd.DataFrame) -> List[Dict[str, Any]]:
-    """
-    (Step B) データフレームを分析し、Pythonで実行可能な基本的な分析手法を提案する。
-    (★) 修正: 2024/11/10 - re.search を使用し、列名を柔軟に検索するよう堅牢化
-    """
-    suggestions = []
-    if df is None or df.empty:
-        logger.error("suggest_analysis_techniques_py: DFが空です。")
-        return suggestions
-        
-    try:
-        # (★) --- 1. 柔軟な列名の特定 ---
-        all_cols = list(df.columns)
-        
-        # (★) 主要な列を見つける
-        text_col = find_col(df, ['ANALYSIS_TEXT_COLUMN', 'text', 'content', '本文'])
-        topic_col = find_col(df, ['話題カテゴリ', 'topic', 'category'])
-        location_col = find_col(df, ['市区町村キーワード', 'location', 'city', '地域'])
-        tour_spot_col = find_col(df, ['観光地キーワード', 'tourist_spot', 'spot'])
-        hashtag_col = find_col(df, ['hash', 'ハッシュタグ'])
-        sentiment_col = find_col(df, ['sent', 'センチメント'])
-        date_col = find_col(df, ['date', 'time', '日付', '日時'])
-        
-        # (★) 複数の可能性がある列
-        engagement_cols = find_engagement_cols(df, ['eng', 'like', 'いいね', 'エンゲージメント'])
-        
-        # (★) --- 修正: None がリストに含まれないよう 'is not None' でチェック ---
-        flag_cols = find_cols(df, ['key', 'keyword', 'キーワード'])
-        flag_cols = sorted(list(set(flag_cols + [c for c in [topic_col, location_col, tour_spot_col, hashtag_col] if c is not None])))
-
-        other_categorical = [
-            col for col in df.select_dtypes(include='object').columns
-            if col not in flag_cols and col != text_col and col != date_col
-        ]
-        
-        logger.info(f"提案分析(PY) - Text:{text_col}, Topic:{topic_col}, Location:{location_col}")
-        logger.info(f"提案分析(PY) - FlagCols(All):{flag_cols}")
-        logger.info(f"提案分析(PY) - Engagement:{engagement_cols}, Sentiment:{sentiment_col}, Date:{date_col}")
-
-        potential_suggestions = []
-
-        # (★) --- 2. 提案ロジック (堅牢化版) ---
-
-        # --- 1. 全体メトリクス ---
-        # (★) --- 修正: None がリストに含まれないよう 'is not None' でチェック ---
-        overall_metric_cols = [c for c in [sentiment_col] + engagement_cols if c is not None]
-        potential_suggestions.append({
-            "priority": 1, "name": "全体のメトリクス",
-            "description": "投稿数、エンゲージメント、センチメント傾向など、データセット全体の概要を計算します。",
-            "reason": "データ全体の状況把握に必須です。",
-            "suitable_cols": overall_metric_cols, # (★) 
-            "type": "python"
-        })
-
-        # --- 3. 単純集計（頻度分析）---
-        if flag_cols:
-            for col in flag_cols:
-                potential_suggestions.append({
-                    "priority": 1, 
-                    "name": f"単純集計: {col}", 
-                    "description": f"「{col}」列の出現頻度（TOP50）を分析します。",
-                    "reason": f"StepAで生成されたキーワード列({col})の基本指標です。",
-                    "suitable_cols": [col],
-                    "type": "python"
-                })
-
-        # --- 2. クロス集計 ---
-        if len(flag_cols) >= 2:
-            potential_suggestions.append({
-                "priority": 2, "name": "クロス集計（キーワード間）",
-                "description": "キーワード間の組み合わせで多く出現するパターンを探ります。",
-                "reason": f"複数キーワード列({len(flag_cols)}個)あり、関連性の発見に。",
-                "suitable_cols": flag_cols, 
-                "type": "python"
-            })
-        if flag_cols and other_categorical:
-             potential_suggestions.append({
-                "priority": 2, "name": "クロス集計（キーワード×属性）",
-                "description": f"キーワード({flag_cols[0]}など)と他の属性({', '.join(other_categorical)})の関係性を分析します。",
-                "reason": f"キーワード列と他カテゴリ列({len(other_categorical)}個)あり。",
-                "suitable_cols": flag_cols + other_categorical, 
-                "type": "python"
-            })
-            
-        if topic_col and tour_spot_col:
-            potential_suggestions.append({
-                "priority": 2, "name": f"{topic_col}別 {tour_spot_col} TOP10",
-                "description": f"「{topic_col}」と「{tour_spot_col}」をクロス集計し、カテゴリ別の人気観光地を分析します。",
-                "reason": "カテゴリと観光地の関連性を分析します。",
-                "suitable_cols": [topic_col, tour_spot_col],
-                "type": "python"
-            })
-
-        # --- 3. 時系列分析 ---
-        if date_col and flag_cols:
-            potential_suggestions.append({
-                "priority": 3, "name": "時系列キーワード分析",
-                "description": f"特定のキーワードの出現数が時間（{date_col}など）とともにどう変化したかトレンドを分析します。",
-                "reason": f"キーワード列と日時列({date_col})あり。",
-                "suitable_cols": {"datetime": [date_col], "keywords": flag_cols},
-                "type": "python"
-            })
-            
-        # --- 3. 共起ネットワーク ---
-        if text_col:
-            potential_suggestions.append({
-                "priority": 3, "name": "共起ネットワーク",
-                "description": "投稿テキスト内の単語の出現パターンを分析し、関連性の高い単語のネットワークを構築します。",
-                "reason": "テキストデータから隠れたトピックや関連性を発見します。",
-                "suitable_cols": [text_col],
-                "type": "python"
-            })
-            
-        # --- 4. テキストマイニング ---
-        if text_col:
-            potential_suggestions.append({
-                "priority": 4, "name": "テキストマイニング（頻出単語）",
-                "description": "原文テキストから頻出する単語を抽出し、どのような言葉が多く使われているか全体像を把握します。",
-                "reason": "原文テキストがあり、タグ付け以外のインサイト発見に。",
-                "suitable_cols": [text_col],
-                "type": "python"
-            })
-
-        # --- 4. 話題カテゴリ別 サマリ (Python + AI) ---
-        if topic_col and text_col:
-            potential_suggestions.append({
-                "priority": 4, "name": "話題カテゴリ別 投稿数とサマリ",
-                "description": "指定された話題カテゴリ（グルメ、自然など）ごとに投稿数を集計し、AIが投稿内容のサマリを生成します。",
-                "reason": "カテゴリごとの主要な話題を把握します。",
-                "suitable_cols": [topic_col, text_col],
-                "type": "python"
-            })
-
-        # --- 4. 話題カテゴリ別 エンゲージメントTOP5 (Python + AI) ---
-        if topic_col and text_col and engagement_cols:
-            potential_suggestions.append({
-                "priority": 4, "name": "話題カテゴリ別 エンゲージメントTOP5と概要",
-                "description": f"指定された話題カテゴリごとに、エンゲージメント（{engagement_cols[0]}）が高いTOP5投稿を抽出し、AIがその概要を生成します。",
-                "reason": "カテゴリごとに「バズった」投稿の内容を把握します。",
-                "suitable_cols": {'topic': [topic_col], 'text': [text_col], 'engagement': engagement_cols},
-                "type": "python"
-            })
-
-        suggestions = sorted(potential_suggestions, key=lambda x: x['priority'])
-        
-        final_suggestions = []
-        seen_names = set()
-        for s in suggestions:
-             if s['name'] not in seen_names:
-                 final_suggestions.append(s)
-                 seen_names.add(s['name'])
-                 
-        logger.info(f"Pythonベース提案(ソート後): {[s['name'] for s in final_suggestions]}")
-        return final_suggestions
-
-    except Exception as e:
-        logger.error(f"Python分析手法提案中にエラー: {e}", exc_info=True)
-        st.warning(f"分析手法提案中にエラー: {e}")
-    return suggestions
-
-def suggest_analysis_techniques_ai(
-    user_prompt: str,
-    df: pd.DataFrame,
-    existing_suggestions: List[Dict[str, Any]]
-) -> List[Dict[str, Any]]:
-    """
-    (Step B) ユーザーの自由記述プロンプトに基づき、AIが追加の分析手法を提案する。
-    """
-    logger.info("AIプロンプトベースの分析提案 (Flash Lite) を開始...")
-    
-    llm = get_llm(model_name=MODEL_FLASH_LITE, temperature=0.1)
-    if llm is None:
-        logger.error("suggest_analysis_techniques_ai: LLM (Flash Lite) が利用できません。")
-        return []
-
-    try:
-        col_info = []
-        for col in df.columns:
-            col_info.append(f"- {col} (型: {df[col].dtype}, 例: {df[col].dropna().iloc[0] if not df[col].dropna().empty else 'N/A'})")
-        column_info_str = "\n".join(col_info[:15])
-        
-        existing_names = [s['name'] for s in existing_suggestions]
-        
-        prompt = PromptTemplate.from_template(
-            """
-            あなたはデータ分析の専門家です。ユーザーの「分析指示」と「データ構造」を読み、実行可能な「分析タスク」をJSONリスト形式で提案してください。
-            
-            # データ構造 (利用可能な列名):
-            {column_info}
-            
-            # 既に提案済みのタスク (これらは提案しないでください):
-            {existing_tasks}
-            
-            # ユーザーの分析指示:
-            {user_prompt}
-            
-            # 指示:
-            1. 「ユーザーの分析指示」を解釈し、具体的な分析タスク（例：「広島市と観光地の相関分析」）に分解する。
-            2. 各タスクを以下のJSON形式で定義する。
-            3. `name`はタスク名、`description`はAI（あなた自身）がこの後実行するタスクの具体的な指示（プロンプト）とする。
-            4. `priority`は 5 固定、`type`は "ai" 固定とする。
-            5. 指示が空、または解釈不能な場合は、空リスト [] を返す。
-            
-            # 回答 (JSONリスト形式のみ):
-            [
-              {{
-                "priority": 5,
-                "name": "（ユーザー指示に基づくタスク名1）",
-                "description": "（このタスクを実行するためのAIへの具体的な指示プロンプト1）",
-                "reason": "ユーザー指示に基づく",
-                "suitable_cols": [],
-                "type": "ai"
-              }}
-            ]
-            """
-        )
-        chain = prompt | llm | StrOutputParser()
-        response_str = chain.invoke({
-            "column_info": column_info_str,
-            "user_prompt": user_prompt,
-            "existing_tasks": ", ".join(existing_names)
-        })
-
-        logger.info(f"AI追加提案(生): {response_str}")
-        match = re.search(r'\[.*\]', response_str, re.DOTALL)
-        if not match:
-            logger.warning("AIがJSONリスト形式で応答しませんでした。")
-            return []
-            
-        json_str = match.group(0)
-        ai_suggestions = json.loads(json_str)
-        
-        for s in ai_suggestions:
-            s['type'] = 'ai'
-            if 'priority' not in s: s['priority'] = 5
-            
-        logger.info(f"AI追加提案(パース済): {len(ai_suggestions)}件")
-        return ai_suggestions
-
-    except Exception as e:
-        logger.error(f"AI追加提案の生成中にエラー: {e}", exc_info=True)
-        st.warning(f"AI追加提案の生成中にエラーが発生しました: {e}")
-        return []
-
-# --- 8.1. (★) Step B: Python分析ヘルパー (修正反映) ---
+# --- 8.1. (★) Step B: Python分析ヘルパー ---
 
 def run_simple_count(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Dict[str, Any]:
     """(Step B) 単純集計（頻度分析）を実行し、DataFrameとグラフ(Base64)を返す"""
@@ -1627,8 +1408,8 @@ def run_simple_count(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Dict[str, 
         results["summary"] = msg
         return results
     
-    # (★) 3. 提案ロジックの変更により、suitable_cols[0] は分析対象の列名 (e.g., '話題カテゴリ') になっている
-    col_to_analyze = flag_cols[0]
+    # UIで編集された列を取得 (フォールバックあり)
+    col_to_analyze = suggestion.get('ui_selected_col', flag_cols[0])
     
     if col_to_analyze not in df.columns:
         msg = f"列 '{col_to_analyze}' がDFに存在しません。"
@@ -1672,7 +1453,6 @@ def run_crosstab(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Dict[str, Any]
     """(Step B) クロス集計を実行し、DataFrameを返す"""
     results = {"data": pd.DataFrame(), "image_base64": None, "summary": ""}
     
-    # (★) UIで編集された列を取得
     cols = suggestion.get('suitable_cols', [])
     if len(cols) < 2:
         msg = "クロス集計には2列以上必要です。"
@@ -1680,8 +1460,9 @@ def run_crosstab(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Dict[str, Any]
         results["summary"] = msg
         return results
 
-    # (★) 編集ロジック (UI側で2列が選択されていることを期待)
-    col1, col2 = cols[0], cols[1]
+    # UIで編集された列を取得 (フォールバックあり)
+    col1 = suggestion.get('ui_selected_col1', cols[0])
+    col2 = suggestion.get('ui_selected_col2', cols[1])
 
     if col1 not in df.columns or col2 not in df.columns:
         msg = f"選択された列 ({col1}, {col2}) がDFに存在しません。"
@@ -1718,7 +1499,6 @@ def run_timeseries(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Dict[str, An
     """(Step B) 時系列分析を実行し、DataFrameとグラフ(Base64)を返す"""
     results = {"data": pd.DataFrame(), "image_base64": None, "summary": ""}
     
-    # (★) UIで編集された列を取得
     cols_dict = suggestion.get('suitable_cols', {})
     if not isinstance(cols_dict, dict) or 'datetime' not in cols_dict or 'keywords' not in cols_dict:
         msg = "列情報（datetime, keywords）が不十分です。"
@@ -1726,9 +1506,9 @@ def run_timeseries(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Dict[str, An
         results["summary"] = msg
         return results
         
-    # (★) 編集ロジック (UI側で1列ずつ選択されていることを期待)
-    dt_col = cols_dict['datetime'][0]
-    kw_col = cols_dict['keywords'][0]
+    # UIで編集された列を取得 (フォールバックあり)
+    dt_col = suggestion.get('ui_selected_dt_col', cols_dict['datetime'][0])
+    kw_col = suggestion.get('ui_selected_kw_col', cols_dict['keywords'][0])
 
     if dt_col not in df.columns:
         msg = f"日時列 '{dt_col}' が見つかりません。"
@@ -1783,8 +1563,8 @@ def run_text_mining(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Dict[str, A
     """(Step B) テキストマイニング（頻出単語）を実行し、DataFrameとグラフ(Base64)を返す"""
     results = {"data": pd.DataFrame(), "image_base64": None, "summary": ""}
     
-    # (★) UIで編集された列を取得
-    text_col = suggestion.get('suitable_cols', ['ANALYSIS_TEXT_COLUMN'])[0]
+    # UIで編集された列を取得 (フォールバックあり)
+    text_col = suggestion.get('ui_selected_text_col', suggestion.get('suitable_cols', ['ANALYSIS_TEXT_COLUMN'])[0])
     
     if text_col not in df.columns or df[text_col].empty:
         msg = f"テキスト列 '{text_col}' がないか、空です。"
@@ -1837,12 +1617,11 @@ def run_text_mining(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Dict[str, A
         results["data"] = word_counts_df
         results["summary"] = f"'{text_col}' に対するテキストマイニングを実行。頻出単語は '{word_counts_df.iloc[0,0]}' ({word_counts_df.iloc[0,1]}件) でした。"
         
+        # グラフ生成 (ワードクラウド)
         results["image_base64"] = generate_graph_image(
             df=word_counts_df,
-            plot_type='bar',
-            x_col='word',
-            y_col='count',
-            title=f"「{text_col}」 頻出単語 TOP20"
+            plot_type='wordcloud',
+            title=f"「{text_col}」 頻出単語 ワードクラウド (TOP100)"
         )
         return results
         
@@ -1852,78 +1631,91 @@ def run_text_mining(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Dict[str, A
     return results
 
 def run_overall_metrics(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Dict[str, Any]:
-    """(Step B) データセット全体のメトリクスを計算する"""
-    # (変更なし)
+    """(Step B) データセット全体のメトリクスを計算する (単位追加)"""
     logger.info("run_overall_metrics 実行...")
     metrics = {}
     try:
-        metrics["total_posts"] = len(df)
+        # (Bug 1.6) 単位を文字列として追加
+        metrics["total_posts"] = f"{len(df):,}件"
+
         engagement_cols = [col for col in df.columns if any(c in col.lower() for c in ['いいね', 'like', 'エンゲージメント', 'engagement', 'retweet', 'リツイート'])]
         total_engagement = 0
         if engagement_cols:
             for col in engagement_cols:
                 if pd.api.types.is_numeric_dtype(df[col]):
                     total_engagement += df[col].sum()
-            metrics["total_engagement"] = int(total_engagement)
+            metrics["total_engagement"] = f"{int(total_engagement):,}件"
         else:
             metrics["total_engagement"] = "N/A"
+
         sentiment_col = None
         if 'センチメント' in df.columns:
             sentiment_col = 'センチメント'
-        elif len(df.columns) > 9 and ('センチメント' in str(df.columns[9]) or 'sentiment' in str(df.columns[9]).lower()):
-            sentiment_col = df.columns[9]
+        elif find_col(df, ['sent', 'センチメント']):
+            sentiment_col = find_col(df, ['sent', 'センチメント'])
+            
         if sentiment_col:
             pos_count = int(df[df[sentiment_col].astype(str).str.contains('ポジティブ|Positive', case=False, na=False)].shape[0])
             neg_count = int(df[df[sentiment_col].astype(str).str.contains('ネガティブ|Negative', case=False, na=False)].shape[0])
-            metrics["positive_posts"] = pos_count
-            metrics["negative_posts"] = neg_count
+            
+            metrics["positive_posts"] = f"{pos_count:,}件"
+            metrics["negative_posts"] = f"{neg_count:,}件"
+            
             if (pos_count + neg_count) > 0:
                 tendency = ((pos_count - neg_count) / (pos_count + neg_count)) * 100
-                metrics["sentiment_tendency_percent"] = int(np.floor(tendency))
+                metrics["sentiment_tendency_percent"] = f"{int(np.floor(tendency))}%" # % を追加
             else:
-                metrics["sentiment_tendency_percent"] = 0
+                metrics["sentiment_tendency_percent"] = "0%"
         else:
             logger.warning("列 'センチメント' が見つかりませんでした。")
             metrics["positive_posts"] = "N/A"
             metrics["negative_posts"] = "N/A"
             metrics["sentiment_tendency_percent"] = "N/A"
-        summary = f"全体のメトリクスを計算。総投稿数: {metrics['total_posts']}件, 総エンゲージメント: {metrics['total_engagement']}。"
+
+        summary = f"全体のメトリクスを計算。総投稿数: {metrics['total_posts']}, 総エンゲージメント: {metrics['total_engagement']}。"
+        
         return {"data": metrics, "image_base64": None, "summary": summary}
+
     except Exception as e:
         logger.error(f"run_overall_metrics error: {e}", exc_info=True)
         return {"data": {"error": str(e)}, "image_base64": None, "summary": f"エラー: {e}"}
 
-def run_cooccurrence_network(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Dict[str, Any]:
+def run_cooccurrence_network_pyvis(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Dict[str, Any]:
     """
-    (Step B) (★) 修正: pyvis を使用し、詳細なパラメータに基づき共起ネットワークを構築する
-    UI（スライダーなど）から渡された 'suggestion' 辞書を使用する。
+    (Step B) pyvis を使用し、詳細なパラメータに基づき共起ネットワークを構築する
     """
     logger.info("run_cooccurrence_network (pyvis版) 実行...")
     results = {"data": pd.DataFrame(), "image_base64": None, "html_content": None, "summary": "", "ai_legend": None, "communities": None}
     
     # --- 1. UIから渡されたパラメータの解析 ---
     try:
-        # 絞り込み (L824)
-        flag_col = suggestion.get('flag_col', '市区町村キーワード')
-        selected_keywords = suggestion.get('selected_keywords', [])
-        text_col = suggestion.get('text_col', 'ANALYSIS_TEXT_COLUMN')
+        # UI (Step 5) で設定されたパラメータを取得 (ui_... で始まるキー)
+        flag_col = suggestion.get('ui_selected_flag_col')
+        selected_keywords = suggestion.get('ui_selected_keywords')
+        text_col = suggestion.get('ui_selected_text_col')
         
-        # 物理演算 (L881)
+        # フォールバック (一括実行時など)
+        if not flag_col:
+            flag_col = find_col(df, ['市区町村キーワード', 'location', 'city', '地域']) or find_col(df, ['話題カテゴリ', 'topic', 'category'])
+        if not text_col:
+            text_col = find_col(df, ['ANALYSIS_TEXT_COLUMN', 'text', 'content', '本文'])
+        if selected_keywords is None: # None と [] は区別
+            try:
+                s = df[flag_col].dropna().astype(str).str.split(',').explode().str.strip()
+                s = s[~s.isin(['', 'nan', 'Nan', 'NaN'])]
+                selected_keywords = s.value_counts().index.tolist()[:10] # デフォルトはTop10
+            except Exception:
+                selected_keywords = []
+        
         solver = suggestion.get('solver', 'barnesHut')
         gravity = suggestion.get('gravity', -2000)
         node_distance = suggestion.get('node_distance', 200)
         spring_length = suggestion.get('spring_length', 250)
-        
-        # フィルタ (L906)
         top_n_words_limit = suggestion.get('top_n_words_limit', 100)
         max_degree_cutoff = suggestion.get('max_degree_cutoff', 50)
         min_occurrence = suggestion.get('min_occurrence', 10)
-        
-        # デザイン (L922)
         default_node_size = suggestion.get('default_node_size', 15)
         default_text_size = suggestion.get('default_text_size', 50)
-        
-        # AI凡例 (L1868)
         run_ai_legend = suggestion.get('run_ai_legend', False)
         
     except Exception as e:
@@ -1935,6 +1727,9 @@ def run_cooccurrence_network(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Di
     if not selected_keywords:
         msg = "絞り込みキーワードが選択されていません。"
         logger.warning(f"run_cooccurrence_network: {msg}"); results["summary"] = msg; return results
+    if not flag_col or not text_col:
+        msg = "対象列 (絞り込み列またはテキスト列) が見つかりません。"
+        logger.warning(f"run_cooccurrence_network: {msg}"); results["summary"] = msg; return results
     if flag_col not in df.columns or text_col not in df.columns:
         msg = f"対象列 ({flag_col} または {text_col}) がDFに存在しません。"
         logger.warning(f"run_cooccurrence_network: {msg}"); results["summary"] = msg; return results
@@ -1945,10 +1740,8 @@ def run_cooccurrence_network(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Di
         logger.error(msg); results["summary"] = msg; return results
 
     try:
-        # --- 2. 過去のコード (L994) に基づく spaCy 処理 ---
-        # (★) target_pos に 'VERB' (動詞) を追加
+        # --- 2. spaCy 処理 ---
         target_pos = {'NOUN', 'PROPN', 'ADJ', 'VERB'}
-        # (★) stop_words を更新 (分析のノイズとなる汎用語のみに限定)
         stop_words = {
             'の', 'に', 'は', 'を', 'が', 'で', 'て', 'です', 'ます', 'こと', 'もの', 'それ', 'あれ',
             'これ', 'ため', 'いる', 'する', 'ある', 'ない', 'いう', 'よう', 'そう', 'など', 'さん',
@@ -1958,7 +1751,7 @@ def run_cooccurrence_network(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Di
         
         G = nx.Graph()
         
-        # (★) 1. キーワードでDataFrameをフィルタリング
+        # 1. キーワードでDataFrameをフィルタリング
         escaped_keywords = [re.escape(k) for k in selected_keywords]
         pattern = '|'.join(escaped_keywords)
         df_filtered = df[df[flag_col].astype(str).str.contains(pattern, na=False)]
@@ -1969,7 +1762,7 @@ def run_cooccurrence_network(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Di
 
         texts_to_analyze = df_filtered[text_col].dropna().astype(str)
         
-        # (★) 2. Top N 単語リストの作成 (L1026)
+        # 2. Top N 単語リストの作成
         st.session_state.progress_text = "共起ネットワーク: (1/3) Top N 単語を計算中..."
         all_words = []
         for text in texts_to_analyze:
@@ -1985,7 +1778,7 @@ def run_cooccurrence_network(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Di
             
         top_n_words_set = set(pd.Series(all_words).value_counts().head(top_n_words_limit).index)
         
-        # (★) 3. グラフ(G)の構築 (L1043)
+        # 3. グラフ(G)の構築
         st.session_state.progress_text = "共起ネットワーク: (2/3) ネットワークを構築中..."
         for text in texts_to_analyze:
             doc = nlp(text)
@@ -2000,7 +1793,7 @@ def run_cooccurrence_network(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Di
                 else:
                     G.add_edge(word1, word2, weight=1)
 
-        # (★) 4. フィルタリング (L1078)
+        # 4. フィルタリング
         edges_to_remove = [(u, v) for u, v, data in G.edges(data=True) if data['weight'] < min_occurrence]
         G.remove_edges_from(edges_to_remove)
         G.remove_nodes_from(list(nx.isolates(G)))
@@ -2014,14 +1807,14 @@ def run_cooccurrence_network(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Di
             msg = f"フィルタ条件 (最小共起: {min_occurrence}, 最大接続: {max_degree_cutoff}) により、表示可能なノードが0件になりました。"
             logger.warning(f"run_cooccurrence_network: {msg}"); results["summary"] = msg; return results
 
-        # (★) 5. pyvis グラフの生成 (L1091)
+        # 5. pyvis グラフの生成
         st.session_state.progress_text = "共起ネットワーク: (3/3) グラフを描画中..."
         net = Network(height="700px", width="100%", cdn_resources='in_line')
         
         degrees = dict(G.degree())
         min_degree, max_degree = (min(degrees.values()) or 1), (max(degrees.values()) or 1)
         
-        # (★) 6. コミュニティ検出と色分け (L1094)
+        # 6. コミュニティ検出と色分け
         community_map = {}
         communities_with_words = {}
         ai_legend_map = {}
@@ -2059,7 +1852,7 @@ def run_cooccurrence_network(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Di
         net.solver = solver
         net.show_buttons(filter_=['physics', 'nodes', 'layout'])
         
-        # (★) 7. HTMLコンテンツを生成して返す (L1145)
+        # 7. HTMLコンテンツを生成して返す
         html_file = "cooccurrence_network.html"
         net.save_graph(html_file)
         with open(html_file, 'r', encoding='utf-8') as f:
@@ -2072,7 +1865,7 @@ def run_cooccurrence_network(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Di
         results["data"] = edge_list[['source', 'target', 'weight']].sort_values(by="weight", ascending=False)
         results["summary"] = f"'{flag_col}' ( {', '.join(selected_keywords[:3])}...) で絞り込み、共起ネットワーク (pyvis) を生成。{G.number_of_nodes()}ノード, {G.number_of_edges()}エッジ。"
 
-        # (★) 8. AI凡例生成 (L1168)
+        # 8. AI凡例生成
         if run_ai_legend and communities_with_words:
             st.session_state.progress_text = "共起ネットワーク: (AI) 凡例を生成中..."
             llm = get_llm(model_name=MODEL_FLASH_LITE, temperature=0.1)
@@ -2092,7 +1885,7 @@ def run_cooccurrence_network(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Di
                         raw_label = chain.invoke({"word_list_str": words_str})
                         cleaned_label = re.sub(r'^(#|回答)\s*\(.*?\)\s*:\s*', '', raw_label.strip())
                         ai_legend_map[group_id] = cleaned_label
-                        time.sleep(1.0) # (★) 簡易的なRate Limit
+                        time.sleep(1.0) # Rate Limit
                     except Exception as e:
                         logger.error(f"AI凡例生成エラー (Group {group_id}): {e}")
                         ai_legend_map[group_id] = "(AIエラー)"
@@ -2110,26 +1903,50 @@ def run_cooccurrence_network(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Di
         st.session_state.progress_text = f"共起ネットワーク エラー: {e}"
         return results
 
-def run_topic_category_summary(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Dict[str, Any]:
-    """(Step B) 話題カテゴリ別に投稿数、サマリ(AI)、上位キーワードを分析する"""
-    logger.info("run_topic_category_summary 実行...")
+def run_generic_category_summary(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    (★) 汎用: カテゴリ列ごとに投稿数、サマリ(AI)、上位キーワードを分析する
+    """
+    logger.info("run_generic_category_summary 実行...")
     results = {"data": pd.DataFrame(), "image_base64": None, "summary": ""}
     
-    # (★) UIで編集された列を取得
-    topic_col = suggestion.get('suitable_cols', ['話題カテゴリ'])[0]
-    
-    target_categories = ['グルメ', '自然', '歴史・文化', 'アート', 'イベント', '宿泊・温泉']
-    if topic_col not in df.columns:
-        msg = f"列 '{topic_col}' が見つかりません。StepAで「話題カテゴリ」が生成されているか確認してください。"
-        logger.warning(f"run_topic_category_summary: {msg}")
+    # 1. UI (Step 5) から渡された「分析軸となるカテゴリ列」を取得
+    default_topic_col = find_col(df, ['話題カテゴリ', 'topic', 'category'])
+    topic_col = suggestion.get('ui_selected_category_col', default_topic_col)
+    text_col = find_col(df, ['ANALYSIS_TEXT_COLUMN', 'text', 'content', '本文'])
+
+    if not topic_col or not text_col:
+        msg = f"分析に必要な列 (カテゴリ列またはテキスト列) が見つかりません。"
+        logger.warning(f"run_generic_category_summary: {msg}")
+        return {"data": pd.DataFrame([{"error": msg}]), "image_base64": None, "summary": msg}
+    if topic_col not in df.columns or text_col not in df.columns:
+        msg = f"指定された列 ('{topic_col}', '{text_col}') がDFに存在しません。"
+        logger.warning(f"run_generic_category_summary: {msg}")
         return {"data": pd.DataFrame([{"error": msg}]), "image_base64": None, "summary": msg}
     
-    # (★) --- 4. TOPキーワードのロジック修正 (地域名を除外) ---
+    # 2. (Enhancement 2.4) 上位キーワードの候補列を動的に決定
     flag_cols = [col for col in df.columns if col.endswith('キーワード')]
-    cols_to_use = [col for col in flag_cols if col != '市区町村キーワード']
-    logger.info(f"TOPキーワード集計対象 (地域名除外): {cols_to_use}")
-    # (★) --- ここまでが修正点 ---
+    location_col = find_col(df, ['市区町村キーワード', 'location', 'city', '地域'])
+    # location_col と topic_col 自身を除外
+    cols_to_use_for_keywords = [col for col in flag_cols if col != location_col and col != topic_col]
+    logger.info(f"TOPキーワード集計対象 (地域/トピック除外): {cols_to_use_for_keywords}")
     
+    # 3. (Enhancement 2.1) ハードコードせず、列のユニーク値上位10件を対象
+    try:
+        s = df[topic_col].astype(str).str.split(', ').explode()
+        s = s[s.str.strip().isin(['', 'nan', 'None', 'N/A', '該当なし']) == False]
+        s = s.str.strip()
+        if s.empty:
+            raise ValueError(f"カテゴリ列 '{topic_col}' に有効なデータがありません。")
+        
+        target_categories = s.value_counts().head(10).index.tolist()
+        logger.info(f"'{topic_col}' の上位10カテゴリを分析対象とします: {target_categories}")
+        
+    except Exception as e:
+        msg = f"カテゴリ列 '{topic_col}' の値の取得に失敗: {e}"
+        logger.error(msg, exc_info=True)
+        return {"data": pd.DataFrame([{"error": msg}]), "image_base64": None, "summary": msg}
+
     results_list = []
     
     total_cats = len(target_categories)
@@ -2137,9 +1954,10 @@ def run_topic_category_summary(df: pd.DataFrame, suggestion: Dict[str, Any]) -> 
             st.session_state.progress_text = ""
             
     for i, category in enumerate(target_categories):
-        st.session_state.progress_text = f"話題カテゴリ分析中 ({i+1}/{total_cats}): {category}"
+        # (Bug 1.3) サブ進捗を更新
+        st.session_state.progress_text = f"カテゴリ深掘り ({i+1}/{total_cats}): {category}"
         
-        df_filtered = df[df[topic_col].astype(str).str.contains(category, na=False)]
+        df_filtered = df[df[topic_col].astype(str).str.contains(re.escape(category), na=False)]
         post_count = len(df_filtered)
         
         if post_count == 0:
@@ -2151,25 +1969,23 @@ def run_topic_category_summary(df: pd.DataFrame, suggestion: Dict[str, Any]) -> 
             })
             continue
         
-        text_samples = df_filtered['ANALYSIS_TEXT_COLUMN'].dropna().sample(n=min(10, post_count), random_state=1).tolist()
-        text_samples_str = "\n".join([f"- {text[:200]}..." for text in text_samples])
-        
         ai_suggestion = {
-            "description": f"「{category}」カテゴリに関する以下の投稿サンプルを読み、主要な話題を1～2文で要約してください。\nサンプル:\n{text_samples_str}"
+            "name": f"Summary for {category}",
+            "description": f"「{category}」カテゴリに関する以下の投稿サンプルを読み、主要な話題を1～2文で要約してください。"
         }
         summary_ai = run_ai_summary_batch(df_filtered, ai_suggestion)
         
-        # (★) --- 4. 修正: 上位キーワード (Python) ---
+        # 4. (Enhancement 2.4) 上位キーワード (Python)
         top_keywords = []
-        if cols_to_use and not df_filtered.empty:
+        if cols_to_use_for_keywords and not df_filtered.empty:
             all_keywords_series = []
-            for kw_col in cols_to_use:
+            for kw_col in cols_to_use_for_keywords:
                 if kw_col in df_filtered.columns:
-                    s = df_filtered[kw_col].astype(str).str.split(', ').explode()
-                    s = s[s.str.strip().isin(['', 'nan', 'None', 'N/A', '該当なし']) == False]
-                    s = s.str.strip()
-                    if not s.empty:
-                        all_keywords_series.append(s)
+                    s_kw = df_filtered[kw_col].astype(str).str.split(', ').explode()
+                    s_kw = s_kw[s_kw.str.strip().isin(['', 'nan', 'None', 'N/A', '該当なし']) == False]
+                    s_kw = s_kw.str.strip()
+                    if not s_kw.empty:
+                        all_keywords_series.append(s_kw)
             if all_keywords_series:
                 combined_s = pd.concat(all_keywords_series)
                 top_keywords = combined_s.value_counts().head(5).index.tolist()
@@ -2183,7 +1999,7 @@ def run_topic_category_summary(df: pd.DataFrame, suggestion: Dict[str, Any]) -> 
         
         time.sleep(max(TAGGING_SLEEP_TIME / 2, 1.0))
 
-    st.session_state.progress_text = "話題カテゴリ分析 完了。"
+    st.session_state.progress_text = "カテゴリ深掘り 完了。"
     results_df = pd.DataFrame(results_list)
     
     image_base64 = generate_graph_image(
@@ -2191,53 +2007,64 @@ def run_topic_category_summary(df: pd.DataFrame, suggestion: Dict[str, Any]) -> 
         plot_type='bar',
         x_col='category',
         y_col='post_count',
-        title=f"「{topic_col}」別 投稿数"
+        title=f"「{topic_col}」別 投稿数 (Top 10)"
     )
     
     summary = f"「{topic_col}」別の分析を実行。投稿数グラフを生成しました。"
     return {"data": results_df, "image_base64": image_base64, "summary": summary}
 
-def run_topic_engagement_top5(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Dict[str, Any]:
-    """(Step B) 話題カテゴリ別にエンゲージメントTOP5投稿と概要(AI)を分析する"""
-    logger.info("run_topic_engagement_top5 実行...")
+def run_generic_engagement_top5(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    (★) 汎用: カテゴリ列別に数値列TOP5投稿と概要(AI)を分析する
+    """
+    logger.info("run_generic_engagement_top5 実行...")
     results = {"data": pd.DataFrame(), "image_base64": None, "summary": ""}
 
-    # (★) UIで編集された列を取得
-    cols_dict = suggestion.get('suitable_cols', {})
-    if not isinstance(cols_dict, dict) or 'topic' not in cols_dict or 'text' not in cols_dict or 'engagement' not in cols_dict:
-        msg = "列情報（topic, text, engagement）が不十分です。"
-        logger.warning(f"run_topic_engagement_top5: {msg}")
+    # 1. UI (Step 5) から渡された「分析軸となる列」を取得
+    default_topic_col = find_col(df, ['話題カテゴリ', 'topic', 'category'])
+    default_text_col = find_col(df, ['ANALYSIS_TEXT_COLUMN', 'text', 'content', '本文'])
+    default_eng_col = find_engagement_cols(df, ['eng', 'like', 'いいね', 'エンゲージメント'])
+    default_eng_col = default_eng_col[0] if default_eng_col else None
+
+    topic_col = suggestion.get('ui_selected_category_col', default_topic_col)
+    text_col = suggestion.get('ui_selected_text_col', default_text_col)
+    engagement_col = suggestion.get('ui_selected_numeric_col', default_eng_col)
+    
+    if not topic_col or not text_col or not engagement_col:
+        msg = f"分析に必要な列 (カテゴリ列, テキスト列, 数値列) が見つかりません。"
+        logger.warning(f"run_generic_engagement_top5: {msg}")
         return {"data": pd.DataFrame([{"error": msg}]), "image_base64": None, "summary": msg}
-
-    topic_col = cols_dict['topic'][0]
-    text_col = cols_dict['text'][0]
-    engagement_col = cols_dict['engagement'][0]
-    target_categories = ['グルメ', '自然', '歴史・文化', 'アート', 'イベント', '宿泊・温泉'] # (★) これは固定
-
     if topic_col not in df.columns:
-        msg = f"話題カテゴリ列 '{topic_col}' が見つかりません。"
+        msg = f"カテゴリ列 '{topic_col}' が見つかりません。"
         return {"data": pd.DataFrame([{"error": msg}]), "image_base64": None, "summary": msg}
     if engagement_col not in df.columns or not pd.api.types.is_numeric_dtype(df[engagement_col]):
-        msg = f"エンゲージメント列 '{engagement_col}' が数値列として存在しません。"
+        msg = f"数値列 '{engagement_col}' が数値列として存在しません。"
         return {"data": pd.DataFrame([{"error": msg}]), "image_base64": None, "summary": msg}
     if text_col not in df.columns:
         msg = f"テキスト列 '{text_col}' が見つかりません。"
         return {"data": pd.DataFrame([{"error": msg}]), "image_base64": None, "summary": msg}
 
+    # 2. (Enhancement 2.1) ハードコードせず、列のユニーク値上位10件を対象
+    try:
+        s = df[topic_col].astype(str).str.split(', ').explode()
+        s = s[s.str.strip().isin(['', 'nan', 'None', 'N/A', '該当なし']) == False]
+        s = s.str.strip()
+        if s.empty:
+            raise ValueError(f"カテゴリ列 '{topic_col}' に有効なデータがありません。")
+        target_categories = s.value_counts().head(10).index.tolist()
+        logger.info(f"'{topic_col}' の上位10カテゴリを分析対象とします: {target_categories}")
+    except Exception as e:
+        msg = f"カテゴリ列 '{topic_col}' の値の取得に失敗: {e}"
+        logger.error(msg, exc_info=True)
+        return {"data": pd.DataFrame([{"error": msg}]), "image_base64": None, "summary": msg}
 
-    # (★) --- 5. メディアリンク列を特定 ---
+    # 3. (Enhancement 2.3) メディアリンク列を特定
     link_col_candidates = ['link', 'url', 'media_url', '投稿URL', 'URL', 'Link', 'Url']
-    df_cols_lower = {col.lower(): col for col in df.columns}
-    found_link_col = None
-    for cand in link_col_candidates:
-        if cand in df_cols_lower:
-            found_link_col = df_cols_lower[cand]
-            break
+    found_link_col = find_col(df, link_col_candidates)
     if found_link_col:
         logger.info(f"メディアリンク列: '{found_link_col}' を使用します。")
     else:
         logger.warning(f"メディアリンク列 ({link_col_candidates}) が見つかりませんでした。")
-    # (★) --- ここまでが修正点 ---
 
     results_list = []
     
@@ -2246,9 +2073,10 @@ def run_topic_engagement_top5(df: pd.DataFrame, suggestion: Dict[str, Any]) -> D
             st.session_state.progress_text = ""
 
     for i, category in enumerate(target_categories):
-        st.session_state.progress_text = f"エンゲージメントTOP5分析中 ({i+1}/{total_cats}): {category}"
+        # (Bug 1.3) サブ進捗を更新
+        st.session_state.progress_text = f"数値列TOP5分析中 ({i+1}/{total_cats}): {category}"
         
-        df_filtered = df[df[topic_col].astype(str).str.contains(category, na=False)]
+        df_filtered = df[df[topic_col].astype(str).str.contains(re.escape(category), na=False)]
         post_count = len(df_filtered)
         
         if post_count == 0:
@@ -2270,11 +2098,12 @@ def run_topic_engagement_top5(df: pd.DataFrame, suggestion: Dict[str, Any]) -> D
             engagement_value = row[engagement_col]
             
             ai_suggestion = {
+                "name": f"Summary for Top 5 {category}",
                 "description": f"以下の投稿テキストを読み、内容を1文で要約してください。\nテキスト: {post_text[:500]}..."
             }
             summary_ai = run_ai_summary_batch(df_filtered, ai_suggestion)
             
-            # (★) --- 5. メディアリンクを取得 ---
+            # 4. (Enhancement 2.3) メディアリンクを取得
             link_value = None
             if found_link_col and found_link_col in row and pd.notna(row[found_link_col]):
                 link_value = str(row[found_link_col])
@@ -2283,7 +2112,7 @@ def run_topic_engagement_top5(df: pd.DataFrame, suggestion: Dict[str, Any]) -> D
                 "engagement": int(engagement_value),
                 "summary_ai": summary_ai,
                 "original_text_snippet": post_text[:100],
-                "media_link": link_value # (★) 追加
+                "media_link": link_value
             })
             
             time.sleep(max(TAGGING_SLEEP_TIME / 2, 1.0))
@@ -2294,19 +2123,96 @@ def run_topic_engagement_top5(df: pd.DataFrame, suggestion: Dict[str, Any]) -> D
             "top_posts": top5_posts_data
         })
 
-    st.session_state.progress_text = "エンゲージメントTOP5分析 完了。"
+    st.session_state.progress_text = "数値列TOP5分析 完了。"
     results_df = pd.DataFrame(results_list)
     
-    summary = f"「{topic_col}」別の高エンゲージメント投稿TOP5を抽出しました。"
+    summary = f"「{topic_col}」別の高「{engagement_col}」投稿TOP5を抽出しました。"
     return {"data": results_df, "image_base64": None, "summary": summary}
 
+# (New Feature 3.1) A/B比較関数
+def run_ab_comparison(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    (Step B) 2つのグループ(A, B)の投稿数と人気観光地ランキングを比較する
+    """
+    logger.info("run_ab_comparison 実行...")
+    results = {"data": {}, "image_base64": None, "summary": ""}
+    
+    try:
+        # 1. UIからパラメータを取得
+        ab_params = suggestion.get('ui_ab_params', {})
+        a_col = ab_params.get('a_col')
+        a_val = ab_params.get('a_val')
+        b_col = ab_params.get('b_col')
+        b_val = ab_params.get('b_val')
+        
+        # 汎用的に列を見つける
+        location_col = find_col(df, ['市区町村キーワード', 'location', 'city', '地域'])
+        topic_col = find_col(df, ['話題カテゴリ', 'topic', 'category'])
+
+        if not all([a_col, a_val, b_col, b_val, location_col, topic_col]):
+            msg = f"A/B比較のパラメータが不足しています (A/B列/値、地域列、トピック列が必要です)"
+            logger.warning(f"run_ab_comparison: {msg}")
+            return {"data": {"error": msg}, "image_base64": None, "summary": msg}
+
+        # 2. グループA, BのDataFrameを作成
+        df_A = df[df[a_col].astype(str).str.contains(re.escape(a_val), na=False)]
+        df_B = df[df[b_col].astype(str).str.contains(re.escape(b_val), na=False)]
+        
+        if df_A.empty or df_B.empty:
+             msg = f"グループA ({a_val}: {len(df_A)}件) または グループB ({b_val}: {len(df_B)}件) のデータが0件です。"
+             logger.warning(f"run_ab_comparison: {msg}")
+             return {"data": {"error": msg}, "image_base64": None, "summary": msg}
+
+        # 3. カテゴリ別投稿数 比較
+        cats_A = df_A[topic_col].value_counts().rename(f"Count (A: {a_val})")
+        cats_B = df_B[topic_col].value_counts().rename(f"Count (B: {b_val})")
+        
+        df_cat_compare = pd.concat([cats_A, cats_B], axis=1).fillna(0).astype(int)
+        df_cat_compare['Total'] = df_cat_compare.sum(axis=1)
+        df_cat_compare.sort_values(by='Total', ascending=False, inplace=True)
+        sum_A = df_cat_compare[cats_A.name].sum()
+        sum_B = df_cat_compare[cats_B.name].sum()
+        df_cat_compare[f"Share (A: {a_val})"] = (df_cat_compare[cats_A.name] / sum_A).map('{:.1%}'.format) if sum_A > 0 else 0
+        df_cat_compare[f"Share (B: {b_val})"] = (df_cat_compare[cats_B.name] / sum_B).map('{:.1%}'.format) if sum_B > 0 else 0
+
+        # 4. 観光地別(地域) 順位変動 比較
+        locs_A = df_A[location_col].value_counts().rename(f"Count (A: {a_val})")
+        locs_B = df_B[location_col].value_counts().rename(f"Count (B: {b_val})")
+        
+        df_rank_compare = pd.concat([locs_A, locs_B], axis=1).fillna(0).astype(int)
+        df_rank_compare[f"Rank (A: {a_val})"] = df_rank_compare[locs_A.name].rank(ascending=False, method='min').astype(int)
+        df_rank_compare[f"Rank (B: {b_val})"] = df_rank_compare[locs_B.name].rank(ascending=False, method='min').astype(int)
+        
+        df_rank_compare['Rank Change (A vs B)'] = (df_rank_compare[f"Rank (B: {b_val})"] - df_rank_compare[f"Rank (A: {a_val})"]).astype(int)
+        
+        df_rank_compare.sort_values(by=f"Count (B: {b_val})", ascending=False, inplace=True)
+        df_rank_compare = df_rank_compare[[
+            f"Rank (A: {a_val})", f"Count (A: {a_val})", 
+            f"Rank (B: {b_val})", f"Count (B: {b_val})", 
+            'Rank Change (A vs B)'
+        ]]
+        
+        summary = f"A/B比較: 「{a_val}」 (A: {len(df_A)}件) vs 「{b_val}」 (B: {len(df_B)}件) を実行。"
+        
+        results["data"] = {
+            "category_comparison": df_cat_compare.reset_index().rename(columns={'index': topic_col}).to_dict(orient='records'),
+            "ranking_comparison": df_rank_compare.reset_index().rename(columns={'index': location_col}).head(20).to_dict(orient='records')
+        }
+        results["summary"] = summary
+        
+        return results
+        
+    except Exception as e:
+        logger.error(f"run_ab_comparison error: {e}", exc_info=True)
+        return {"data": {"error": f"A/B比較エラー: {e}"}, "image_base64": None, "summary": f"A/B比較エラー: {e}"}
+
+# --- 8.2. (★) Step B: AI分析ヘルパー (Bug 1.1 修正) ---
 def run_ai_summary_batch(df: pd.DataFrame, suggestion: Dict[str, Any]) -> str:
     """
     (Step B) AI (Flash Lite) を使用して、指定されたタスク(description)を実行する。
     """
     logger.info(f"run_ai_summary_batch 実行 (タスク: {suggestion.get('name', 'N/A')})...")
     
-    # (★) Step B のAIタスクは、高速な FLASH_LITE を使用
     llm = get_llm(model_name=MODEL_FLASH_LITE, temperature=0.1, timeout_seconds=120)
     if llm is None:
         logger.error("run_ai_summary_batch: LLM (Flash Lite) が利用できません。")
@@ -2315,14 +2221,22 @@ def run_ai_summary_batch(df: pd.DataFrame, suggestion: Dict[str, Any]) -> str:
     try:
         ai_prompt_instruction = suggestion.get('description', 'データからインサイトを抽出してください。')
         
-        # (★) --- 修正: サンプル数を 10 -> 50 に増加 ---
-        if 'ANALYSIS_TEXT_COLUMN' in df.columns:
+        # (Bug 1.1) total_rows をここで定義
+        total_rows_count = len(df)
+        
+        text_col = find_col(df, ['ANALYSIS_TEXT_COLUMN', 'text', 'content', '本文'])
+        
+        if text_col:
             # テキスト列がある場合、サンプルを抽出
-            text_samples = df['ANALYSIS_TEXT_COLUMN'].dropna().sample(n=min(50, len(df)), random_state=1).tolist()
-            data_context = "\n".join([f"- {text[:200]}..." for text in text_samples])
+            sample_size = min(50, total_rows_count)
+            if sample_size > 0:
+                text_samples = df[text_col].dropna().sample(n=sample_size, random_state=1).tolist()
+                data_context = "\n".join([f"- {text[:200]}..." for text in text_samples])
+            else:
+                data_context = "（サンプルデータなし）"
         else:
             # テキスト列がない場合、DFの先頭をJSONで渡す
-            data_context = df.head(10).to_json(orient='records', force_ascii=False) # テキスト以外は10件
+            data_context = df.head(10).to_json(orient='records', force_ascii=False)
 
         prompt = PromptTemplate.from_template(
             """
@@ -2332,7 +2246,6 @@ def run_ai_summary_batch(df: pd.DataFrame, suggestion: Dict[str, Any]) -> str:
             # 指示:
             {ai_instruction}
 
-            # (★) --- 修正: 総件数をプロンプトに追加 ---
             # データサンプル (分析対象: 全 {total_rows} 件からの抜粋):
             {data_context}
 
@@ -2341,9 +2254,11 @@ def run_ai_summary_batch(df: pd.DataFrame, suggestion: Dict[str, Any]) -> str:
         )
         chain = prompt | llm | StrOutputParser()
         
+        # (Bug 1.1) total_rows を invoke に渡す
         response_str = chain.invoke({
             "ai_instruction": ai_prompt_instruction,
-            "data_context": data_context
+            "data_context": data_context,
+            "total_rows": total_rows_count
         })
         
         return response_str.strip()
@@ -2352,8 +2267,7 @@ def run_ai_summary_batch(df: pd.DataFrame, suggestion: Dict[str, Any]) -> str:
         logger.error(f"run_ai_summary_batch 実行エラー: {e}", exc_info=True)
         return f"AI分析タスクの実行中にエラーが発生しました: {e}"
 
-
-# --- 8.3. (★) Step B: 分析実行ルーター (変更なし) ---
+# --- 8.3. (★) Step B: 分析実行ルーター (汎用化対応) ---
 def execute_analysis(
     analysis_name: str,
     df: pd.DataFrame,
@@ -2368,21 +2282,24 @@ def execute_analysis(
         if analysis_type == 'python':
             if analysis_name == "全体のメトリクス":
                 return run_overall_metrics(df, suggestion)
-            # (★) 3. "単純集計: {col}" のような動的な名前に対応
             elif analysis_name.startswith("単純集計:"):
                 return run_simple_count(df, suggestion)
-            elif analysis_name in ["クロス集計（キーワード間）", "クロス集計（キーワード×属性）", "話題カテゴリ別 観光地TOP10"]:
+            elif analysis_name.startswith("クロス集計"):
                 return run_crosstab(df, suggestion)
             elif analysis_name == "時系列キーワード分析":
                 return run_timeseries(df, suggestion)
             elif analysis_name == "テキストマイニング（頻出単語）":
                 return run_text_mining(df, suggestion)
             elif analysis_name == "共起ネットワーク":
-                return run_cooccurrence_network(df, suggestion)
-            elif analysis_name == "話題カテゴリ別 投稿数とサマリ":
-                return run_topic_category_summary(df, suggestion)
-            elif analysis_name == "話題カテゴリ別 エンゲージメントTOP5と概要":
-                return run_topic_engagement_top5(df, suggestion)
+                return run_cooccurrence_network_pyvis(df, suggestion)
+            # 汎用タスク名に対応
+            elif analysis_name == "カテゴリ列の集計と深掘り":
+                return run_generic_category_summary(df, suggestion)
+            elif analysis_name == "カテゴリ別 数値列TOP5分析":
+                return run_generic_engagement_top5(df, suggestion)
+            # A/B比較のルーティング
+            elif analysis_name == "A/B 比較分析":
+                return run_ab_comparison(df, suggestion)
             else:
                 logger.warning(f"Python分析 '{analysis_name}' の実行ロジックが定義されていません。AI分析にフォールバックします。")
                 suggestion['description'] = f"データサンプルを使い、'{analysis_name}' を実行してください。"
@@ -2402,6 +2319,7 @@ def execute_analysis(
         err_msg = f"分析 '{analysis_name}' の実行中にエラーが発生しました: {e}"
         return {"data": err_msg, "image_base64": None, "summary": err_msg}
 
+# --- 8.4. (★) Step B: JSON出力ヘルパー (汎用化対応) ---
 def convert_results_to_json_string(results_dict: Dict[str, Any]) -> str:
     """
     (Step B) 実行された分析結果(dict)を、Step Cで読み込むためのJSONL文字列に変換する。
@@ -2410,10 +2328,9 @@ def convert_results_to_json_string(results_dict: Dict[str, Any]) -> str:
     logger.info(f"JSONL変換開始: {len(results_dict)}件の結果を処理...")
     json_lines = []
     overall_summary_data = {}
-    task_summaries = {} # (★) 他タスクのサマリを集約するため
+    task_summaries = {} # 他タスクのサマリを集約するため
 
     # --- 1. まず "全体のメトリクス" (OverallSummary) を探す ---
-    # ... (このブロックは変更なし) ...
     overall_task_name = "全体のメトリクス"
     if overall_task_name in results_dict:
         result = results_dict[overall_task_name]
@@ -2423,7 +2340,7 @@ def convert_results_to_json_string(results_dict: Dict[str, Any]) -> str:
             "summary": result.get("summary", ""),
             "image_base64": None,
             "image_note": "No image",
-            "analysis_summaries": {} # (★) プレースホルダ
+            "analysis_summaries": {} # プレースホルダ
         }
     else:
         logger.warning("JSONL変換: '全体のメトリクス' (OverallSummary) が見つかりません。")
@@ -2439,77 +2356,101 @@ def convert_results_to_json_string(results_dict: Dict[str, Any]) -> str:
             line_data["analysis_task"] = task_name
             line_data["summary"] = result.get("summary", "N/A")
 
-            # (★) data の型に応じてシリアライズ
-            # ... (変更なし) ...
+            # data の型に応じてシリアライズ
             data = result.get("data")
             if isinstance(data, pd.DataFrame):
-                # (★) 5. エンゲージメントTOP5 (DFだがJSON化済みのリストが格納)
-                if task_name == "話題カテゴリ別 エンゲージメントTOP5と概要":
+                # 汎用化: TOP5系タスクはDFだが、中身は辞書のリスト
+                if task_name == "カテゴリ別 数値列TOP5分析":
                     line_data["data"] = data.to_dict(orient='records')
                 else:
-                    line_data["data"] = data.to_json(orient='records', force_ascii=False)
-            elif isinstance(data, dict) or isinstance(data, list) or isinstance(data, str):
+                    # 通常のDFはJSON文字列に (トークン数節約)
+                    if len(data) > 500:
+                        line_data["data"] = data.head(500).to_json(orient='records', force_ascii=False)
+                        line_data["note"] = f"Data truncated. Showing 500 of {len(data)} records."
+                    else:
+                        line_data["data"] = data.to_json(orient='records', force_ascii=False)
+            
+            elif isinstance(data, pd.Series):
+                line_data["data"] = data.to_dict()
+            
+            elif isinstance(data, dict) or isinstance(data, list): # メトリクス, A/B比較
                 line_data["data"] = data
-            elif data is None:
-                line_data["data"] = None
-            else:
-                line_data["data"] = str(data) # フォールバック
 
-            # (★) 共起ネットワーク (pyvis) は html_content を持つが、image_base64 は持たない
-            if task_name == "共起ネットワーク":
-                line_data["image_base64"] = None # (★) StepCはHTMLを読めないので None
-                line_data["image_note"] = "No image (pyvis HTML)"
-            elif result.get("image_base64"):
-                line_data["image_base64"] = result["image_base64"]
-                line_data["image_note"] = "Image data included (Base64)"
+            elif isinstance(data, str): # AIの回答
+                line_data["data"] = data
+            
+            elif data is None or (hasattr(data, 'empty') and data.empty):
+                line_data["data"] = None
+                record["note"] = "No data returned from analysis."
+            
+            else:
+                line_data["data"] = str(data)
+
+            # 画像 (Base64) と HTML (pyvis) の処理
+            html_content = result.get("html_content") # pyvis用
+            image_base64 = result.get("image_base64")
+
+            if html_content:
+                 line_data["image_base64"] = None
+                 line_data["image_note"] = "No image (pyvis HTML)"
+            elif image_base64 and len(image_base64) < (1024 * 1024 * 1.0):
+                line_data["image_base64"] = image_base64
+                line_data["image_note"] = "Base64 encoded PNG image attached."
+            elif image_base64:
+                line_data["image_base64"] = None
+                line_data["image_note"] = "Image was generated but exceeded 1MB and was not included."
             else:
                 line_data["image_base64"] = None
-                line_data["image_note"] = "No image"
+                line_data["image_note"] = "No image generated for this task."
 
-            json_lines.append(json.dumps(line_data, ensure_ascii=False))
-            task_summaries[task_name] = line_data["summary"] # (★) サマリを収集
+            json_lines.append(json.dumps(line_data, ensure_ascii=False, default=str))
+            task_summaries[task_name] = line_data["summary"] # サマリを収集
             
         except Exception as e:
             logger.error(f"JSONL変換エラー ({task_name}): {e}", exc_info=True)
             json_lines.append(json.dumps({"analysis_task": task_name, "error": str(e)}))
 
     # --- 3. OverallSummary に収集したサマリを結合 ---
-    # ... (このブロックは変更なし) ...
     if overall_summary_data:
         overall_summary_data["analysis_summaries"] = task_summaries
-        # (★) JSONLの *先頭* に OverallSummary を追加
+        # JSONLの *先頭* に OverallSummary を追加
         json_lines.insert(0, json.dumps(overall_summary_data, ensure_ascii=False))
     
     logger.info(f"JSONL変換完了: {len(json_lines)}行のJSONLを生成。")
     return "\n".join(json_lines)
 
-# --- 8.5. (★) Step B: UI描画関数 (★ 新ワークフロー) ---
-
 def render_step_b():
     """(Step B) 分析手法の提案・実行・データ出力UIを描画する"""
-    st.title("📊 Step B: 分析の実行とデータ出力")
+    st.title("📊 Step B: インタラクティブ分析とデータ出力")
 
-    # (★) --- セッションステートの初期化 (ワークフロー変更対応) ---
+    # セッションステートの初期化
     if 'df_flagged_B' not in st.session_state:
         st.session_state.df_flagged_B = pd.DataFrame()
-    if 'suggestions_B' not in st.session_state: # (★) すべての提案
+    if 'suggestions_B' not in st.session_state: # すべての提案 (タスク名 -> 詳細dict)
         st.session_state.suggestions_B = {}
-    if 'selected_tasks_B' not in st.session_state: # (★) ユーザーがチェックしたタスク
+    if 'selected_tasks_B' not in st.session_state: # ユーザーがチェックしたタスク名 (set)
         st.session_state.selected_tasks_B = set()
-    if 'step_b_results' not in st.session_state: # (★) 実行結果
+    if 'step_b_results' not in st.session_state: # 実行結果 (タスク名 -> 結果dict)
         st.session_state.step_b_results = {}
     if 'step_b_json_output' not in st.session_state:
         st.session_state.step_b_json_output = None
     if 'progress_text' not in st.session_state:
          st.session_state.progress_text = ""
-    if 'suggestions_attempted_B' not in st.session_state:
+    if 'suggestions_attempted_B' not in st.session_state: # 提案ボタンを押したか
         st.session_state.suggestions_attempted_B = False
+        
     if 'tips_list' not in st.session_state:
         st.session_state.tips_list = []
     if 'current_tip_index' not in st.session_state:
         st.session_state.current_tip_index = 0
     if 'last_tip_time' not in st.session_state:
         st.session_state.last_tip_time = time.time()
+    # A/B比較用のウィジェット値を保持
+    if 'step_b_ab_params' not in st.session_state:
+        st.session_state.step_b_ab_params = {}
+    # 汎用カテゴリ分析用のウィジェット値を保持
+    if 'step_b_generic_params' not in st.session_state:
+        st.session_state.step_b_generic_params = {}
 
     # --- 1. ファイルアップロード ---
     st.header("Step 1: キュレーション済みCSVのアップロード")
@@ -2523,6 +2464,7 @@ def render_step_b():
     if uploaded_flagged_file:
         try:
             current_file_id = f"{uploaded_flagged_file.name}_{uploaded_flagged_file.size}"
+            # ファイルが変更された場合のみリロード＆リセット
             if ('df_flagged_B' not in st.session_state or 
                 st.session_state.df_flagged_B.empty or 
                 st.session_state.get('current_file_id_B') != current_file_id):
@@ -2538,12 +2480,14 @@ def render_step_b():
                 st.session_state.df_flagged_B = df
                 st.session_state.current_file_id_B = current_file_id
                 
-                # (★) ワークフロー変更: 関連ステートをすべてリセット
+                # 関連ステートをすべてリセット
                 st.session_state.suggestions_B = {} 
                 st.session_state.selected_tasks_B = set()
                 st.session_state.step_b_results = {}
                 st.session_state.step_b_json_output = None
                 st.session_state.suggestions_attempted_B = False
+                st.session_state.step_b_ab_params = {}
+                st.session_state.step_b_generic_params = {}
                 
                 st.success(f"ファイル「{uploaded_flagged_file.name}」読込完了 ({len(df)}行)")
                 with st.expander("データプレビュー (先頭5行)", expanded=True):
@@ -2561,7 +2505,7 @@ def render_step_b():
             st.session_state.current_file_id_B = None
             return
     else:
-        st.warning("分析を続けるには、Step A で生成したCSVファイルをアップロードしてください。")
+        # ファイルがクリアされたら、関連ステートもクリア
         st.session_state.df_flagged_B = pd.DataFrame()
         st.session_state.suggestions_B = {}
         st.session_state.selected_tasks_B = set()
@@ -2569,23 +2513,40 @@ def render_step_b():
         st.session_state.step_b_json_output = None
         st.session_state.current_file_id_B = None
         st.session_state.suggestions_attempted_B = False
+        st.session_state.step_b_ab_params = {}
+        st.session_state.step_b_generic_params = {}
+        st.warning("分析を続けるには、Step A で生成したCSVファイルをアップロードしてください。")
         return
 
     df_B = st.session_state.df_flagged_B
     
-    # (★) --- 列候補の定義 (L1678) ---
+    # (★) --- 修正: 以下の列定義ブロック全体で `df` ではなく `df_B` を使用 ---
     all_cols = list(df_B.columns)
-    keyword_cols = find_cols(df_B, ['key', 'keyword', 'キーワード', 'カテゴリ', 'ハッシュタグ', 'location', 'city', 'topic'])
-    all_object_cols = df_B.select_dtypes(include='object').columns.tolist()
-    text_cols = [col for col in all_object_cols if col not in keyword_cols]
-    main_text_col = find_col(df_B, ['ANALYSIS_TEXT_COLUMN'])
-    if main_text_col in text_cols:
-         text_cols.insert(0, text_cols.pop(text_cols.index(main_text_col)))
-    date_cols = [find_col(df_B, ['date', 'time', '日付', '日時'])]
-    date_cols = [c for c in date_cols if c is not None]
+    
+    # 汎用カテゴリ列: ...キーワード, カテゴリ, topic など
+    base_flag_cols = find_cols(df_B, ['key', 'keyword', 'キーワード', 'カテゴリ', 'topic', 'ハッシュタグ'])
+    location_col_search = find_col(df_B, ['市区町村キーワード', 'location', 'city', '地域'])
+    # 汎用カテゴリ列 (場所列を除外)
+    flag_cols = sorted(list(set([c for c in base_flag_cols if c is not None and c != location_col_search])))
+    # 場所列
+    location_cols = [location_col_search] if location_col_search else []
+    # カテゴリ + 場所
+    all_categorical_cols = flag_cols + location_cols
+    
+    # テキスト列
+    object_cols = df_B.select_dtypes(include='object').columns.tolist()
+    text_cols = [col for col in object_cols if col not in all_categorical_cols]
+    main_text_col_search = find_col(df_B, ['ANALYSIS_TEXT_COLUMN'])
+    if main_text_col_search and main_text_col_search in text_cols:
+         text_cols.insert(0, text_cols.pop(text_cols.index(main_text_col_search)))
+    
+    # 日付列
+    date_col_search = find_col(df_B, ['date', 'time', '日付', '日時'])
+    date_cols = [date_col_search] if date_col_search is not None else []
+    
+    # 数値列
     numeric_cols = df_B.select_dtypes(include=np.number).columns.tolist()
     engagement_cols = find_engagement_cols(df_B, ['eng', 'like', 'いいね', 'エンゲージメント'])
-    # (★) --- 列定義ここまで ---
 
     # --- 2. 分析手法の提案 ---
     st.header("Step 2: 分析手法の提案")
@@ -2593,12 +2554,12 @@ def render_step_b():
     
     analysis_prompt_B = st.text_area(
         "（任意）AIに追加で指示したい分析タスクを入力:",
-        placeholder="例: 広島市と観光地の相関関係を深掘りしたい。",
+        placeholder="例: グルメ投稿と自然投稿の傾向を比較したい。",
         key="step_b_prompt"
     )
 
     if st.button("💡 分析手法を提案させる (Step 2)", key="suggest_button_B", type="primary"):
-        st.session_state.suggestions_attempted_B = True
+        st.session_state.suggestions_attempted_B = True # 提案を実行したフラグ
         
         if not st.session_state.tips_list:
             with st.spinner("分析TIPSをAIで生成中..."):
@@ -2613,6 +2574,7 @@ def render_step_b():
             base_suggestions = suggest_analysis_techniques_py(df_B)
             ai_suggestions = []
             if analysis_prompt_B.strip():
+                # (Bug 1.2) base_suggestions を渡して重複をAIに防がせる
                 ai_suggestions = suggest_analysis_techniques_ai(
                     analysis_prompt_B, df_B, base_suggestions
                 )
@@ -2624,12 +2586,13 @@ def render_step_b():
                 st.session_state.suggestions_B = {}
                 st.session_state.selected_tasks_B = set()
             else:
+                # 提案を辞書として保存
                 st.session_state.suggestions_B = {s['name']: s for s in all_suggestions}
-                # (★) 提案されたら、デフォルトですべて選択状態にする
+                # デフォルトですべて選択状態にする
                 st.session_state.selected_tasks_B = set(st.session_state.suggestions_B.keys())
                 st.success(f"分析手法の提案が完了しました ({len(all_suggestions)}件)。Step 3 で実行するタスクを選択してください。")
             
-            st.rerun()
+            st.rerun() # 提案後、UIを再描画して Step 3 を表示
 
     # --- 3. (★) 実行タスクの選択（チェックボックス） ---
     if not st.session_state.suggestions_attempted_B:
@@ -2648,17 +2611,36 @@ def render_step_b():
     st.header("Step 3: 実行する分析タスクの選択")
     st.info("一括実行したい分析タスクを選択してください。")
 
+    # (Bug 1.5) チェックボックスUI (on_clickコールバック方式)
     selected_tasks = set()
+    
+    def select_all_analyses():
+        st.session_state.selected_tasks_B = set(st.session_state.suggestions_B.keys())
+        
+    def deselect_all_analyses():
+        st.session_state.selected_tasks_B = set()
+
+    col_select, col_deselect = st.columns(2)
+    with col_select:
+        st.button("すべて選択", key="select_all_b", use_container_width=True, on_click=select_all_analyses)
+    with col_deselect:
+        st.button("すべて解除", key="deselect_all_b", use_container_width=True, on_click=deselect_all_analyses)
+
+    st.markdown("---")
+    
     cols = st.columns(3)
     i = 0
-    # (★) suggestions_B を priority でソートして表示
-    sorted_suggestions = sorted(st.session_state.suggestions_B.items(), key=lambda item: item[1].get('priority', 99))
+    sorted_suggestions = sorted(
+        st.session_state.suggestions_B.items(), 
+        key=lambda item: item[1].get('priority', 99)
+    )
     
+    # (Bug 1.5) on_change は使わず、ループの最後で st.session_state.selected_tasks_B を一括更新
     for task_name, details in sorted_suggestions:
         with cols[i % 3]:
             is_checked = st.checkbox(
                 task_name,
-                value=(task_name in st.session_state.selected_tasks_B), # (★) セッションステートと連動
+                value=(task_name in st.session_state.selected_tasks_B),
                 key=f"cb_{task_name}",
                 help=details.get('description', '')
             )
@@ -2666,14 +2648,17 @@ def render_step_b():
                 selected_tasks.add(task_name)
         i += 1
     
-    # (★) ユーザーの選択をセッションステートに即時反映
     st.session_state.selected_tasks_B = selected_tasks
 
-    # --- 4. (★) 選択項目の一括実行 ---
+
+    # --- 4. (★) 選択項目の一括実行 (Bug 1.3 UIフリーズ対応) ---
     if st.button(f"🏃 選択した {len(st.session_state.selected_tasks_B)} 件の分析を実行 (Step 4)", type="primary", use_container_width=True):
         st.session_state.progress_text = "選択項目の実行を開始します..."
         
-        # (★) 実行前に、*選択されなかった* 分析の結果をクリアする
+        # (Bug 1.3) 実行ログ(progress_text)用のプレースホルダ
+        progress_text_placeholder_bulk = st.empty()
+        progress_text_placeholder_bulk.info(st.session_state.progress_text)
+
         tasks_to_run = st.session_state.selected_tasks_B
         cleared_results_count = 0
         for task_name in list(st.session_state.step_b_results.keys()):
@@ -2686,6 +2671,7 @@ def render_step_b():
         total_tasks = len(tasks_to_run)
         if total_tasks == 0:
             st.warning("実行するタスクが選択されていません。")
+            progress_text_placeholder_bulk.empty()
             st.rerun()
 
         progress_bar = st.progress(0.0, text="一括実行 待機中...")
@@ -2700,7 +2686,10 @@ def render_step_b():
                 suggestion_details = st.session_state.suggestions_B[task_name]
                 i += 1
                 st.session_state.progress_text = f"({i}/{total_tasks}) 「{task_name}」を実行中..."
+                
+                # (Bug 1.3) ループ内でログを更新
                 progress_bar.progress(i / total_tasks, text=f"実行中: {task_name}")
+                progress_text_placeholder_bulk.info(st.session_state.progress_text)
                 
                 try:
                     result_data = execute_analysis(task_name, df_B, suggestion_details)
@@ -2716,11 +2705,12 @@ def render_step_b():
             st.session_state.progress_text = "全分析の実行が完了しました。"
             progress_bar.progress(1.0, text="実行 完了")
             tip_placeholder_b_bulk.empty()
+            progress_text_placeholder_bulk.empty() # 完了したら消す
             st.success("選択された分析の実行が完了しました。Step 5 で結果を確認してください。")
             st.rerun()
 
 
-    # --- 5. (★) 分析のプレビューとパラメータ修正 ---
+    # --- 5. (★) 分析のプレビューとパラメータ修正 (汎用化) ---
     st.markdown("---")
     st.header("Step 5: 分析のプレビューとパラメータ修正")
     
@@ -2738,36 +2728,58 @@ def render_step_b():
         except IndexError:
             st.session_state.current_tip_index = 0
 
-    # (★) UI進捗表示
     progress_text_placeholder = st.empty()
     if st.session_state.progress_text:
          progress_text_placeholder.info(st.session_state.progress_text)
          
-    # (★) 修正: 提案 (suggestions_B) ではなく、*実行された結果* (step_b_results) をループする
-    # (★) ただし、パラメータ編集のために元の suggestion も必要なので、
-    # (★) 実行済みのタスク名 (step_b_results.keys()) でループし、
-    # (★) 元の提案 (suggestions_B) を参照する。
-    
-    # (★) 実行済みのタスクを、提案時の優先度順にソートして表示
     sorted_executed_tasks = sorted(
         st.session_state.step_b_results.keys(),
         key=lambda task_name: st.session_state.suggestions_B.get(task_name, {}).get('priority', 99)
     )
 
+    # 汎用パラメータUIのためのヘルパー
+    def get_generic_param(task_name, param_key, default_value):
+        return st.session_state.step_b_generic_params.get(task_name, {}).get(param_key, default_value)
+
+    def set_generic_param(task_name, param_key, value):
+        if task_name not in st.session_state.step_b_generic_params:
+            st.session_state.step_b_generic_params[task_name] = {}
+        st.session_state.step_b_generic_params[task_name][param_key] = value
+
     for task_name in sorted_executed_tasks:
         if task_name not in st.session_state.suggestions_B:
-            continue # (ありえないはずだが念のため)
+            continue
             
-        # (★) 元の提案 (編集UI用) と、今回の結果 (プレビュー用) を取得
         suggestion_details = st.session_state.suggestions_B[task_name].copy()
         result = st.session_state.step_b_results[task_name]
         
         st.markdown("---")
         
-        # (★) プレビュー表示 (L1796〜)
+        # プレビュー表示
         st.subheader(f"✅ プレビュー: {task_name}")
         
-        if task_name == "共起ネットワーク" and result.get("html_content"):
+        # (Bug 1.4) [object Object] バグ修正
+        if task_name == "カテゴリ別 数値列TOP5分析" and isinstance(result.get('data'), pd.DataFrame):
+            # st.dataframe(result['data']) を削除
+            for _, row in result['data'].iterrows():
+                st.markdown(f"**{row['category']}** (投稿数: {row['post_count']})")
+                if row['top_posts']:
+                     for post in row['top_posts']:
+                         st.markdown(f"  - **EG: {post['engagement']}** - {post['summary_ai']}")
+                         if post.get('media_link'): # (Enhancement 2.3)
+                             st.markdown(f"    [Link]({post['media_link']})")
+                st.markdown("---")
+        # (New Feature 3.5) A/B比較のプレビュー
+        elif task_name == "A/B 比較分析" and isinstance(result.get('data'), dict):
+            if "category_comparison" in result["data"]:
+                st.markdown("##### カテゴリ別 投稿数比較")
+                st.dataframe(pd.DataFrame(result["data"]["category_comparison"]))
+            if "ranking_comparison" in result["data"]:
+                st.markdown("##### 地域別 順位変動 (Top 20)")
+                st.dataframe(pd.DataFrame(result["data"]["ranking_comparison"]))
+        
+        # 共起ネットワーク (pyvis HTML)
+        elif task_name == "共起ネットワーク" and result.get("html_content"):
             components.html(result.get("html_content"), height=710)
             ai_legend_map = result.get("ai_legend")
             communities_map = result.get("communities")
@@ -2800,64 +2812,87 @@ def render_step_b():
                     legend_items.append(legend_html.replace("\n", ""))
                 st.markdown("<div style='line-height: 1.8;'>" + " ".join(legend_items) + "</div>", unsafe_allow_html=True)
 
-        elif task_name == "話題カテゴリ別 エンゲージメントTOP5と概要" and isinstance(result['data'], pd.DataFrame):
-            st.dataframe(result['data'])
-            for _, row in result['data'].iterrows():
-                st.markdown(f"**カテゴリ: {row['category']}** (投稿数: {row['post_count']})")
-                if row['top_posts']:
-                     for post in row['top_posts']:
-                         st.markdown(f"  - **EG: {post['engagement']}** - {post['summary_ai']}")
-                         if post['media_link']:
-                             st.markdown(f"    [Link]({post['media_link']})")
-                st.markdown("---")
-        
-        elif result.get('image_base64'):
-            st.image(base64.b64decode(result['image_base64']))
-        
-        if isinstance(result['data'], pd.DataFrame) and task_name != "話題カテゴリ別 エンゲージメントTOP5と概要":
-            st.dataframe(result['data'].head(10))
-        elif isinstance(result['data'], dict):
-            st.json(result['data'])
-        elif isinstance(result['data'], str) and task_name != "共起ネットワーク":
-            st.markdown(result['data'])
+        # その他の分析
+        else:
+            if result.get('image_base64'):
+                st.image(base64.b64decode(result['image_base64']))
+            
+            if isinstance(result.get('data'), pd.DataFrame):
+                st.dataframe(result['data'].head(10))
+            elif isinstance(result.get('data'), dict):
+                st.json(result['data'])
+            elif isinstance(result.get('data'), str):
+                st.markdown(result['data'])
             
         st.caption(f"サマリ: {result.get('summary', 'N/A')}")
 
-        # (★) 個別実行エリア (L1813〜)
+        # (★) 個別実行エリア (汎用化対応)
         with st.expander(f"「{task_name}」のパラメータ修正・再実行"):
             
-            st.markdown(f"**説明:** {suggestion_details['description']}")
+            st.markdown(f"**説明:** {suggestion_details.get('description', 'N/A')}")
             st.markdown("##### (オプション) パラメータの変更")
             
-            # (★) --- 修正: ネストエラーを修正 (L1815) ---
             try:
-                # 1. 共起ネットワーク
-                if task_name == "共起ネットワーク":
-                    
-                    # --- 1. 絞り込み列 ---
-                    flag_col_options = [col for col in keyword_cols if col in df_B.columns]
-                    default_flag_col = suggestion_details.get('flag_col', '市区町村キーワード')
-                    if default_flag_col not in flag_col_options and flag_col_options:
-                        default_flag_col = flag_col_options[0]
+                # 1. 単純集計
+                if task_name.startswith("単純集計:"):
+                    default_col = suggestion_details['suitable_cols'][0]
+                    new_col = st.selectbox(f"集計対象の列 ({task_name})", options=all_categorical_cols, index=all_categorical_cols.index(default_col) if default_col in all_categorical_cols else 0, key=f"sel_{task_name}")
+                    suggestion_details['ui_selected_col'] = new_col
+                
+                # 2. クロス集計
+                elif task_name.startswith("クロス集計"):
+                    default_col1 = suggestion_details['suitable_cols'][0]
+                    default_col2 = suggestion_details['suitable_cols'][1]
+                    c1, c2 = st.columns(2)
+                    new_col1 = c1.selectbox(f"列 1 (行) ({task_name})", options=all_categorical_cols, index=all_categorical_cols.index(default_col1) if default_col1 in all_categorical_cols else 0, key=f"sel_{task_name}_1")
+                    new_col2 = c2.selectbox(f"列 2 (列) ({task_name})", options=all_categorical_cols, index=all_categorical_cols.index(default_col2) if default_col2 in all_categorical_cols else 1, key=f"sel_{task_name}_2")
+                    suggestion_details['ui_selected_col1'] = new_col1
+                    suggestion_details['ui_selected_col2'] = new_col2
+
+                # 3. 時系列
+                elif task_name == "時系列キーワード分析":
+                    default_dt = suggestion_details['suitable_cols']['datetime'][0]
+                    default_kw = suggestion_details['suitable_cols']['keywords'][0]
+                    c1, c2 = st.columns(2)
+                    new_dt = c1.selectbox(f"日時列 ({task_name})", options=date_cols, index=date_cols.index(default_dt) if default_dt in date_cols else 0, key=f"sel_{task_name}_dt")
+                    new_kw = c2.selectbox(f"キーワード列 ({task_name})", options=all_categorical_cols, index=all_categorical_cols.index(default_kw) if default_kw in all_categorical_cols else 0, key=f"sel_{task_name}_kw")
+                    suggestion_details['ui_selected_dt_col'] = new_dt
+                    suggestion_details['ui_selected_kw_col'] = new_kw
+                
+                # 4. テキストマイニング
+                elif task_name == "テキストマイニング（頻出単語）":
+                    default_col = suggestion_details['suitable_cols'][0]
+                    if not text_cols:
+                         st.warning("分析対象のテキスト列が見つかりません。")
+                         new_col = None
+                    else:
+                        new_col = st.selectbox(f"テキスト列 ({task_name})", options=text_cols, index=text_cols.index(default_col) if default_col in text_cols else 0, key=f"sel_{task_name}_txt")
+                    suggestion_details['ui_selected_text_col'] = new_col
+
+                # 5. 共起ネットワーク
+                elif task_name == "共起ネットワーク":
+                    # 1. 絞り込み列
+                    flag_col_options = all_categorical_cols
+                    default_flag_col = suggestion_details.get('ui_selected_flag_col', location_cols[0] if location_cols else (flag_cols[0] if flag_cols else None))
                     
                     flag_col = st.selectbox(
-                        "1. 絞り込みに使用する列:", flag_col_options,
+                        "1. 絞り込みに使用するカテゴリ列:", flag_col_options,
                         index=flag_col_options.index(default_flag_col) if default_flag_col in flag_col_options else 0,
-                        key=f"cn_filter_col_{task_name}", # (★) 重複キー回避
+                        key=f"cn_filter_col_{task_name}",
                         help="ここで選んだ列のキーワードで、分析対象の投稿を絞り込みます。"
                     )
-                    suggestion_details['flag_col'] = flag_col
+                    suggestion_details['ui_selected_flag_col'] = flag_col
 
-                    # --- 2. 絞り込みキーワード ---
+                    # 2. 絞り込みキーワード
                     try:
                         s = df_B[flag_col].dropna().astype(str).str.split(',').explode().str.strip()
                         s = s[~s.isin(['', 'nan', 'Nan', 'NaN'])]
                         keyword_counts = s.value_counts()
                         options = keyword_counts.index.tolist()[:50]
-                        default_options_kws = suggestion_details.get('selected_keywords', keyword_counts.index.tolist()[:10])
+                        default_options_kws = suggestion_details.get('ui_selected_keywords', keyword_counts.index.tolist()[:10])
                     except Exception:
                         options = []
-                        default_options_kws = suggestion_details.get('selected_keywords', [])
+                        default_options_kws = suggestion_details.get('ui_selected_keywords', [])
 
                     selected_keywords = st.multiselect(
                         f"2. 絞り込むキーワード（「{flag_col}」列 Top 50）:",
@@ -2866,153 +2901,211 @@ def render_step_b():
                         key=f"cn_selected_keywords_{flag_col}",
                         help="分析対象とする投稿に含まれるキーワードを選択します。"
                     )
-                    suggestion_details['selected_keywords'] = selected_keywords
+                    suggestion_details['ui_selected_keywords'] = selected_keywords
                     
-                    # --- 3. テキスト列 ---
-                    default_text_col = suggestion_details.get('text_col', 'ANALYSIS_TEXT_COLUMN')
+                    # 3. テキスト列
+                    default_text_col = suggestion_details.get('ui_selected_text_col', text_cols[0] if text_cols else None)
                     if not text_cols:
-                         st.warning("分析対象のテキスト列 (ANALYSIS_TEXT_COLUMN) が見つかりません。")
+                         st.warning("分析対象のテキスト列が見つかりません。")
                          text_col = None
                     else:
                         text_col = st.selectbox(
                             "3. 分析対象の自由記述列:", text_cols,
                             index=text_cols.index(default_text_col) if default_text_col in text_cols else 0,
-                            key=f"cn_text_col_{task_name}" # (★) 重複キー回避
+                            key=f"cn_text_col_{task_name}"
                         )
-                    suggestion_details['text_col'] = text_col
+                    suggestion_details['ui_selected_text_col'] = text_col
                     
                     st.markdown("---")
                     st.markdown("**グラフ詳細設定**")
                     ui_cols = st.columns([0.5, 0.5])
                     
                     with ui_cols[0]:
-                        # --- 4. レイアウト ---
+                        # 4. レイアウト
                         st.markdown("**レイアウト・物理演算**")
                         solver = st.selectbox(
                             "レイアウト (layout)", ['barnesHut', 'fruchterman_reingold', 'repulsion'],
                             index=['barnesHut', 'fruchterman_reingold', 'repulsion'].index(suggestion_details.get('solver', 'barnesHut')),
-                            key=f"cn_solver_{task_name}" # (★) 重複キー回避
+                            key=f"cn_solver_{task_name}"
                         )
                         suggestion_details['solver'] = solver
-                        
                         gravity = st.slider(
                             "重力 (Gravity)", -50000, -1000, suggestion_details.get('gravity', -2000), step=1000,
-                            key=f"cn_gravity_{task_name}" # (★) 重複キー回避
+                            key=f"cn_gravity_{task_name}"
                         )
                         suggestion_details['gravity'] = gravity
-                        
                         node_distance = st.slider(
                             "ノード間の反発力", 100, 500, suggestion_details.get('node_distance', 200),
-                            key=f"cn_distance_{task_name}" # (★) 重複キー回避
+                            key=f"cn_distance_{task_name}"
                         )
                         suggestion_details['node_distance'] = node_distance
-                        
                         spring_length = st.slider(
                             "エッジの長さ", 50, 500, suggestion_details.get('spring_length', 250),
-                            key=f"cn_spring_{task_name}" # (★) 重複キー回避
+                            key=f"cn_spring_{task_name}"
                         )
                         suggestion_details['spring_length'] = spring_length
 
                     with ui_cols[1]:
-                        # --- 5. フィルタ ---
+                        # 5. フィルタ
                         st.markdown("**フィルタ設定**")
                         top_n_words_limit = st.slider(
                             "分析対象の単語数 (Top N)", 50, 300, suggestion_details.get('top_n_words_limit', 100),
-                            key=f"cn_top_n_{task_name}" # (★) 重複キー回避
+                            key=f"cn_top_n_{task_name}"
                         )
                         suggestion_details['top_n_words_limit'] = top_n_words_limit
-                        
                         max_degree_cutoff = st.slider(
                             "最大接続数 (Exclude Hubs)", 10, 100, suggestion_details.get('max_degree_cutoff', 50),
-                            key=f"cn_max_degree_{task_name}" # (★) 重複キー回避
+                            key=f"cn_max_degree_{task_name}"
                         )
                         suggestion_details['max_degree_cutoff'] = max_degree_cutoff
-                        
                         min_occurrence = st.slider(
                             "最小共起回数 (Min Freq)", 1, 30, suggestion_details.get('min_occurrence', 10),
-                            key=f"cn_slider_v3_{task_name}" # (★) 重複キー回避
+                            key=f"cn_slider_v3_{task_name}"
                         )
                         suggestion_details['min_occurrence'] = min_occurrence
                         
-                        # --- 6. デザイン ---
+                        # 6. デザイン
                         st.markdown("**デザイン設定**")
                         default_node_size = st.slider(
                             "基準ノードサイズ", 5, 50, suggestion_details.get('default_node_size', 15),
-                            key=f"cn_node_size_v2_{task_name}" # (★) 重複キー回避
+                            key=f"cn_node_size_v2_{task_name}"
                         )
                         suggestion_details['default_node_size'] = default_node_size
-                        
                         default_text_size = st.slider(
                             "テキストサイズ", 10, 100, suggestion_details.get('default_text_size', 50),
-                            key=f"cn_text_size_v2_{task_name}" # (★) 重複キー回避
+                            key=f"cn_text_size_v2_{task_name}"
                         )
                         suggestion_details['default_text_size'] = default_text_size
                     
-                    # --- 7. AI凡例 ---
+                    # 7. AI凡例
                     st.markdown("---")
                     run_ai_legend = st.checkbox(
                         "🤖 AIで凡例を生成 (β) (実行に時間がかかります)",
                         value=suggestion_details.get('run_ai_legend', False),
-                        key=f"cn_run_ai_legend_{task_name}" # (★) 重複キー回避
+                        key=f"cn_run_ai_legend_{task_name}"
                     )
                     suggestion_details['run_ai_legend'] = run_ai_legend
 
-                # 2. 単純集計
-                elif task_name.startswith("単純集計:"):
-                    default_col = suggestion_details['suitable_cols'][0]
-                    new_col = st.selectbox(f"集計対象の列 ({task_name})", options=keyword_cols, index=keyword_cols.index(default_col) if default_col in keyword_cols else 0, key=f"sel_{task_name}")
-                    suggestion_details['suitable_cols'] = [new_col]
-                
-                # 3. クロス集計
-                elif task_name.startswith("クロス集計"):
-                    default_col1 = suggestion_details['suitable_cols'][0]
-                    default_col2 = suggestion_details['suitable_cols'][1]
-                    c1, c2 = st.columns(2)
-                    new_col1 = c1.selectbox(f"列 1 ({task_name})", options=all_cols, index=all_cols.index(default_col1) if default_col1 in all_cols else 0, key=f"sel_{task_name}_1")
-                    new_col2 = c2.selectbox(f"列 2 ({task_name})", options=all_cols, index=all_cols.index(default_col2) if default_col2 in all_cols else 1, key=f"sel_{task_name}_2")
-                    suggestion_details['suitable_cols'] = [new_col1, new_col2]
-
-                # 4. 時系列
-                elif task_name == "時系列キーワード分析":
-                    default_dt = suggestion_details['suitable_cols']['datetime'][0]
-                    default_kw = suggestion_details['suitable_cols']['keywords'][0]
-                    c1, c2 = st.columns(2)
-                    new_dt = c1.selectbox(f"日時列 ({task_name})", options=date_cols, index=date_cols.index(default_dt) if default_dt in date_cols else 0, key=f"sel_{task_name}_dt")
-                    new_kw = c2.selectbox(f"キーワード列 ({task_name})", options=keyword_cols, index=keyword_cols.index(default_kw) if default_kw in keyword_cols else 0, key=f"sel_{task_name}_kw")
-                    suggestion_details['suitable_cols'] = {"datetime": [new_dt], "keywords": [new_kw]}
-                
-                # 5. テキストマイニング
-                elif task_name in ["テキストマイニング（頻出単語）"]:
-                    default_col = suggestion_details['suitable_cols'][0]
-                    if not text_cols:
-                         st.warning("分析対象のテキスト列 (ANALYSIS_TEXT_COLUMN) が見つかりません。")
-                         new_col = None
-                    else:
-                        new_col = st.selectbox(f"テキスト列 ({task_name})", options=text_cols, index=text_cols.index(default_col) if default_col in text_cols else 0, key=f"sel_{task_name}_txt")
-                    suggestion_details['suitable_cols'] = [new_col]
-                
-                # 6. エンゲージメントTOP5
-                elif task_name == "話題カテゴリ別 エンゲージメントTOP5と概要":
+                # 6. 汎用カテゴリ深掘り
+                elif task_name == "カテゴリ列の集計と深掘り":
                     defaults = suggestion_details['suitable_cols']
+                    cat_options = defaults['category_cols']
+                    if not cat_options:
+                         st.warning("分析可能なカテゴリ列（...キーワード 等）が見つかりません。")
+                         new_cat_col = None
+                    else:
+                        default_cat_col = get_generic_param(task_name, 'cat_col', cat_options[0])
+                        new_cat_col = st.selectbox(
+                            f"集計対象のカテゴリ列 ({task_name})", options=cat_options, 
+                            index=cat_options.index(default_cat_col) if default_cat_col in cat_options else 0, 
+                            key=f"sel_{task_name}_cat"
+                        )
+                    suggestion_details['ui_selected_category_col'] = new_cat_col
+                    set_generic_param(task_name, 'cat_col', new_cat_col)
+
+                # 7. 汎用 数値列TOP5
+                elif task_name == "カテゴリ別 数値列TOP5分析":
+                    defaults = suggestion_details['suitable_cols']
+                    
+                    cat_options = defaults['category_cols']
+                    num_options = defaults['numeric_cols']
+                    
+                    if not cat_options or not num_options:
+                        st.warning("分析に必要なカテゴリ列または数値列（いいね 等）が見つかりません。")
+                    else:
+                        c1, c2 = st.columns(2)
+                        default_cat_col = get_generic_param(task_name, 'cat_col', cat_options[0])
+                        default_num_col = get_generic_param(task_name, 'num_col', num_options[0])
+
+                        new_cat_col = c1.selectbox(
+                            f"カテゴリ列 ({task_name})", options=cat_options, 
+                            index=cat_options.index(default_cat_col) if default_cat_col in cat_options else 0, 
+                            key=f"sel_{task_name}_cat_top5"
+                        )
+                        new_num_col = c2.selectbox(
+                            f"数値列（集計対象） ({task_name})", options=num_options, 
+                            index=num_options.index(default_num_col) if default_num_col in num_options else 0, 
+                            key=f"sel_{task_name}_num_top5"
+                        )
+                        
+                        suggestion_details['ui_selected_category_col'] = new_cat_col
+                        suggestion_details['ui_selected_numeric_col'] = new_num_col
+                        suggestion_details['ui_selected_text_col'] = defaults['text_col'][0] # テキスト列は固定
+                        
+                        set_generic_param(task_name, 'cat_col', new_cat_col)
+                        set_generic_param(task_name, 'num_col', new_num_col)
+
+                # 8. A/B比較のUI
+                elif task_name == "A/B 比較分析":
+                    st.info("比較したい2つのグループ（AとB）を定義してください。")
+                    ab_col_options = suggestion_details['suitable_cols']['category_cols']
+                    
+                    ab_params = st.session_state.step_b_ab_params
+                    
                     c1, c2 = st.columns(2)
-                    new_topic = c1.selectbox(f"話題カテゴリ列 ({task_name})", options=keyword_cols, index=keyword_cols.index(defaults['topic'][0]) if defaults['topic'][0] in keyword_cols else 0, key=f"sel_{task_name}_top")
-                    new_eng = c2.selectbox(f"エンゲージメント列 ({task_name})", options=engagement_cols, index=engagement_cols.index(defaults['engagement'][0]) if defaults['engagement'][0] in engagement_cols else 0, key=f"sel_{task_name}_eng")
-                    suggestion_details['suitable_cols'] = {'topic': [new_topic], 'text': defaults['text'], 'engagement': [new_eng]}
+                    with c1:
+                        st.markdown("##### グループ A")
+                        a_col_key = f"ab_a_col_{task_name}"
+                        a_val_key = f"ab_a_val_{task_name}"
+                        
+                        default_a_col = ab_params.get('a_col', ab_col_options[0] if ab_col_options else None)
+                        a_col = st.selectbox(
+                            "A: 比較列", ab_col_options, 
+                            index=ab_col_options.index(default_a_col) if default_a_col in ab_col_options else 0, 
+                            key=a_col_key
+                        )
+                        try:
+                            a_val_options = sorted(list(df_B[a_col].astype(str).str.split(', ').explode().str.strip().unique()))
+                        except Exception:
+                            a_val_options = []
+                        
+                        default_a_val = ab_params.get('a_val', a_val_options[0] if a_val_options else None)
+                        a_val = st.selectbox(
+                            "A: 比較値", a_val_options, 
+                            index=a_val_options.index(default_a_val) if default_a_val in a_val_options else 0, 
+                            key=a_val_key
+                        )
+                    with c2:
+                        st.markdown("##### グループ B")
+                        b_col_key = f"ab_b_col_{task_name}"
+                        b_val_key = f"ab_b_val_{task_name}"
+                        
+                        default_b_col = ab_params.get('b_col', ab_col_options[0] if ab_col_options else None)
+                        b_col = st.selectbox(
+                            "B: 比較列", ab_col_options, 
+                            index=ab_col_options.index(default_b_col) if default_b_col in ab_col_options else 0, 
+                            key=b_col_key
+                        )
+                        try:
+                            b_val_options = sorted(list(df_B[b_col].astype(str).str.split(', ').explode().str.strip().unique()))
+                        except Exception:
+                            b_val_options = []
+                            
+                        default_b_val = ab_params.get('b_val', b_val_options[1] if len(b_val_options) > 1 else (b_val_options[0] if b_val_options else None))
+                        b_val = st.selectbox(
+                            "B: 比較値", b_val_options, 
+                            index=b_val_options.index(default_b_val) if default_b_val in b_val_options else 0, 
+                            key=b_val_key
+                        )
+                    
+                    current_ab_params = {'a_col': a_col, 'a_val': a_val, 'b_col': b_col, 'b_val': b_val}
+                    suggestion_details['ui_ab_params'] = current_ab_params
+                    st.session_state.step_b_ab_params = current_ab_params
 
             except Exception as e:
                 st.error(f"パラメータUIの描画に失敗: {e}")
                 logger.error(f"パラメータUI描画エラー ({task_name}): {e}", exc_info=True)
 
-            # (★) 個別実行ボタン
+            # 個別実行ボタン
             if st.button(f"「{task_name}」を再実行/更新", key=f"run_{task_name}"):
                 st.session_state.progress_text = f"「{task_name}」を個別に実行中..."
                 with st.spinner(f"「{task_name}」を実行中..."):
                     try:
                         result_data = execute_analysis(task_name, df_B, suggestion_details)
-                        st.session_state.step_b_results[task_name] = result_data
-                        st.session_state.suggestions_B[task_name] = suggestion_details
+                        st.session_state.step_b_results[task_name] = result_data # 結果を更新
+                        st.session_state.suggestions_B[task_name] = suggestion_details # パラメータを保存
                         st.session_state.progress_text = f"「{task_name}」の実行が完了しました。"
-                        st.rerun()
+                        st.rerun() # UIを更新してプレビューに反映
                     except Exception as e:
                          st.error(f"分析実行エラー: {e}")
                          logger.error(f"個別実行エラー ({task_name}): {e}", exc_info=True)
@@ -3044,7 +3137,7 @@ def render_step_b():
                     logger.error(f"Step B 最終JSON出力変換エラー: {e}", exc_info=True)
                     st.error(f"分析結果のJSON変換中にエラー: {e}")
 
-    # (★) ダウンロードセクション (変更なし)
+    # ダウンロードセクション
     if st.session_state.step_b_json_output:
         st.info(f"以下のJSONファイルには、Step 5 でプレビュー・実行された {len(st.session_state.step_b_results)} 件の分析結果がすべて含まれています。")
         
