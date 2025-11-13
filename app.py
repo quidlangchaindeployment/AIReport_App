@@ -118,6 +118,10 @@ except ImportError:
     st.error("地名辞書ファイル (geography_db.py) が見つかりません。")
     JAPAN_GEOGRAPHY_DB = {}
 
+COLOR_PALETTE = [
+    "#FF5733", "#33FF57", "#3357FF", "#FF33A1", "#33FFF6",
+    "#F3FF33", "#FF8C33", "#8C33FF", "#33FF8C", "#FF338C"
+]
 
 # --- 3. ロガー設定 ---
 class StreamlitLogHandler(logging.Handler):
@@ -477,22 +481,22 @@ def perform_ai_tagging(
         # 地名辞書 (JAPAN_GEOGRAPHY_DB): {geo_context}
         # カテゴリ定義 (categories): {categories}
         # テキストデータ (JSONL): {text_data_jsonl}
+
         # 指示:
         1. 「テキストデータ(JSONL)」の各行を処理する。
         2. 「カテゴリ定義」のキー名を【厳格に】使用し、全カテゴリを抽出する。
-        3. 【"市区町村キーワード" 以外のカテゴリ】:
-           - 値は必ず【リスト形式】で出力（該当なければ空リスト []）。
-        4. 【"市区町村キーワード" (最重要・単一回答)】:
+        3. 【すべてのカテゴリ】 ( "市区町村キーワード" を含む ):
            - 値は【単一の文字列】で出力する (該当なければ空文字列 "")。リスト形式は【厳禁】。
-           - 抽出ルール:
-             a. 「地名辞書」の【値】(例: "呉市", "中区") または【キー】(例: "広島市") に一致する、最も文脈に関連性の高いものを【1つだけ】選ぶ。
-             b. (例: "広島市" と "中区" が両方言及されていれば、より詳細な "中区" を優先する)
-             c. "宮島" のようなランドマーク名は、それが属する「地名辞書」の市区町村名 (例: "廿日市市") に【必ず変換】して回答する。
-             d. "広島" のような曖昧な表現は、文脈から (a) のいずれかに特定できる場合のみ (例: "広島市") 抽出し、特定できなければ【空文字列 ""】とする。
-             e. 都道府県名 (例: "広島県")、および「観光地」のような地名以外の単語は【絶対に抽出しない】。
-             f. 「分析指針」と無関係な地域の地名（例: 指針が「広島」なのにテキストが「滋賀県」）は【抽出しない】。
+           - 文脈から最も関連性の高いものを【1つだけ】選ぶ。
+           - 分析指針でカテゴリとその内容の選択肢が提示されている場合は、それに従いラベル付けを行う。
+        4. 【"市区町村キーワード" の特別ルール】:
+           - "宮島" のようなランドマーク名は "廿日市市" のように【必ず変換】する。
+           - "広島" のような曖昧な表現は、特定できなければ【空文字列 ""】とする。
+           - 都道府県名（例: "広島県"）は【絶対に抽出しない】。
+           - 「分析指針」と無関係な地域の地名は【抽出しない】。
         5. ハルシネーション（情報の捏造）禁止。
         6. 出力は【JSONL形式のみ】（id と categories を含む辞書）。
+
         # 回答 (JSONL形式のみ):
         """
     )
@@ -536,36 +540,19 @@ def perform_ai_tagging(
                             break
                     
                     raw_value = tag_source.get(found_key) if found_key else None
-
-                    # --- "市区町村キーワード" の処理 (単一文字列) ---
-                    if key == "市区町村キーワード":
-                        processed_value = ""
-                        if isinstance(raw_value, list) and raw_value:
-                            # リストで返ってきた場合、最初の要素を採用
-                            processed_value = str(raw_value[0]).strip()
-                        elif raw_value is not None and str(raw_value).strip():
-                            # 文字列で返ってきた場合
-                            processed_value = str(raw_value).strip()
-                        
-                        # 該当なし等の表現を空文字に統一
-                        if processed_value.lower() in ["該当なし", "none", "null", "", "n/a"]:
-                            row_result[key] = ""
-                        else:
-                            row_result[key] = processed_value
+                    processed_value = ""
+                    if isinstance(raw_value, list) and raw_value:
+                        # (★) リストで返ってきた場合(AIの指示ミス)でも、最初の要素を採用
+                        processed_value = str(raw_value[0]).strip()
+                    elif raw_value is not None and str(raw_value).strip():
+                        # (★) 文字列で返ってきた場合
+                        processed_value = str(raw_value).strip()
                     
-                    # --- その他のカテゴリの処理 (カンマ区切り文字列) ---
+                    # 該当なし等の表現を空文字に統一
+                    if processed_value.lower() in ["該当なし", "none", "null", "", "n/a"]:
+                        row_result[key] = ""
                     else:
-                        processed_values = []
-                        if isinstance(raw_value, list):
-                            processed_values = sorted(list(set(
-                                str(val).strip() for val in raw_value if str(val).strip()
-                            )))
-                        elif raw_value is not None and str(raw_value).strip():
-                            # 単一文字列で返ってきた場合もリストに格納
-                            processed_values = [str(raw_value).strip()]
-                        
-                        # 既存コード (L304) に合わせ、カンマ区切りの文字列として格納
-                        row_result[key] = ", ".join(processed_values)
+                        row_result[key] = processed_value
                 
                 results.append(row_result)
                 
@@ -976,11 +963,6 @@ def find_cols(df: pd.DataFrame, patterns: List[str]) -> List[str]:
     found_cols = set()
     for pattern in patterns:
         try:
-            # 1. ･･･キーワード (hard-coded rule from old function)
-            for col in cols:
-                 if col.endswith('キーワード'):
-                     found_cols.add(col)
-            # 2. 部分一致 (大文字小文字無視)
             for col in cols:
                 if re.search(pattern, col, re.IGNORECASE):
                     found_cols.add(col)
@@ -1030,7 +1012,7 @@ def suggest_analysis_techniques_py(df: pd.DataFrame) -> List[Dict[str, Any]]:
         engagement_cols = find_engagement_cols(df, ['eng', 'like', 'いいね', 'エンゲージメント'])
         # (★) `...キーワード` で終わる列 + `topic_col` や `location_col` など
         flag_cols = find_cols(df, ['key', 'keyword', 'キーワード'])
-        flag_cols = sorted(list(set(flag_cols + [c for c in [topic_col, location_col, tour_spot_col, hashtag_col] if c])))
+        flag_cols = sorted(list(set(flag_cols + [c for c in [topic_col, location_col, tour_spot_col, hashtag_col] if c is not None]))) # (★) Noneを除外
 
         other_categorical = [
             col for col in df.select_dtypes(include='object').columns
@@ -1047,7 +1029,7 @@ def suggest_analysis_techniques_py(df: pd.DataFrame) -> List[Dict[str, Any]]:
 
         # --- 1. 全体メトリクス ---
         # (★) センチメント列とエンゲージメント列を `suitable_cols` に渡す
-        overall_metric_cols = [c for c in [sentiment_col] + engagement_cols if c]
+        overall_metric_cols = [c for c in [sentiment_col] + engagement_cols if c is not None] # (★) Noneを除外
         potential_suggestions.append({
             "priority": 1, "name": "全体のメトリクス",
             "description": "投稿数、エンゲージメント、センチメント傾向など、データセット全体の概要を計算します。",
@@ -1391,7 +1373,7 @@ def generate_graph_image(
 def suggest_analysis_techniques_py(df: pd.DataFrame) -> List[Dict[str, Any]]:
     """
     (Step B) データフレームを分析し、Pythonで実行可能な基本的な分析手法を提案する。
-    (★) 3. 単純集計のロジックを修正
+    (★) 修正: 2024/11/10 - re.search を使用し、列名を柔軟に検索するよう堅牢化
     """
     suggestions = []
     if df is None or df.empty:
@@ -1399,62 +1381,68 @@ def suggest_analysis_techniques_py(df: pd.DataFrame) -> List[Dict[str, Any]]:
         return suggestions
         
     try:
-        numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
-        object_cols = df.select_dtypes(include='object').columns.tolist()
-        datetime_cols = []
-
-        for col in object_cols:
-             if df[col].isnull().sum() / len(df) > 0.5: continue
-             sample = df[col].dropna().head(50)
-             if sample.empty: continue
-             try:
-                 pd.to_datetime(sample, errors='raise')
-                 temp_dt = pd.to_datetime(df[col], errors='coerce').dropna()
-                 if not temp_dt.empty and (temp_dt.dt.year.nunique() > 1 or temp_dt.dt.month.nunique() > 1 or temp_dt.dt.day.nunique() > 1 or col.lower() in ['date', 'time', 'timestamp', '日付', '日時']):
-                     datetime_cols.append(col)
-                     logger.info(f"列 '{col}' を日時列として認識しました。")
-             except (ValueError, TypeError, OverflowError, pd.errors.ParserError):
-                 pass
-
-        numeric_cols = [col for col in numeric_cols if col != 'id']
-        categorical_cols = [col for col in object_cols if col != 'ANALYSIS_TEXT_COLUMN' and col not in datetime_cols]
-        # (★) 3. _キーワード で終わる列を flag_cols とする
-        flag_cols = [col for col in categorical_cols if col.endswith('キーワード')]
-        other_categorical = [col for col in categorical_cols if not col.endswith('キーワード')]
+        # (★) --- 1. 柔軟な列名の特定 ---
+        all_cols = list(df.columns)
         
-        logger.info(f"提案分析(PY) - 数値:{numeric_cols}, カテゴリ(フラグ):{flag_cols}, カテゴリ(他):{other_categorical}, 日時:{datetime_cols}")
+        # (★) 主要な列を見つける
+        text_col = find_col(df, ['ANALYSIS_TEXT_COLUMN', 'text', 'content', '本文'])
+        topic_col = find_col(df, ['話題カテゴリ', 'topic', 'category'])
+        location_col = find_col(df, ['市区町村キーワード', 'location', 'city', '地域'])
+        tour_spot_col = find_col(df, ['観光地キーワード', 'tourist_spot', 'spot'])
+        hashtag_col = find_col(df, ['hash', 'ハッシュタグ'])
+        sentiment_col = find_col(df, ['sent', 'センチメント'])
+        date_col = find_col(df, ['date', 'time', '日付', '日時'])
+        
+        # (★) 複数の可能性がある列
+        engagement_cols = find_engagement_cols(df, ['eng', 'like', 'いいね', 'エンゲージメント'])
+        
+        # (★) --- 修正: None がリストに含まれないよう 'is not None' でチェック ---
+        flag_cols = find_cols(df, ['key', 'keyword', 'キーワード'])
+        flag_cols = sorted(list(set(flag_cols + [c for c in [topic_col, location_col, tour_spot_col, hashtag_col] if c is not None])))
+
+        other_categorical = [
+            col for col in df.select_dtypes(include='object').columns
+            if col not in flag_cols and col != text_col and col != date_col
+        ]
+        
+        logger.info(f"提案分析(PY) - Text:{text_col}, Topic:{topic_col}, Location:{location_col}")
+        logger.info(f"提案分析(PY) - FlagCols(All):{flag_cols}")
+        logger.info(f"提案分析(PY) - Engagement:{engagement_cols}, Sentiment:{sentiment_col}, Date:{date_col}")
 
         potential_suggestions = []
 
-        # (★) --- 1. 全体メトリクス ---
+        # (★) --- 2. 提案ロジック (堅牢化版) ---
+
+        # --- 1. 全体メトリクス ---
+        # (★) --- 修正: None がリストに含まれないよう 'is not None' でチェック ---
+        overall_metric_cols = [c for c in [sentiment_col] + engagement_cols if c is not None]
         potential_suggestions.append({
             "priority": 1, "name": "全体のメトリクス",
             "description": "投稿数、エンゲージメント、センチメント傾向など、データセット全体の概要を計算します。",
             "reason": "データ全体の状況把握に必須です。",
-            "suitable_cols": [col for col in df.columns if 'センチメント' in col or 'いいね' in col or 'エンゲージメント' in col],
+            "suitable_cols": overall_metric_cols, # (★) 
             "type": "python"
         })
 
-        # (★) --- 3. 単純集計（頻度分析）---
-        # (★) 修正: StepAで生成した全キーワード列を個別に提案
+        # --- 3. 単純集計（頻度分析）---
         if flag_cols:
             for col in flag_cols:
                 potential_suggestions.append({
                     "priority": 1, 
-                    "name": f"単純集計: {col}", # (★) 例: "単純集計: 市区町村キーワード"
+                    "name": f"単純集計: {col}", 
                     "description": f"「{col}」列の出現頻度（TOP50）を分析します。",
                     "reason": f"StepAで生成されたキーワード列({col})の基本指標です。",
-                    "suitable_cols": [col], # (★) 1列のみ
+                    "suitable_cols": [col],
                     "type": "python"
                 })
 
-        # 優先度2: クロス集計
+        # --- 2. クロス集計 ---
         if len(flag_cols) >= 2:
             potential_suggestions.append({
                 "priority": 2, "name": "クロス集計（キーワード間）",
                 "description": "キーワード間の組み合わせで多く出現するパターンを探ります。",
                 "reason": f"複数キーワード列({len(flag_cols)}個)あり、関連性の発見に。",
-                "suitable_cols": flag_cols, # (★) 編集用に全フラグ列を渡す
+                "suitable_cols": flag_cols, 
                 "type": "python"
             })
         if flag_cols and other_categorical:
@@ -1462,74 +1450,80 @@ def suggest_analysis_techniques_py(df: pd.DataFrame) -> List[Dict[str, Any]]:
                 "priority": 2, "name": "クロス集計（キーワード×属性）",
                 "description": f"キーワード({flag_cols[0]}など)と他の属性({', '.join(other_categorical)})の関係性を分析します。",
                 "reason": f"キーワード列と他カテゴリ列({len(other_categorical)}個)あり。",
-                "suitable_cols": flag_cols + other_categorical, # (★) 編集用に全列を渡す
+                "suitable_cols": flag_cols + other_categorical, 
                 "type": "python"
             })
             
-        if '話題カテゴリ' in df.columns and '観光地キーワード' in df.columns:
+        if topic_col and tour_spot_col:
             potential_suggestions.append({
-                "priority": 2, "name": "話題カテゴリ別 観光地TOP10",
-                "description": "「話題カテゴリ」と「観光地キーワード」をクロス集計し、カテゴリ別の人気観光地を分析します。",
+                "priority": 2, "name": f"{topic_col}別 {tour_spot_col} TOP10",
+                "description": f"「{topic_col}」と「{tour_spot_col}」をクロス集計し、カテゴリ別の人気観光地を分析します。",
                 "reason": "カテゴリと観光地の関連性を分析します。",
-                "suitable_cols": ['話題カテゴリ', '観光地キーワード'],
+                "suitable_cols": [topic_col, tour_spot_col],
                 "type": "python"
             })
 
-        # 優先度3: 時系列分析
-        if datetime_cols and flag_cols:
+        # --- 3. 時系列分析 ---
+        if date_col and flag_cols:
             potential_suggestions.append({
                 "priority": 3, "name": "時系列キーワード分析",
-                "description": f"特定のキーワードの出現数が時間（{datetime_cols[0]}など）とともにどう変化したかトレンドを分析します。",
-                "reason": f"キーワード列と日時列({len(datetime_cols)}個)あり。",
-                "suitable_cols": {"datetime": datetime_cols, "keywords": flag_cols}, # (★) 編集用に全候補を渡す
+                "description": f"特定のキーワードの出現数が時間（{date_col}など）とともにどう変化したかトレンドを分析します。",
+                "reason": f"キーワード列と日時列({date_col})あり。",
+                "suitable_cols": {"datetime": [date_col], "keywords": flag_cols},
                 "type": "python"
             })
             
-        # (★) --- 3. 共起ネットワーク ---
-        if 'ANALYSIS_TEXT_COLUMN' in df.columns:
+        # --- 3. 共起ネットワーク ---
+        if text_col:
             potential_suggestions.append({
                 "priority": 3, "name": "共起ネットワーク",
                 "description": "投稿テキスト内の単語の出現パターンを分析し、関連性の高い単語のネットワークを構築します。",
                 "reason": "テキストデータから隠れたトピックや関連性を発見します。",
-                "suitable_cols": ['ANALYSIS_TEXT_COLUMN'],
+                "suitable_cols": [text_col],
                 "type": "python"
             })
             
-        # 優先度4: テキストマイニング
-        if 'ANALYSIS_TEXT_COLUMN' in df.columns:
+        # --- 4. テキストマイニング ---
+        if text_col:
             potential_suggestions.append({
                 "priority": 4, "name": "テキストマイニング（頻出単語）",
                 "description": "原文テキストから頻出する単語を抽出し、どのような言葉が多く使われているか全体像を把握します。",
                 "reason": "原文テキストがあり、タグ付け以外のインサイト発見に。",
-                "suitable_cols": ['ANALYSIS_TEXT_COLUMN'],
+                "suitable_cols": [text_col],
                 "type": "python"
             })
 
-        # (★) --- 4. 話題カテゴリ別 サマリ (Python + AI) ---
-        if '話題カテゴリ' in df.columns and 'ANALYSIS_TEXT_COLUMN' in df.columns:
+        # --- 4. 話題カテゴリ別 サマリ (Python + AI) ---
+        if topic_col and text_col:
             potential_suggestions.append({
                 "priority": 4, "name": "話題カテゴリ別 投稿数とサマリ",
                 "description": "指定された話題カテゴリ（グルメ、自然など）ごとに投稿数を集計し、AIが投稿内容のサマリを生成します。",
                 "reason": "カテゴリごとの主要な話題を把握します。",
-                "suitable_cols": ['話題カテゴリ', 'ANALYSIS_TEXT_COLUMN'],
+                "suitable_cols": [topic_col, text_col],
                 "type": "python"
             })
 
-        # (★) --- 4. 話題カテゴリ別 エンゲージメントTOP5 (Python + AI) ---
-        engagement_cols = [col for col in numeric_cols if any(c in col.lower() for c in ['いいね', 'like', 'エンゲージメント', 'engagement'])]
-        if '話題カテゴリ' in df.columns and 'ANALYSIS_TEXT_COLUMN' in df.columns and engagement_cols:
+        # --- 4. 話題カテゴリ別 エンゲージメントTOP5 (Python + AI) ---
+        if topic_col and text_col and engagement_cols:
             potential_suggestions.append({
                 "priority": 4, "name": "話題カテゴリ別 エンゲージメントTOP5と概要",
                 "description": f"指定された話題カテゴリごとに、エンゲージメント（{engagement_cols[0]}）が高いTOP5投稿を抽出し、AIがその概要を生成します。",
                 "reason": "カテゴリごとに「バズった」投稿の内容を把握します。",
-                # (★) 編集用に全候補を渡す
-                "suitable_cols": {'topic': ['話題カテゴリ'], 'text': ['ANALYSIS_TEXT_COLUMN'], 'engagement': engagement_cols},
+                "suitable_cols": {'topic': [topic_col], 'text': [text_col], 'engagement': engagement_cols},
                 "type": "python"
             })
 
         suggestions = sorted(potential_suggestions, key=lambda x: x['priority'])
-        logger.info(f"Pythonベース提案(ソート後): {[s['name'] for s in suggestions]}")
-        return suggestions
+        
+        final_suggestions = []
+        seen_names = set()
+        for s in suggestions:
+             if s['name'] not in seen_names:
+                 final_suggestions.append(s)
+                 seen_names.add(s['name'])
+                 
+        logger.info(f"Pythonベース提案(ソート後): {[s['name'] for s in final_suggestions]}")
+        return final_suggestions
 
     except Exception as e:
         logger.error(f"Python分析手法提案中にエラー: {e}", exc_info=True)
@@ -1900,78 +1894,220 @@ def run_overall_metrics(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Dict[st
         return {"data": {"error": str(e)}, "image_base64": None, "summary": f"エラー: {e}"}
 
 def run_cooccurrence_network(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Dict[str, Any]:
-    """(Step B) 共起ネットワークを構築し、エッジリストのDataFrameとグラフ(Base64)を返す"""
-    # (★) UIで編集された列を取得
-    results = {"data": pd.DataFrame(), "image_base64": None, "summary": ""}
-    text_col = suggestion.get('suitable_cols', ['ANALYSIS_TEXT_COLUMN'])[0]
-    if text_col not in df.columns or df[text_col].empty:
-        msg = f"テキスト列 '{text_col}' がないか、空です。"
+    """
+    (Step B) (★) 修正: pyvis を使用し、詳細なパラメータに基づき共起ネットワークを構築する
+    UI（スライダーなど）から渡された 'suggestion' 辞書を使用する。
+    """
+    logger.info("run_cooccurrence_network (pyvis版) 実行...")
+    results = {"data": pd.DataFrame(), "image_base64": None, "html_content": None, "summary": "", "ai_legend": None, "communities": None}
+    
+    # --- 1. UIから渡されたパラメータの解析 ---
+    try:
+        # 絞り込み (L824)
+        flag_col = suggestion.get('flag_col', '市区町村キーワード')
+        selected_keywords = suggestion.get('selected_keywords', [])
+        text_col = suggestion.get('text_col', 'ANALYSIS_TEXT_COLUMN')
+        
+        # 物理演算 (L881)
+        solver = suggestion.get('solver', 'barnesHut')
+        gravity = suggestion.get('gravity', -2000)
+        node_distance = suggestion.get('node_distance', 200)
+        spring_length = suggestion.get('spring_length', 250)
+        
+        # フィルタ (L906)
+        top_n_words_limit = suggestion.get('top_n_words_limit', 100)
+        max_degree_cutoff = suggestion.get('max_degree_cutoff', 50)
+        min_occurrence = suggestion.get('min_occurrence', 10)
+        
+        # デザイン (L922)
+        default_node_size = suggestion.get('default_node_size', 15)
+        default_text_size = suggestion.get('default_text_size', 50)
+        
+        # AI凡例 (L1868)
+        run_ai_legend = suggestion.get('run_ai_legend', False)
+        
+    except Exception as e:
+        msg = f"UIパラメータの解析エラー: {e}"
+        logger.error(f"run_cooccurrence_network: {msg}", exc_info=True)
+        results["summary"] = msg
+        return results
+
+    if not selected_keywords:
+        msg = "絞り込みキーワードが選択されていません。"
+        logger.warning(f"run_cooccurrence_network: {msg}"); results["summary"] = msg; return results
+    if flag_col not in df.columns or text_col not in df.columns:
+        msg = f"対象列 ({flag_col} または {text_col}) がDFに存在しません。"
         logger.warning(f"run_cooccurrence_network: {msg}"); results["summary"] = msg; return results
 
     nlp = load_spacy_model()
     if nlp is None:
-        st.error("spaCy日本語モデルのロードに失敗しました。")
-        results["summary"] = "spaCy日本語モデルのロードに失敗しました。"
-        return results
+        msg = "spaCy日本語モデルのロードに失敗しました。"
+        logger.error(msg); results["summary"] = msg; return results
 
     try:
-        texts = df[text_col].dropna().astype(str)
-        if texts.empty:
-            results["summary"] = "テキストデータが空です。"
-            return results
-        target_pos = {'NOUN', 'PROPN', 'ADJ'}
+        # --- 2. 過去のコード (L994) に基づく spaCy 処理 ---
+        # (★) target_pos に 'VERB' (動詞) を追加
+        target_pos = {'NOUN', 'PROPN', 'ADJ', 'VERB'}
+        # (★) stop_words を更新 (分析のノイズとなる汎用語のみに限定)
         stop_words = {
             'の', 'に', 'は', 'を', 'が', 'で', 'て', 'です', 'ます', 'こと', 'もの', 'それ', 'あれ',
             'これ', 'ため', 'いる', 'する', 'ある', 'ない', 'いう', 'よう', 'そう', 'など', 'さん',
-            '的', '人', '自分', '私', '僕', '何', 'その', 'この', 'あの'
+            '的', '人', '自分', '私', '僕', '何', 'その', 'この', 'あの', 'れる', 'られる',
+            'てる', 'なる', '中', 'ところ', 'たち', '人達', '今回', '本当', 'とても', '色々'
         }
-        st.session_state.progress_text = "共起ネットワーク (spaCy) 処理中... 0%"
-        total_texts = len(texts)
-        doc_words_list = []
-        for i, doc in enumerate(nlp.pipe(texts, disable=["parser", "ner"], batch_size=50)):
-            words_in_text = set()
+        
+        G = nx.Graph()
+        
+        # (★) 1. キーワードでDataFrameをフィルタリング
+        escaped_keywords = [re.escape(k) for k in selected_keywords]
+        pattern = '|'.join(escaped_keywords)
+        df_filtered = df[df[flag_col].astype(str).str.contains(pattern, na=False)]
+        
+        if df_filtered.empty:
+            msg = "選択したキーワードを含む投稿が見つかりませんでした。"
+            logger.warning(f"run_cooccurrence_network: {msg}"); results["summary"] = msg; return results
+
+        texts_to_analyze = df_filtered[text_col].dropna().astype(str)
+        
+        # (★) 2. Top N 単語リストの作成 (L1026)
+        st.session_state.progress_text = "共起ネットワーク: (1/3) Top N 単語を計算中..."
+        all_words = []
+        for text in texts_to_analyze:
+            doc = nlp(text)
             for token in doc:
                 if (token.pos_ in target_pos) and (not token.is_stop) and (token.lemma_ not in stop_words) and (len(token.lemma_) > 1):
-                    words_in_text.add(token.lemma_)
-            doc_words_list.append(list(words_in_text))
-            if (i + 1) % 100 == 0:
-                percent = (i + 1) / total_texts
-                st.session_state.progress_text = f"共起ネットワーク (spaCy) 処理中... {percent:.0%}"
-
-        all_words = [word for sublist in doc_words_list for word in sublist]
+                    if token.lemma_ not in selected_keywords:
+                        all_words.append(token.lemma_)
+        
         if not all_words:
-            msg = "抽出可能な単語がありません。"
+            msg = "フィルタ結果から分析対象の単語が見つかりませんでした。"
             logger.warning(f"run_cooccurrence_network: {msg}"); results["summary"] = msg; return results
-        top_n_words_limit = 100
+            
         top_n_words_set = set(pd.Series(all_words).value_counts().head(top_n_words_limit).index)
-        G = nx.Graph()
-        for words_in_text_set in doc_words_list:
-            filtered_words = [word for word in words_in_text_set if word in top_n_words_set]
-            for word1, word2 in combinations(sorted(list(filtered_words)), 2):
+        
+        # (★) 3. グラフ(G)の構築 (L1043)
+        st.session_state.progress_text = "共起ネットワーク: (2/3) ネットワークを構築中..."
+        for text in texts_to_analyze:
+            doc = nlp(text)
+            words_in_text = set()
+            for token in doc:
+                if (token.pos_ in target_pos) and (token.lemma_ in top_n_words_set):
+                    words_in_text.add(token.lemma_)
+            
+            for word1, word2 in combinations(sorted(list(words_in_text)), 2):
                 if G.has_edge(word1, word2):
                     G[word1][word2]['weight'] += 1
                 else:
                     G.add_edge(word1, word2, weight=1)
+
+        # (★) 4. フィルタリング (L1078)
+        edges_to_remove = [(u, v) for u, v, data in G.edges(data=True) if data['weight'] < min_occurrence]
+        G.remove_edges_from(edges_to_remove)
+        G.remove_nodes_from(list(nx.isolates(G)))
+
+        degrees = dict(G.degree())
+        nodes_to_remove = [node for node, degree in degrees.items() if degree > max_degree_cutoff]
+        G.remove_nodes_from(nodes_to_remove)
+        G.remove_nodes_from(list(nx.isolates(G)))
+        
         if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
-            msg = "有効なエッジが構築されませんでした。"
-            logger.info(f"run_cooccurrence_network: {msg}"); results["summary"] = msg; return results
-        edge_list = []
+            msg = f"フィルタ条件 (最小共起: {min_occurrence}, 最大接続: {max_degree_cutoff}) により、表示可能なノードが0件になりました。"
+            logger.warning(f"run_cooccurrence_network: {msg}"); results["summary"] = msg; return results
+
+        # (★) 5. pyvis グラフの生成 (L1091)
+        st.session_state.progress_text = "共起ネットワーク: (3/3) グラフを描画中..."
+        net = Network(height="700px", width="100%", cdn_resources='in_line')
+        
+        degrees = dict(G.degree())
+        min_degree, max_degree = (min(degrees.values()) or 1), (max(degrees.values()) or 1)
+        
+        # (★) 6. コミュニティ検出と色分け (L1094)
+        community_map = {}
+        communities_with_words = {}
+        ai_legend_map = {}
+        try:
+            communities_list = community.greedy_modularity_communities(G)
+            communities_with_words = {i: list(comm) for i, comm in enumerate(communities_list)}
+            community_map = {node: i for i, comm in communities_with_words.items() for node in comm}
+            logger.info(f"コミュニティ検出成功。{len(communities_list)}個のクラスタを発見。")
+        except Exception as e:
+            logger.warning(f"コミュニティ検出に失敗: {e}。色分けなしで続行します。")
+            
+        results["communities"] = communities_with_words # 凡例表示用に格納
+
+        for node in G.nodes():
+            if node not in degrees: continue
+            size_factor = degrees.get(node, 0)
+            size = default_node_size + 30 * (size_factor - min_degree) / (max_degree - min_degree + 1e-6)
+            group_id = community_map.get(node, 0)
+            color = COLOR_PALETTE[group_id % len(COLOR_PALETTE)]
+            
+            net.add_node(
+                node, label=node, size=size, title=f"{node} (クラスタ: {group_id}, 結合数: {size_factor})",
+                color=color,
+                font={"size": default_text_size}
+            )
+            
         for u, v, data in G.edges(data=True):
-            edge_list.append({"source": u, "target": v, "weight": data['weight']})
-        edges_df = pd.DataFrame(edge_list)
-        edges_df_sorted = edges_df.sort_values(by="weight", ascending=False).head(500)
-        results["data"] = edges_df_sorted
-        st.session_state.progress_text = "共起ネットワーク グラフ描画中..."
-        results["image_base64"] = generate_graph_image(
-            df=edges_df_sorted,
-            plot_type='network',
-            title="共起ネットワーク (上位100エッジ)"
-        )
-        results["summary"] = f"'{text_col}' に対する共起ネットワーク分析を実行。{len(G.nodes())}ノード, {len(G.edges())}エッジを検出。グラフを生成しました。"
+            weight = data['weight']
+            net.add_edge(u, v, title=f"共起回数: {weight}", value=weight)
+
+        if solver == 'barnesHut':
+            net.barnes_hut(gravity=gravity, overlap=0.1)
+        else:
+            net.repulsion(node_distance=node_distance, spring_length=spring_length)
+        net.solver = solver
+        net.show_buttons(filter_=['physics', 'nodes', 'layout'])
+        
+        # (★) 7. HTMLコンテンツを生成して返す (L1145)
+        html_file = "cooccurrence_network.html"
+        net.save_graph(html_file)
+        with open(html_file, 'r', encoding='utf-8') as f:
+            html_content = f.read()
+        
+        results["html_content"] = html_content
+        
+        edge_list = pd.DataFrame(G.edges(data=True), columns=["source", "target", "data"])
+        edge_list['weight'] = edge_list['data'].apply(lambda x: x['weight'])
+        results["data"] = edge_list[['source', 'target', 'weight']].sort_values(by="weight", ascending=False)
+        results["summary"] = f"'{flag_col}' ( {', '.join(selected_keywords[:3])}...) で絞り込み、共起ネットワーク (pyvis) を生成。{G.number_of_nodes()}ノード, {G.number_of_edges()}エッジ。"
+
+        # (★) 8. AI凡例生成 (L1168)
+        if run_ai_legend and communities_with_words:
+            st.session_state.progress_text = "共起ネットワーク: (AI) 凡例を生成中..."
+            llm = get_llm(model_name=MODEL_FLASH_LITE, temperature=0.1)
+            if llm:
+                prompt = PromptTemplate.from_template(
+                    "以下の「単語リスト」の共通テーマを【3語以内】で考案してください。\n"
+                    "# 単語リスト (上位10件): {word_list_str}\n"
+                    "# 回答 (3語以内):"
+                )
+                chain = prompt | llm | StrOutputParser()
+                
+                for group_id, words in communities_with_words.items():
+                    if not words: continue
+                    words_top10 = sorted(words, key=lambda w: degrees.get(w, 0), reverse=True)[:10]
+                    words_str = ", ".join(words_top10)
+                    try:
+                        raw_label = chain.invoke({"word_list_str": words_str})
+                        cleaned_label = re.sub(r'^(#|回答)\s*\(.*?\)\s*:\s*', '', raw_label.strip())
+                        ai_legend_map[group_id] = cleaned_label
+                        time.sleep(1.0) # (★) 簡易的なRate Limit
+                    except Exception as e:
+                        logger.error(f"AI凡例生成エラー (Group {group_id}): {e}")
+                        ai_legend_map[group_id] = "(AIエラー)"
+                results["ai_legend"] = ai_legend_map
+                results["summary"] += " AIによる凡例生成完了。"
+            else:
+                results["summary"] += " AI凡例生成スキップ (LLMロード失敗)。"
+        
+        st.session_state.progress_text = "共起ネットワーク 完了。"
         return results
+
     except Exception as e:
-        logger.error(f"run_cooccurrence_network error: {e}", exc_info=True)
-        results["summary"] = f"エラー: {e}"
+        logger.error(f"run_cooccurrence_network (pyvis版) エラー: {e}", exc_info=True)
+        results["summary"] = f"共起ネットワーク分析中にエラー: {e}"
+        st.session_state.progress_text = f"共起ネットワーク エラー: {e}"
         return results
 
 def run_topic_category_summary(df: pd.DataFrame, suggestion: Dict[str, Any]) -> Dict[str, Any]:
@@ -2164,9 +2300,57 @@ def run_topic_engagement_top5(df: pd.DataFrame, suggestion: Dict[str, Any]) -> D
     summary = f"「{topic_col}」別の高エンゲージメント投稿TOP5を抽出しました。"
     return {"data": results_df, "image_base64": None, "summary": summary}
 
+def run_ai_summary_batch(df: pd.DataFrame, suggestion: Dict[str, Any]) -> str:
+    """
+    (Step B) AI (Flash Lite) を使用して、指定されたタスク(description)を実行する。
+    """
+    logger.info(f"run_ai_summary_batch 実行 (タスク: {suggestion.get('name', 'N/A')})...")
+    
+    # (★) Step B のAIタスクは、高速な FLASH_LITE を使用
+    llm = get_llm(model_name=MODEL_FLASH_LITE, temperature=0.1, timeout_seconds=120)
+    if llm is None:
+        logger.error("run_ai_summary_batch: LLM (Flash Lite) が利用できません。")
+        return "AIモデル(Flash Lite)が利用できませんでした。"
 
-# --- 8.2. (★) Step B: AI分析ヘルパー (変更なし) ---
-# ... (run_ai_summary_batch は変更なし) ...
+    try:
+        ai_prompt_instruction = suggestion.get('description', 'データからインサイトを抽出してください。')
+        
+        # (★) --- 修正: サンプル数を 10 -> 50 に増加 ---
+        if 'ANALYSIS_TEXT_COLUMN' in df.columns:
+            # テキスト列がある場合、サンプルを抽出
+            text_samples = df['ANALYSIS_TEXT_COLUMN'].dropna().sample(n=min(50, len(df)), random_state=1).tolist()
+            data_context = "\n".join([f"- {text[:200]}..." for text in text_samples])
+        else:
+            # テキスト列がない場合、DFの先頭をJSONで渡す
+            data_context = df.head(10).to_json(orient='records', force_ascii=False) # テキスト以外は10件
+
+        prompt = PromptTemplate.from_template(
+            """
+            あなたはデータアナリストです。「指示」に基づき、「データサンプル」を分析し、
+            簡潔な分析結果（文字列）のみを回答してください。
+
+            # 指示:
+            {ai_instruction}
+
+            # (★) --- 修正: 総件数をプロンプトに追加 ---
+            # データサンプル (分析対象: 全 {total_rows} 件からの抜粋):
+            {data_context}
+
+            # 回答 (分析結果の文字列のみ):
+            """
+        )
+        chain = prompt | llm | StrOutputParser()
+        
+        response_str = chain.invoke({
+            "ai_instruction": ai_prompt_instruction,
+            "data_context": data_context
+        })
+        
+        return response_str.strip()
+
+    except Exception as e:
+        logger.error(f"run_ai_summary_batch 実行エラー: {e}", exc_info=True)
+        return f"AI分析タスクの実行中にエラーが発生しました: {e}"
 
 
 # --- 8.3. (★) Step B: 分析実行ルーター (変更なし) ---
@@ -2218,9 +2402,86 @@ def execute_analysis(
         err_msg = f"分析 '{analysis_name}' の実行中にエラーが発生しました: {e}"
         return {"data": err_msg, "image_base64": None, "summary": err_msg}
 
-# --- 8.4. (★) Step B: JSON出力ヘルパー (変更なし) ---
-# ... (convert_results_to_json_string は変更なし) ...
+def convert_results_to_json_string(results_dict: Dict[str, Any]) -> str:
+    """
+    (Step B) 実行された分析結果(dict)を、Step Cで読み込むためのJSONL文字列に変換する。
+    "OverallSummary" (全体のメトリクス) は特別扱いし、他のタスクのサマリ情報も集約する。
+    """
+    logger.info(f"JSONL変換開始: {len(results_dict)}件の結果を処理...")
+    json_lines = []
+    overall_summary_data = {}
+    task_summaries = {} # (★) 他タスクのサマリを集約するため
 
+    # --- 1. まず "全体のメトリクス" (OverallSummary) を探す ---
+    # ... (このブロックは変更なし) ...
+    overall_task_name = "全体のメトリクス"
+    if overall_task_name in results_dict:
+        result = results_dict[overall_task_name]
+        overall_summary_data = {
+            "analysis_task": "OverallSummary",
+            "data": result.get("data", {"error": "data not found"}),
+            "summary": result.get("summary", ""),
+            "image_base64": None,
+            "image_note": "No image",
+            "analysis_summaries": {} # (★) プレースホルダ
+        }
+    else:
+        logger.warning("JSONL変換: '全体のメトリクス' (OverallSummary) が見つかりません。")
+
+
+    # --- 2. "OverallSummary" 以外のタスクを処理 ---
+    for task_name, result in results_dict.items():
+        if task_name == overall_task_name:
+            continue # 後で処理するのでスキップ
+
+        try:
+            line_data = {}
+            line_data["analysis_task"] = task_name
+            line_data["summary"] = result.get("summary", "N/A")
+
+            # (★) data の型に応じてシリアライズ
+            # ... (変更なし) ...
+            data = result.get("data")
+            if isinstance(data, pd.DataFrame):
+                # (★) 5. エンゲージメントTOP5 (DFだがJSON化済みのリストが格納)
+                if task_name == "話題カテゴリ別 エンゲージメントTOP5と概要":
+                    line_data["data"] = data.to_dict(orient='records')
+                else:
+                    line_data["data"] = data.to_json(orient='records', force_ascii=False)
+            elif isinstance(data, dict) or isinstance(data, list) or isinstance(data, str):
+                line_data["data"] = data
+            elif data is None:
+                line_data["data"] = None
+            else:
+                line_data["data"] = str(data) # フォールバック
+
+            # (★) 共起ネットワーク (pyvis) は html_content を持つが、image_base64 は持たない
+            if task_name == "共起ネットワーク":
+                line_data["image_base64"] = None # (★) StepCはHTMLを読めないので None
+                line_data["image_note"] = "No image (pyvis HTML)"
+            elif result.get("image_base64"):
+                line_data["image_base64"] = result["image_base64"]
+                line_data["image_note"] = "Image data included (Base64)"
+            else:
+                line_data["image_base64"] = None
+                line_data["image_note"] = "No image"
+
+            json_lines.append(json.dumps(line_data, ensure_ascii=False))
+            task_summaries[task_name] = line_data["summary"] # (★) サマリを収集
+            
+        except Exception as e:
+            logger.error(f"JSONL変換エラー ({task_name}): {e}", exc_info=True)
+            json_lines.append(json.dumps({"analysis_task": task_name, "error": str(e)}))
+
+    # --- 3. OverallSummary に収集したサマリを結合 ---
+    # ... (このブロックは変更なし) ...
+    if overall_summary_data:
+        overall_summary_data["analysis_summaries"] = task_summaries
+        # (★) JSONLの *先頭* に OverallSummary を追加
+        json_lines.insert(0, json.dumps(overall_summary_data, ensure_ascii=False))
+    
+    logger.info(f"JSONL変換完了: {len(json_lines)}行のJSONLを生成。")
+    return "\n".join(json_lines)
 
 # --- 8.5. (★) Step B: UI描画関数 (★ 新ワークフロー) ---
 
@@ -2228,26 +2489,27 @@ def render_step_b():
     """(Step B) 分析手法の提案・実行・データ出力UIを描画する"""
     st.title("📊 Step B: 分析の実行とデータ出力")
 
-    # (★) --- セッションステートの初期化 ---
+    # (★) --- セッションステートの初期化 (ワークフロー変更対応) ---
     if 'df_flagged_B' not in st.session_state:
         st.session_state.df_flagged_B = pd.DataFrame()
-    if 'suggestions_B' not in st.session_state:
-        # (★) 提案を「辞書」で持つ (task_name -> details)
+    if 'suggestions_B' not in st.session_state: # (★) すべての提案
         st.session_state.suggestions_B = {}
-    if 'step_b_results' not in st.session_state:
-        # (★) プレビュー用の結果 (task_name -> result_data)
+    if 'selected_tasks_B' not in st.session_state: # (★) ユーザーがチェックしたタスク
+        st.session_state.selected_tasks_B = set()
+    if 'step_b_results' not in st.session_state: # (★) 実行結果
         st.session_state.step_b_results = {}
     if 'step_b_json_output' not in st.session_state:
         st.session_state.step_b_json_output = None
     if 'progress_text' not in st.session_state:
          st.session_state.progress_text = ""
+    if 'suggestions_attempted_B' not in st.session_state:
+        st.session_state.suggestions_attempted_B = False
     if 'tips_list' not in st.session_state:
         st.session_state.tips_list = []
     if 'current_tip_index' not in st.session_state:
         st.session_state.current_tip_index = 0
     if 'last_tip_time' not in st.session_state:
         st.session_state.last_tip_time = time.time()
-    # (★) --- ここまでが修正点 ---
 
     # --- 1. ファイルアップロード ---
     st.header("Step 1: キュレーション済みCSVのアップロード")
@@ -2260,61 +2522,94 @@ def render_step_b():
 
     if uploaded_flagged_file:
         try:
-            df, err = read_file(uploaded_flagged_file)
-            if err:
-                st.error(f"ファイル読み込みエラー: {err}")
-                return
-            st.session_state.df_flagged_B = df
+            current_file_id = f"{uploaded_flagged_file.name}_{uploaded_flagged_file.size}"
+            if ('df_flagged_B' not in st.session_state or 
+                st.session_state.df_flagged_B.empty or 
+                st.session_state.get('current_file_id_B') != current_file_id):
+                
+                logger.info(f"Step B: 新しいファイル {current_file_id} をロードします。")
+                df, err = read_file(uploaded_flagged_file)
+                if err:
+                    st.error(f"ファイル読み込みエラー: {err}")
+                    st.session_state.df_flagged_B = pd.DataFrame()
+                    st.session_state.current_file_id_B = None
+                    return
+                
+                st.session_state.df_flagged_B = df
+                st.session_state.current_file_id_B = current_file_id
+                
+                # (★) ワークフロー変更: 関連ステートをすべてリセット
+                st.session_state.suggestions_B = {} 
+                st.session_state.selected_tasks_B = set()
+                st.session_state.step_b_results = {}
+                st.session_state.step_b_json_output = None
+                st.session_state.suggestions_attempted_B = False
+                
+                st.success(f"ファイル「{uploaded_flagged_file.name}」読込完了 ({len(df)}行)")
+                with st.expander("データプレビュー (先頭5行)", expanded=True):
+                    st.dataframe(df.head())
             
-            # (★) 新しいファイルをアップロードしたら、古い提案と結果をクリア
-            st.session_state.suggestions_B = {}
-            st.session_state.step_b_results = {}
-            st.session_state.step_b_json_output = None
-            
-            st.success(f"ファイル「{uploaded_flagged_file.name}」読込完了 ({len(df)}行)")
-            with st.expander("データプレビュー (先頭5行)"):
-                st.dataframe(df.head())
+            else:
+                if 'df_flagged_B' in st.session_state and not st.session_state.df_flagged_B.empty:
+                    with st.expander("データプレビュー (先頭5行)"):
+                        st.dataframe(st.session_state.df_flagged_B.head())
+                
         except Exception as e:
             logger.error(f"Step B ファイル読込エラー: {e}", exc_info=True)
             st.error(f"ファイル読み込み中にエラー: {e}")
+            st.session_state.df_flagged_B = pd.DataFrame()
+            st.session_state.current_file_id_B = None
             return
     else:
         st.warning("分析を続けるには、Step A で生成したCSVファイルをアップロードしてください。")
+        st.session_state.df_flagged_B = pd.DataFrame()
+        st.session_state.suggestions_B = {}
+        st.session_state.selected_tasks_B = set()
+        st.session_state.step_b_results = {}
+        st.session_state.step_b_json_output = None
+        st.session_state.current_file_id_B = None
+        st.session_state.suggestions_attempted_B = False
         return
 
     df_B = st.session_state.df_flagged_B
     
-    # (★) --- DFの列情報をキャッシュ (Selectbox用) ---
+    # (★) --- 列候補の定義 (L1678) ---
     all_cols = list(df_B.columns)
-    text_cols = ['ANALYSIS_TEXT_COLUMN'] + [col for col in all_cols if 'text' in col.lower() or 'content' in col.lower()]
-    keyword_cols = [col for col in all_cols if col.endswith('キーワード')]
-    date_cols = [col for col in all_cols if col in df_B.select_dtypes(include='datetime64').columns or 'date' in col.lower()]
-    numeric_cols = [col for col in all_cols if pd.api.types.is_numeric_dtype(df_B[col])]
-    engagement_cols = [col for col in numeric_cols if any(c in col.lower() for c in ['いいね', 'like', 'エンゲージメント', 'engagement'])]
+    keyword_cols = find_cols(df_B, ['key', 'keyword', 'キーワード', 'カテゴリ', 'ハッシュタグ', 'location', 'city', 'topic'])
+    all_object_cols = df_B.select_dtypes(include='object').columns.tolist()
+    text_cols = [col for col in all_object_cols if col not in keyword_cols]
+    main_text_col = find_col(df_B, ['ANALYSIS_TEXT_COLUMN'])
+    if main_text_col in text_cols:
+         text_cols.insert(0, text_cols.pop(text_cols.index(main_text_col)))
+    date_cols = [find_col(df_B, ['date', 'time', '日付', '日時'])]
+    date_cols = [c for c in date_cols if c is not None]
+    numeric_cols = df_B.select_dtypes(include=np.number).columns.tolist()
+    engagement_cols = find_engagement_cols(df_B, ['eng', 'like', 'いいね', 'エンゲージメント'])
+    # (★) --- 列定義ここまで ---
 
-    # --- 2. 分析手法の提案と一括実行 --- (★) タイトル変更
-    st.header("Step 2: 分析手法の提案と一括実行")
+    # --- 2. 分析手法の提案 ---
+    st.header("Step 2: 分析手法の提案")
     st.markdown(f"（(★) AI提案モデル: `{MODEL_FLASH_LITE}`）")
     
     analysis_prompt_B = st.text_area(
         "（任意）AIに追加で指示したい分析タスクを入力:",
-        placeholder="例: 広島市と観光地の相関関係を深掘りしたい。\n例: ポジティブな意見とネガティブな意見の具体例を3つずつ抽出して。",
+        placeholder="例: 広島市と観光地の相関関係を深掘りしたい。",
         key="step_b_prompt"
     )
 
     if st.button("💡 分析手法を提案させる (Step 2)", key="suggest_button_B", type="primary"):
+        st.session_state.suggestions_attempted_B = True
+        
         if not st.session_state.tips_list:
             with st.spinner("分析TIPSをAIで生成中..."):
                 st.session_state.tips_list = get_analysis_tips_list_from_ai()
-                if st.session_state.tips_list:
-                    st.session_state.current_tip_index = random.randint(0, len(st.session_state.tips_list) - 1)
-                    st.session_state.last_tip_time = time.time()
+                st.session_state.current_tip_index = random.randint(0, len(st.session_state.tips_list) - 1) if st.session_state.tips_list else 0
+                st.session_state.last_tip_time = time.time()
             
         with st.spinner(f"データ構造と指示内容を分析し、手法を提案中 ({MODEL_FLASH_LITE})..."):
-            st.session_state.step_b_results = {} # (★) 提案のたびに結果をリセット
-            st.session_state.step_b_json_output = None # (★) 出力もリセット
+            st.session_state.step_b_results = {}
+            st.session_state.step_b_json_output = None
             
-            # (★) 堅牢化された関数 (上記 1. で修正) が呼ばれる
             base_suggestions = suggest_analysis_techniques_py(df_B)
             ai_suggestions = []
             if analysis_prompt_B.strip():
@@ -2325,74 +2620,116 @@ def render_step_b():
             filtered_ai_suggestions = [s for s in ai_suggestions if s['name'] not in base_names]
             all_suggestions = sorted(base_suggestions + filtered_ai_suggestions, key=lambda x: x['priority'])
             
-            # (★) --- BEGIN FIX (Loop Prevention) ---
             if not all_suggestions:
-                # (★) 提案が0件だった場合の処理
                 st.session_state.suggestions_B = {}
-                st.warning(
-                    "分析手法の提案が 0件 でした。\n"
-                    "アップロードしたCSVファイルに、分析可能な列（`...キーワード`で終わる列や、`ANALYSIS_TEXT_COLUMN`など）が"
-                    "正しく含まれているか確認してください。"
-                )
-                # (★) st.rerun() を *しない* で、このままスクリプトを続行させる
+                st.session_state.selected_tasks_B = set()
             else:
-                # (★) 提案が1件以上あった場合の処理
                 st.session_state.suggestions_B = {s['name']: s for s in all_suggestions}
-                st.success(f"分析手法の提案が完了しました ({len(all_suggestions)}件)。Step 2.5 で一括実行してください。")
-                st.rerun()
-
-    # (★) --- NEW Step 2.5: Bulk Execution ---
-    # (★) 提案 (suggestions_B) が存在する場合にのみ表示
-    if st.session_state.suggestions_B:
-        st.markdown("---")
-        st.info("以下のボタンで、提案されたすべての分析をデフォルトパラメータで一括実行できます。")
-        
-        if st.button("🏃 全分析をデフォルトで一括実行 (Step 2.5)", type="primary", use_container_width=True):
-            st.session_state.progress_text = "一括実行を開始します..."
-            total_tasks = len(st.session_state.suggestions_B)
-            progress_bar = st.progress(0.0, text="一括実行 待機中...")
+                # (★) 提案されたら、デフォルトですべて選択状態にする
+                st.session_state.selected_tasks_B = set(st.session_state.suggestions_B.keys())
+                st.success(f"分析手法の提案が完了しました ({len(all_suggestions)}件)。Step 3 で実行するタスクを選択してください。")
             
-            # (★) Tips表示
-            tip_placeholder_b_bulk = st.empty()
-            if st.session_state.tips_list:
-                try:
-                    current_tip = st.session_state.tips_list[st.session_state.current_tip_index]
-                    tip_placeholder_b_bulk.info(f"💡 データ分析TIPS: {current_tip}")
-                except IndexError:
-                    st.session_state.current_tip_index = 0
-            
-            with st.spinner(f"全 {total_tasks} 件の分析を一括実行中..."):
-                for i, (task_name, suggestion_details) in enumerate(st.session_state.suggestions_B.items()):
-                    st.session_state.progress_text = f"({i+1}/{total_tasks}) 「{task_name}」を実行中..."
-                    progress_bar.progress((i+1)/total_tasks, text=f"実行中: {task_name}")
-                    
-                    try:
-                        result_data = execute_analysis(task_name, df_B, suggestion_details)
-                        st.session_state.step_b_results[task_name] = result_data
-                    except Exception as e:
-                        logger.error(f"一括実行エラー ({task_name}): {e}", exc_info=True)
-                        st.session_state.step_b_results[task_name] = {
-                            "data": f"一括実行中にエラーが発生しました: {e}",
-                            "image_base64": None,
-                            "summary": f"エラー: {e}"
-                        }
-                
-                st.session_state.progress_text = "全分析の一括実行が完了しました。"
-                progress_bar.progress(1.0, text="一括実行 完了")
-                tip_placeholder_b_bulk.empty()
-                st.success("全分析の一括実行が完了しました。Step 3 で結果を確認してください。")
-                st.rerun() # (★) プレビューを更新するためにリラン
+            st.rerun()
 
-
-    # --- 3. 分析のプレビューとパラメータ修正 ---
-    if not st.session_state.suggestions_B:
+    # --- 3. (★) 実行タスクの選択（チェックボックス） ---
+    if not st.session_state.suggestions_attempted_B:
         st.info("Step 2 で「分析手法を提案させる」ボタンを押してください。")
         return
-
-    st.header("Step 3: 分析のプレビューとパラメータ修正")
-    st.info("各分析項目の「▼」を開き、プレビューを確認してください。パラメータ（分析対象の列など）を修正して、個別に「再実行/更新」も可能です。")
     
-    # (★) Tips表示
+    if st.session_state.suggestions_attempted_B and not st.session_state.suggestions_B:
+        st.warning(
+            "分析手法の提案が 0件 でした。\n"
+            "アップロードしたCSVファイルに、分析可能な列（`...キーワード`で終わる列や、`ANALYSIS_TEXT_COLUMN`など）が"
+            "正しく含まれているか確認してください。"
+        )
+        return
+
+    st.markdown("---")
+    st.header("Step 3: 実行する分析タスクの選択")
+    st.info("一括実行したい分析タスクを選択してください。")
+
+    selected_tasks = set()
+    cols = st.columns(3)
+    i = 0
+    # (★) suggestions_B を priority でソートして表示
+    sorted_suggestions = sorted(st.session_state.suggestions_B.items(), key=lambda item: item[1].get('priority', 99))
+    
+    for task_name, details in sorted_suggestions:
+        with cols[i % 3]:
+            is_checked = st.checkbox(
+                task_name,
+                value=(task_name in st.session_state.selected_tasks_B), # (★) セッションステートと連動
+                key=f"cb_{task_name}",
+                help=details.get('description', '')
+            )
+            if is_checked:
+                selected_tasks.add(task_name)
+        i += 1
+    
+    # (★) ユーザーの選択をセッションステートに即時反映
+    st.session_state.selected_tasks_B = selected_tasks
+
+    # --- 4. (★) 選択項目の一括実行 ---
+    if st.button(f"🏃 選択した {len(st.session_state.selected_tasks_B)} 件の分析を実行 (Step 4)", type="primary", use_container_width=True):
+        st.session_state.progress_text = "選択項目の実行を開始します..."
+        
+        # (★) 実行前に、*選択されなかった* 分析の結果をクリアする
+        tasks_to_run = st.session_state.selected_tasks_B
+        cleared_results_count = 0
+        for task_name in list(st.session_state.step_b_results.keys()):
+            if task_name not in tasks_to_run:
+                del st.session_state.step_b_results[task_name]
+                cleared_results_count += 1
+        if cleared_results_count > 0:
+            logger.info(f"選択解除された {cleared_results_count} 件の古い結果をクリアしました。")
+        
+        total_tasks = len(tasks_to_run)
+        if total_tasks == 0:
+            st.warning("実行するタスクが選択されていません。")
+            st.rerun()
+
+        progress_bar = st.progress(0.0, text="一括実行 待機中...")
+        tip_placeholder_b_bulk = st.empty()
+        
+        with st.spinner(f"全 {total_tasks} 件の分析を実行中..."):
+            i = 0
+            for task_name in tasks_to_run:
+                if task_name not in st.session_state.suggestions_B:
+                    continue
+                
+                suggestion_details = st.session_state.suggestions_B[task_name]
+                i += 1
+                st.session_state.progress_text = f"({i}/{total_tasks}) 「{task_name}」を実行中..."
+                progress_bar.progress(i / total_tasks, text=f"実行中: {task_name}")
+                
+                try:
+                    result_data = execute_analysis(task_name, df_B, suggestion_details)
+                    st.session_state.step_b_results[task_name] = result_data
+                except Exception as e:
+                    logger.error(f"一括実行エラー ({task_name}): {e}", exc_info=True)
+                    st.session_state.step_b_results[task_name] = {
+                        "data": f"一括実行中にエラーが発生しました: {e}",
+                        "image_base64": None,
+                        "summary": f"エラー: {e}"
+                    }
+            
+            st.session_state.progress_text = "全分析の実行が完了しました。"
+            progress_bar.progress(1.0, text="実行 完了")
+            tip_placeholder_b_bulk.empty()
+            st.success("選択された分析の実行が完了しました。Step 5 で結果を確認してください。")
+            st.rerun()
+
+
+    # --- 5. (★) 分析のプレビューとパラメータ修正 ---
+    st.markdown("---")
+    st.header("Step 5: 分析のプレビューとパラメータ修正")
+    
+    if not st.session_state.step_b_results:
+        st.info("Step 4 で分析を実行すると、ここにプレビューが表示されます。")
+        return
+    
+    st.info("各分析項目の「▼」を開き、プレビューを確認してください。パラメータを修正して、個別に「再実行/更新」も可能です。")
+    
     tip_placeholder = st.empty()
     if st.session_state.tips_list:
         try:
@@ -2406,143 +2743,300 @@ def render_step_b():
     if st.session_state.progress_text:
          progress_text_placeholder.info(st.session_state.progress_text)
          
-    # (★) 提案されたタスクをループ処理
-    for task_name, suggestion_details_from_session in st.session_state.suggestions_B.items():
-        
-        # (★) 状態がリセットされないよう、セッションの辞書を直接操作せず、
-        # (★) 描画ループ用のローカルコピーを作成する
-        suggestion_details = suggestion_details_from_session.copy()
+    # (★) 修正: 提案 (suggestions_B) ではなく、*実行された結果* (step_b_results) をループする
+    # (★) ただし、パラメータ編集のために元の suggestion も必要なので、
+    # (★) 実行済みのタスク名 (step_b_results.keys()) でループし、
+    # (★) 元の提案 (suggestions_B) を参照する。
+    
+    # (★) 実行済みのタスクを、提案時の優先度順にソートして表示
+    sorted_executed_tasks = sorted(
+        st.session_state.step_b_results.keys(),
+        key=lambda task_name: st.session_state.suggestions_B.get(task_name, {}).get('priority', 99)
+    )
+
+    for task_name in sorted_executed_tasks:
+        if task_name not in st.session_state.suggestions_B:
+            continue # (ありえないはずだが念のため)
+            
+        # (★) 元の提案 (編集UI用) と、今回の結果 (プレビュー用) を取得
+        suggestion_details = st.session_state.suggestions_B[task_name].copy()
+        result = st.session_state.step_b_results[task_name]
         
         st.markdown("---")
         
-        # (★) 各タスクのプレビューエリア (Expander の *外*)
-        # (★) 実行結果がセッションにあれば表示
-        if task_name in st.session_state.step_b_results:
-            result = st.session_state.step_b_results[task_name]
-            st.subheader(f"✅ プレビュー: {task_name}")
-            
-            # (★) [object Object] 対策: TOP5の辞書リストを正しく表示
-            if task_name == "話題カテゴリ別 エンゲージメントTOP5と概要" and isinstance(result['data'], pd.DataFrame):
-                st.dataframe(result['data'])
-                for _, row in result['data'].iterrows():
-                    st.markdown(f"**カテゴリ: {row['category']}** (投稿数: {row['post_count']})")
-                    if row['top_posts']:
-                         for post in row['top_posts']:
-                             st.markdown(f"  - **EG: {post['engagement']}** - {post['summary_ai']}")
-                             if post['media_link']:
-                                 st.markdown(f"    [Link]({post['media_link']})")
-                    st.markdown("---")
-            
-            # (★) その他のプレビュー
-            elif result['image_base64']:
-                st.image(base64.b64decode(result['image_base64']))
-            
-            if isinstance(result['data'], pd.DataFrame) and task_name != "話題カテゴリ別 エンゲージメントTOP5と概要":
-                st.dataframe(result['data'].head(10))
-            elif isinstance(result['data'], dict):
-                st.json(result['data'])
-            elif isinstance(result['data'], str):
-                st.markdown(result['data'])
-                
-            st.caption(f"サマリ: {result.get('summary', 'N/A')}")
-        else:
-            st.subheader(f"⬜️ 未実行: {task_name}")
-
+        # (★) プレビュー表示 (L1796〜)
+        st.subheader(f"✅ プレビュー: {task_name}")
         
-        # (★) 各タスクの編集・実行エリア
+        if task_name == "共起ネットワーク" and result.get("html_content"):
+            components.html(result.get("html_content"), height=710)
+            ai_legend_map = result.get("ai_legend")
+            communities_map = result.get("communities")
+            
+            if ai_legend_map:
+                st.markdown("##### AIによる推定トピック:")
+                legend_items = []
+                for group_id, topic in ai_legend_map.items():
+                    color = COLOR_PALETTE[group_id % len(COLOR_PALETTE)]
+                    legend_html = f"""
+                    <span style="display: inline-block; margin: 4px; padding: 8px 12px; border-radius: 8px; background-color: #f0f2f6; border: 1px solid #e0e0e0;">
+                        <span style='color:{color}; font-size: 20px; font-weight: bold; vertical-align: middle;'>■</span>
+                        <span style="vertical-align: middle; margin-left: 8px; font-size: 14px;">{topic} (G{group_id})</span>
+                    </span>
+                    """
+                    legend_items.append(legend_html.replace("\n", ""))
+                st.markdown("<div style='line-height: 1.8;'>" + " ".join(legend_items) + "</div>", unsafe_allow_html=True)
+            
+            elif communities_map:
+                st.markdown("##### 検出されたコミュニティ (色分け):")
+                legend_items = []
+                for group_id in communities_map.keys():
+                    color = COLOR_PALETTE[group_id % len(COLOR_PALETTE)]
+                    legend_html = f"""
+                    <span style="display: inline-block; margin: 4px; padding: 8px 12px; border-radius: 8px; background-color: #f0f2f6; border: 1px solid #e0e0e0;">
+                        <span style='color:{color}; font-size: 20px; font-weight: bold; vertical-align: middle;'>■</span>
+                        <span style="vertical-align: middle; margin-left: 8px; font-size: 14px;">グループ {group_id}</span>
+                    </span>
+                    """
+                    legend_items.append(legend_html.replace("\n", ""))
+                st.markdown("<div style='line-height: 1.8;'>" + " ".join(legend_items) + "</div>", unsafe_allow_html=True)
+
+        elif task_name == "話題カテゴリ別 エンゲージメントTOP5と概要" and isinstance(result['data'], pd.DataFrame):
+            st.dataframe(result['data'])
+            for _, row in result['data'].iterrows():
+                st.markdown(f"**カテゴリ: {row['category']}** (投稿数: {row['post_count']})")
+                if row['top_posts']:
+                     for post in row['top_posts']:
+                         st.markdown(f"  - **EG: {post['engagement']}** - {post['summary_ai']}")
+                         if post['media_link']:
+                             st.markdown(f"    [Link]({post['media_link']})")
+                st.markdown("---")
+        
+        elif result.get('image_base64'):
+            st.image(base64.b64decode(result['image_base64']))
+        
+        if isinstance(result['data'], pd.DataFrame) and task_name != "話題カテゴリ別 エンゲージメントTOP5と概要":
+            st.dataframe(result['data'].head(10))
+        elif isinstance(result['data'], dict):
+            st.json(result['data'])
+        elif isinstance(result['data'], str) and task_name != "共起ネットワーク":
+            st.markdown(result['data'])
+            
+        st.caption(f"サマリ: {result.get('summary', 'N/A')}")
+
+        # (★) 個別実行エリア (L1813〜)
         with st.expander(f"「{task_name}」のパラメータ修正・再実行"):
             
             st.markdown(f"**説明:** {suggestion_details['description']}")
             st.markdown("##### (オプション) パラメータの変更")
             
-            # (★) タスクごとに編集UIを動的に生成
+            # (★) --- 修正: ネストエラーを修正 (L1815) ---
             try:
-                # (★) 3. 単純集計
-                if task_name.startswith("単純集計:"):
+                # 1. 共起ネットワーク
+                if task_name == "共起ネットワーク":
+                    
+                    # --- 1. 絞り込み列 ---
+                    flag_col_options = [col for col in keyword_cols if col in df_B.columns]
+                    default_flag_col = suggestion_details.get('flag_col', '市区町村キーワード')
+                    if default_flag_col not in flag_col_options and flag_col_options:
+                        default_flag_col = flag_col_options[0]
+                    
+                    flag_col = st.selectbox(
+                        "1. 絞り込みに使用する列:", flag_col_options,
+                        index=flag_col_options.index(default_flag_col) if default_flag_col in flag_col_options else 0,
+                        key=f"cn_filter_col_{task_name}", # (★) 重複キー回避
+                        help="ここで選んだ列のキーワードで、分析対象の投稿を絞り込みます。"
+                    )
+                    suggestion_details['flag_col'] = flag_col
+
+                    # --- 2. 絞り込みキーワード ---
+                    try:
+                        s = df_B[flag_col].dropna().astype(str).str.split(',').explode().str.strip()
+                        s = s[~s.isin(['', 'nan', 'Nan', 'NaN'])]
+                        keyword_counts = s.value_counts()
+                        options = keyword_counts.index.tolist()[:50]
+                        default_options_kws = suggestion_details.get('selected_keywords', keyword_counts.index.tolist()[:10])
+                    except Exception:
+                        options = []
+                        default_options_kws = suggestion_details.get('selected_keywords', [])
+
+                    selected_keywords = st.multiselect(
+                        f"2. 絞り込むキーワード（「{flag_col}」列 Top 50）:",
+                        options,
+                        default=default_options_kws,
+                        key=f"cn_selected_keywords_{flag_col}",
+                        help="分析対象とする投稿に含まれるキーワードを選択します。"
+                    )
+                    suggestion_details['selected_keywords'] = selected_keywords
+                    
+                    # --- 3. テキスト列 ---
+                    default_text_col = suggestion_details.get('text_col', 'ANALYSIS_TEXT_COLUMN')
+                    if not text_cols:
+                         st.warning("分析対象のテキスト列 (ANALYSIS_TEXT_COLUMN) が見つかりません。")
+                         text_col = None
+                    else:
+                        text_col = st.selectbox(
+                            "3. 分析対象の自由記述列:", text_cols,
+                            index=text_cols.index(default_text_col) if default_text_col in text_cols else 0,
+                            key=f"cn_text_col_{task_name}" # (★) 重複キー回避
+                        )
+                    suggestion_details['text_col'] = text_col
+                    
+                    st.markdown("---")
+                    st.markdown("**グラフ詳細設定**")
+                    ui_cols = st.columns([0.5, 0.5])
+                    
+                    with ui_cols[0]:
+                        # --- 4. レイアウト ---
+                        st.markdown("**レイアウト・物理演算**")
+                        solver = st.selectbox(
+                            "レイアウト (layout)", ['barnesHut', 'fruchterman_reingold', 'repulsion'],
+                            index=['barnesHut', 'fruchterman_reingold', 'repulsion'].index(suggestion_details.get('solver', 'barnesHut')),
+                            key=f"cn_solver_{task_name}" # (★) 重複キー回避
+                        )
+                        suggestion_details['solver'] = solver
+                        
+                        gravity = st.slider(
+                            "重力 (Gravity)", -50000, -1000, suggestion_details.get('gravity', -2000), step=1000,
+                            key=f"cn_gravity_{task_name}" # (★) 重複キー回避
+                        )
+                        suggestion_details['gravity'] = gravity
+                        
+                        node_distance = st.slider(
+                            "ノード間の反発力", 100, 500, suggestion_details.get('node_distance', 200),
+                            key=f"cn_distance_{task_name}" # (★) 重複キー回避
+                        )
+                        suggestion_details['node_distance'] = node_distance
+                        
+                        spring_length = st.slider(
+                            "エッジの長さ", 50, 500, suggestion_details.get('spring_length', 250),
+                            key=f"cn_spring_{task_name}" # (★) 重複キー回避
+                        )
+                        suggestion_details['spring_length'] = spring_length
+
+                    with ui_cols[1]:
+                        # --- 5. フィルタ ---
+                        st.markdown("**フィルタ設定**")
+                        top_n_words_limit = st.slider(
+                            "分析対象の単語数 (Top N)", 50, 300, suggestion_details.get('top_n_words_limit', 100),
+                            key=f"cn_top_n_{task_name}" # (★) 重複キー回避
+                        )
+                        suggestion_details['top_n_words_limit'] = top_n_words_limit
+                        
+                        max_degree_cutoff = st.slider(
+                            "最大接続数 (Exclude Hubs)", 10, 100, suggestion_details.get('max_degree_cutoff', 50),
+                            key=f"cn_max_degree_{task_name}" # (★) 重複キー回避
+                        )
+                        suggestion_details['max_degree_cutoff'] = max_degree_cutoff
+                        
+                        min_occurrence = st.slider(
+                            "最小共起回数 (Min Freq)", 1, 30, suggestion_details.get('min_occurrence', 10),
+                            key=f"cn_slider_v3_{task_name}" # (★) 重複キー回避
+                        )
+                        suggestion_details['min_occurrence'] = min_occurrence
+                        
+                        # --- 6. デザイン ---
+                        st.markdown("**デザイン設定**")
+                        default_node_size = st.slider(
+                            "基準ノードサイズ", 5, 50, suggestion_details.get('default_node_size', 15),
+                            key=f"cn_node_size_v2_{task_name}" # (★) 重複キー回避
+                        )
+                        suggestion_details['default_node_size'] = default_node_size
+                        
+                        default_text_size = st.slider(
+                            "テキストサイズ", 10, 100, suggestion_details.get('default_text_size', 50),
+                            key=f"cn_text_size_v2_{task_name}" # (★) 重複キー回避
+                        )
+                        suggestion_details['default_text_size'] = default_text_size
+                    
+                    # --- 7. AI凡例 ---
+                    st.markdown("---")
+                    run_ai_legend = st.checkbox(
+                        "🤖 AIで凡例を生成 (β) (実行に時間がかかります)",
+                        value=suggestion_details.get('run_ai_legend', False),
+                        key=f"cn_run_ai_legend_{task_name}" # (★) 重複キー回避
+                    )
+                    suggestion_details['run_ai_legend'] = run_ai_legend
+
+                # 2. 単純集計
+                elif task_name.startswith("単純集計:"):
                     default_col = suggestion_details['suitable_cols'][0]
                     new_col = st.selectbox(f"集計対象の列 ({task_name})", options=keyword_cols, index=keyword_cols.index(default_col) if default_col in keyword_cols else 0, key=f"sel_{task_name}")
-                    suggestion_details['suitable_cols'] = [new_col] # (★) ローカルコピーを更新
+                    suggestion_details['suitable_cols'] = [new_col]
                 
-                # (★) クロス集計
+                # 3. クロス集計
                 elif task_name.startswith("クロス集計"):
                     default_col1 = suggestion_details['suitable_cols'][0]
                     default_col2 = suggestion_details['suitable_cols'][1]
                     c1, c2 = st.columns(2)
                     new_col1 = c1.selectbox(f"列 1 ({task_name})", options=all_cols, index=all_cols.index(default_col1) if default_col1 in all_cols else 0, key=f"sel_{task_name}_1")
                     new_col2 = c2.selectbox(f"列 2 ({task_name})", options=all_cols, index=all_cols.index(default_col2) if default_col2 in all_cols else 1, key=f"sel_{task_name}_2")
-                    suggestion_details['suitable_cols'] = [new_col1, new_col2] # (★) ローカルコピーを更新
+                    suggestion_details['suitable_cols'] = [new_col1, new_col2]
 
-                # (★) 時系列
+                # 4. 時系列
                 elif task_name == "時系列キーワード分析":
                     default_dt = suggestion_details['suitable_cols']['datetime'][0]
                     default_kw = suggestion_details['suitable_cols']['keywords'][0]
                     c1, c2 = st.columns(2)
                     new_dt = c1.selectbox(f"日時列 ({task_name})", options=date_cols, index=date_cols.index(default_dt) if default_dt in date_cols else 0, key=f"sel_{task_name}_dt")
                     new_kw = c2.selectbox(f"キーワード列 ({task_name})", options=keyword_cols, index=keyword_cols.index(default_kw) if default_kw in keyword_cols else 0, key=f"sel_{task_name}_kw")
-                    suggestion_details['suitable_cols'] = {"datetime": [new_dt], "keywords": [new_kw]} # (★) ローカルコピーを更新
+                    suggestion_details['suitable_cols'] = {"datetime": [new_dt], "keywords": [new_kw]}
                 
-                # (★) テキストマイニング / 共起ネットワーク
-                elif task_name in ["テキストマイニング（頻出単語）", "共起ネットワーク"]:
+                # 5. テキストマイニング
+                elif task_name in ["テキストマイニング（頻出単語）"]:
                     default_col = suggestion_details['suitable_cols'][0]
-                    new_col = st.selectbox(f"テキスト列 ({task_name})", options=text_cols, index=text_cols.index(default_col) if default_col in text_cols else 0, key=f"sel_{task_name}_txt")
-                    suggestion_details['suitable_cols'] = [new_col] # (★) ローカルコピーを更新
+                    if not text_cols:
+                         st.warning("分析対象のテキスト列 (ANALYSIS_TEXT_COLUMN) が見つかりません。")
+                         new_col = None
+                    else:
+                        new_col = st.selectbox(f"テキスト列 ({task_name})", options=text_cols, index=text_cols.index(default_col) if default_col in text_cols else 0, key=f"sel_{task_name}_txt")
+                    suggestion_details['suitable_cols'] = [new_col]
                 
-                # (★) 5. エンゲージメントTOP5
+                # 6. エンゲージメントTOP5
                 elif task_name == "話題カテゴリ別 エンゲージメントTOP5と概要":
                     defaults = suggestion_details['suitable_cols']
                     c1, c2 = st.columns(2)
                     new_topic = c1.selectbox(f"話題カテゴリ列 ({task_name})", options=keyword_cols, index=keyword_cols.index(defaults['topic'][0]) if defaults['topic'][0] in keyword_cols else 0, key=f"sel_{task_name}_top")
                     new_eng = c2.selectbox(f"エンゲージメント列 ({task_name})", options=engagement_cols, index=engagement_cols.index(defaults['engagement'][0]) if defaults['engagement'][0] in engagement_cols else 0, key=f"sel_{task_name}_eng")
-                    # (★) text_col は変更しない
-                    suggestion_details['suitable_cols'] = {'topic': [new_topic], 'text': defaults['text'], 'engagement': [new_eng]} # (★) ローカルコピーを更新
+                    suggestion_details['suitable_cols'] = {'topic': [new_topic], 'text': defaults['text'], 'engagement': [new_eng]}
 
             except Exception as e:
                 st.error(f"パラメータUIの描画に失敗: {e}")
                 logger.error(f"パラメータUI描画エラー ({task_name}): {e}", exc_info=True)
 
-
             # (★) 個別実行ボタン
-            if st.button(f"「{task_name}」を再実行/更新", key=f"run_{task_name}"): # (★) 文言変更
+            if st.button(f"「{task_name}」を再実行/更新", key=f"run_{task_name}"):
                 st.session_state.progress_text = f"「{task_name}」を個別に実行中..."
                 with st.spinner(f"「{task_name}」を実行中..."):
                     try:
-                        # (★) 編集されたローカルコピー (suggestion_details) を渡す
                         result_data = execute_analysis(task_name, df_B, suggestion_details)
-                        # (★) 実行結果をセッションステートに保存
                         st.session_state.step_b_results[task_name] = result_data
-                        
-                        # (★) !!! 重要: 修正したパラメータをセッションステートに書き戻す !!!
                         st.session_state.suggestions_B[task_name] = suggestion_details
-                        
                         st.session_state.progress_text = f"「{task_name}」の実行が完了しました。"
-                        st.rerun() # (★) UIを即時更新してプレビューを表示
+                        st.rerun()
                     except Exception as e:
                          st.error(f"分析実行エラー: {e}")
                          logger.error(f"個別実行エラー ({task_name}): {e}", exc_info=True)
                          st.session_state.progress_text = f"「{task_name}」の実行に失敗しました。"
 
 
-    # (★) --- 4. (NEW) 最終エクスポート ---
+    # --- 6. (★) 最終エクスポート ---
     st.markdown("---")
-    st.header("Step 4: 最終JSONのエクスポート")
+    st.header("Step 6: 最終JSONのエクスポート")
     
-    # (★) 実行状況のサマリー
-    total_suggestions = len(st.session_state.suggestions_B)
     total_results = len(st.session_state.step_b_results)
     
-    if total_results < total_suggestions:
-        st.warning(f"まだすべての分析が実行されていません ({total_results} / {total_suggestions} 件)。(Step 2.5 の一括実行を推奨します)")
+    if total_results == 0:
+        st.warning("Step 4 で分析を実行してください。")
     else:
-        st.success(f"すべての分析 ({total_results} / {total_suggestions} 件) が実行されました。JSONを生成できます。")
+        st.success(f"現在 {total_results} 件の分析結果がプレビューされています。")
 
     
-    if st.button("StepC用 JSONを生成・エクスポート (Step 4)", type="primary", use_container_width=True):
+    if st.button("StepC用 JSONを生成・エクスポート (Step 6)", type="primary", use_container_width=True):
         if total_results == 0:
-            st.error("分析が1つも実行されていません。Step 3 で各分析を実行してください。")
+            st.error("分析が1つも実行されていません。Step 4 で分析を実行してください。")
         else:
             with st.spinner("最終JSONファイルを生成中..."):
                 try:
-                    # (★) プレビューされた結果 (`step_b_results`) をJSONLに変換
                     json_output_string = convert_results_to_json_string(st.session_state.step_b_results)
                     st.session_state.step_b_json_output = json_output_string
                     st.success("StepC用のJSONデータが生成されました！")
@@ -2550,9 +3044,9 @@ def render_step_b():
                     logger.error(f"Step B 最終JSON出力変換エラー: {e}", exc_info=True)
                     st.error(f"分析結果のJSON変換中にエラー: {e}")
 
-    # (★) --- 5. (NEW) ダウンロードセクション ---
+    # (★) ダウンロードセクション (変更なし)
     if st.session_state.step_b_json_output:
-        st.info(f"以下のJSONファイルには、Step 3 でプレビュー・実行された {len(st.session_state.step_b_results)} 件の分析結果がすべて含まれています。")
+        st.info(f"以下のJSONファイルには、Step 5 でプレビュー・実行された {len(st.session_state.step_b_results)} 件の分析結果がすべて含まれています。")
         
         st.download_button(
             label="分析データ (analysis_data.json) をダウンロード",
@@ -2597,171 +3091,6 @@ def render_step_b():
 # --- 9. (★) Step C: AIレポート生成 (Proモデル) ---
 # (要件: Step Cは gemini-2.5-pro を使用)
 
-def generate_step_c_prompt(jsonl_data_string: str) -> str:
-    """
-    (Step C) アップロードされた Step B の JSONL データを「下読み」し、
-    gemini-2.5-pro への高品質な指示プロンプトを自動生成する。
-    (★) この「下読み」自体は高速な flash-lite モデルを使用する
-    (★) ご要望に基づき、品質向上のためプロンプト生成ロジックを大幅に強化
-    """
-    logger.info("Step C プロンプト自動生成 (Flash Lite) 実行...")
-    
-    llm = get_llm(model_name=MODEL_FLASH_LITE, temperature=0.1)
-    if llm is None:
-        logger.error("generate_step_c_prompt: LLM (Flash Lite) が利用できません。")
-        return "# AIモデル(Flash Lite)が利用できませんでした。"
-
-    # (★) JSONLから分析タスク名（"analysis_task"）を抽出
-    task_names = []
-    summary_data = {}
-    try:
-        for line in jsonl_data_string.splitlines():
-            try:
-                task_data = json.loads(line)
-                task_name = task_data.get("analysis_task")
-                if task_name == "OverallSummary":
-                    summary_data = task_data.get("data", {})
-                    # analysis_summaries からタスクリストを取得 (フォールバック)
-                    if not task_names and "analysis_summaries" in task_data:
-                         task_names = list(task_data.get("analysis_summaries", {}).keys())
-                elif task_name:
-                    task_names.append(task_name)
-            except json.JSONDecodeError:
-                continue
-        
-        task_names_str = ", ".join(list(set(task_names))) # 重複削除
-        if not task_names_str:
-            task_names_str = "（JSONL内の各分析タスク）"
-            
-        summary_context = json.dumps(summary_data, ensure_ascii=False, indent=2)
-        if len(summary_context) > 2000:
-             summary_context = summary_context[:2000] + "\n... (サマリ省略)"
-        
-    except Exception as e:
-        logger.error(f"Step B JSONLのパース (下読み) に失敗: {e}")
-        task_names_str = "（JSONL内の各分析タスク）"
-        summary_context = "{}"
-
-    # (★) --- gemini-2.5-pro への「超」詳細な指示プロンプトを生成 ---
-    # (★) ご要望に基づき、1万文字を超える詳細なレポートを出力させるため、
-    # (★) 出力JSON形式、役割、各タスクの処理方法を厳密に定義します。
-    
-    prompt_template = """
-あなたは、高名なデータアナリスト兼経営コンサルタントです。
-クライアント（例：観光協会、事業会社）に提出するための、高品質な「データ分析レポート」を作成する任務を負っています。
-
-これから、部下がPythonとAI（Flash Lite）で一次分析した結果（グラフ画像Base64、データテーブル、サマリを含むJSONL）が提供されます。
-あなたの仕事は、この一次分析結果を【専門家の視点】で解釈し直し、クライアントの意思決定に資する「インサイト」と「戦略的提言」を含む、詳細かつ構造化されたレポート（JSON形式）を生成することです。
-
-# 0. 全体サマリー（参考）
-分析対象となったデータセットの全体像は以下の通りです。
-{summary_context}
-
-# 1. 実行タスク
-提供される「分析データ（JSONL）」の各行（各分析タスク）を【漏れなく】処理し、以下の「出力JSON形式」に従って、スライド構成案を作成してください。
-
-# 2. 出力JSON形式（厳守）
-出力は、以下のキーを持つ辞書の【リスト（配列）】形式 `[ {{...}}, {{...}} ]` とします。
-JSON以外のテキスト（例：「承知しました」）は【絶対に】含めないでください。
-
-[
-  {{
-    "slide_title": "（スライドのタイトル）",
-    "slide_layout": "（"title_and_content" または "text_and_image" または "title_only"）",
-    "slide_content": [
-      "（このスライドで伝えるべき【インサイト】や【考察】を箇条書きで詳細に記述）",
-      "（データを単純に羅列するのではなく、専門家としての解釈を加えること）",
-      "（必要であれば1スライドあたり1000文字以上の詳細な記述を行うこと）"
-    ],
-    "image_base64": "（"analysis_task" に "image_base64" が存在すれば、そのBase64文字列をここにコピーする。存在しなければ null とする）"
-  }}
-]
-
-# 3. 必須スライド構成（この順番で構成すること）
-
-### A. 導入スライド (3〜4枚)
-1.  **表紙 (layout: "title_only")**: 「SNSデータ分析レポート（仮）」のようなタイトル。
-2.  **エグゼクティブ・サマリー (layout: "title_and_content")**:
-    * `analysis_task: "OverallSummary"` のデータ（特に `total_posts` や `total_engagement`）を参照し、分析の最も重要な発見（KGI/KPI）を3〜5点の箇条書きで要約します。
-    * 【極めて重要】ここでのインサイトは、単なる数字の報告ではなく、「何を意味するのか」を記述してください。
-3.  **分析概要 (layout: "title_and_content")**:
-    * 分析の目的（例：「SNS投稿から観光客の動向と関心事を特定する」）と、分析対象データ（例：「Instagram投稿 XXX件」）を記述します。
-4.  **アジェンダ (layout: "title_and_content")**:
-    * この後のレポートの目次（例：「1. 全体傾向」「2. 主要カテゴリ分析」「3. 戦略的提言」）を記述します。
-
-### B. 詳細分析スライド (JSONLの各タスクごとに1枚以上)
-`analysis_task` が "OverallSummary" 以外の各タスク（例： {task_names}）について、以下の指示に従ってスライドを生成します。
-
-5.  **タスク名: `run_simple_count` / `run_text_mining` / `run_topic_category_summary` (グラフがあるタスク)**
-    * `slide_layout`: "text_and_image"
-    * `slide_title`: JSONLの `analysis_task` 名（例：「頻出単語分析」）を、分かりやすい日本語タイトル（例：「主要な頻出キーワードの分析」）に翻訳・修正して記載します。
-    * `image_base64`: JSONLの `image_base64` を【必ずコピー】します。
-    * `slide_content`:
-        * 【最重要】グラフ（`image_base64`）とデータ（`data`）を詳細に分析し、クライアントが理解すべき【インサイト（発見）】を3〜5点以上の詳細な箇条書きで記述します。
-        * （悪い例：「グラフの通り、Aが1位でした。」）
-        * （良い例：「分析の結果、Aが圧倒的多数を占めており、これはユーザーの関心がAに集中していることを示唆しています。特に2位のBとの差は...」）
-        * `data`（JSON配列）から、上位3位までの具体的な数値や項目名を引用し、考察に厚みを持たせてください。
-
-6.  **タスク名: `run_cooccurrence_network` (共起ネットワーク)**
-    * `slide_layout`: "text_and_image"
-    * `slide_title`: 「共起ネットワーク分析：話題の関連性」
-    * `image_base64`: JSONLの `image_base64` を【必ずコピー】します。
-    * `slide_content`:
-        * ネットワーク図（`image_base64`）を解釈し、どの単語が中心にあるか（中心性）、どの単語同士が強く結びついているか（コミュニティ）を指摘します。
-        * （例：「『A』と『B』、また『C』と『D』のグループが形成されており、これは...という2つの異なる文脈で語られていることを示します。」）
-        * `data`（エッジリスト）から、`weight`（重み）が特に高い組み合わせを具体的に引用してください。
-
-7.  **タスク名: `run_crosstab` / `run_topic_engagement_top5` (グラフがないタスク)**
-    * `slide_layout`: "title_and_content"
-    * `slide_title`: タスク名を分かりやすい日本語タイトル（例：「カテゴリ別 エンゲージメントTOP5」）に修正して記載します。
-    * `image_base64`: null
-    * `slide_content`:
-        * `data`（JSON配列）の分析結果から、特筆すべきパターン、相関、または具体例（例：エンゲージメントが最も高かった投稿のAI要約）を引用し、詳細なインサイトを記述します。
-
-8.  **タスク名: `run_ai_summary_batch` (AIによる自由分析)**
-    * `slide_layout`: "title_and_content"
-    * `slide_title`: AIが実行したタスク名（例：「ポジティブな意見の具体例」）
-    * `image_base64`: null
-    * `slide_content`:
-        * AIの回答（`data`フィールドの文字列）を、クライアント向けに分かりやすく箇条書きで再構成し、提示します。
-
-### C. 結論スライド (2枚)
-9.  **結論 (layout: "title_and_content")**:
-    * 全ての詳細分析（スライドB群）から導き出される【全体的な結論】を、強固な根拠（分析データへの言及）とともに要約します。
-    * （例：「SNS分析の結果、強みは『X』であり、課題は『Y』であることが明らかになった。」）
-
-10. **戦略的提言 (layout: "title_and_content")**:
-    * 【最重要】あなたが経営コンサルタントとして、この分析結果に基づき、クライアントが次に取るべき【具体的なアクション（施策）】を3〜5点、提案してください。
-    * （例：「1. 強みである『X』をさらに伸ばすため、...なキャンペーンを推奨する。」）
-    * （例：「2. 課題である『Y』を克服するため、...なターゲット層へのアプローチを強化する。」）
-
-# 4. 最終確認
-* **情報量**: レポート全体で1万文字を超えるような、詳細で充実した内容を期待します。`slide_content` の各項目は、単語ではなく、完全な「文章」または「詳細な箇条書き」にしてください。
-* **厳格な形式**: 出力は `[` で始まり `]` で終わる、JSON配列形式のみとします。
-
-この指示に従い、最高の分析レポート（JSON）を作成してください。
-"""
-
-    prompt = PromptTemplate.from_template(prompt_template)
-    
-    try:
-        # (★) Flash Lite に Pro への指示書を生成させる
-        generated_prompt = prompt.invoke({
-            "summary_context": summary_context,
-            "task_names": task_names_str
-        })
-        
-        logger.info("Step C プロンプト自動生成 完了。")
-        return generated_prompt
-
-    except Exception as e:
-        logger.error(f"generate_step_c_prompt error: {e}", exc_info=True)
-        # (★) --- フォールバック用の最小限のプロンプト ---
-        return f"# (★) プロンプト自動生成失敗: {e}\n\n# 指示:\nあなたは優秀な経営コンサルタントです。提供される「分析データ（JSONL）」を読み、以下のJSON形式でPowerPoint用の分析レポートを作成してください。\n\n[ {{ \"slide_title\": \"...\", \"slide_layout\": \"title_and_content\", \"slide_content\": [\"...\", \"...\"], \"image_base64\": null }} ]"
-
-# --- 9. (★) Step C: AIレポート生成 (ハイブリッド処理) ---
-# (★) 廃止: generate_step_c_prompt() は不要になりました。
-
 def run_step_c_analysis(
     jsonl_data_string: str,
     model_name: str,
@@ -2790,8 +3119,7 @@ def run_step_c_analysis(
     
     logger.info(f"モデル: {model_name}, RPM: {rpm_limit}, 待機: {sleep_time:.1f}秒")
 
-    # (★) --- 2. チャンク生成用のAIプロンプトテンプレートを定義 ---
-    # (★) 修正: AIは「画像(image_base64)」を見ない前提のプロンプトに変更
+    # (★) --- 2. チャンク生成用のAIプロンプトテンプレートを定義 (品質向上) ---
     ITERATIVE_SLIDE_PROMPT_TEMPLATE = """
     あなたはシニアデータアナリストであり、クライアント向けレポートの「スライド1枚」の
     【テキスト部分】を作成しています。
@@ -2803,8 +3131,14 @@ def run_step_c_analysis(
 
     # 指示:
     1.  **タイトル**: `task_data_text_only` の `analysis_task` 名に基づき、 professional な「slide_title」を考案してください。
-    2.  **考察 (最重要)**: `task_data_text_only` の `summary` と `data`（テーブルデータ）を解釈し、クライアントが知るべき【インサイト（発見）】を「slide_content」として2〜4点の詳細な箇条書き（文字列リスト）で記述してください。
+    
+    2.  **考察 (最重要)**: `task_data_text_only` の `summary` と `data`（テーブルデータ）を解釈し、クライアントが知るべき【インサイト（発見）】を「slide_content」として2〜4点の詳細な箇条書きで記述してください。
         (注: あなたにはグラフ画像は提供されていません。`data` の数値や `summary` のテキストのみを根拠に考察を記述してください。)
+
+    3.  **(★) 品質向上のための書式設定**:
+        - 回答は【Markdown形式】を使用してください。
+        - 考察の中の重要なキーワードや数値は、`**太字**` にして強調してください。
+        - グラフ画像がないタスク（例：クロス集計）で、`data` が短いリスト（例：TOP5）の場合、その内容を **Markdownのテーブル形式** で簡潔に（3〜5行）表現することを試みてください。
 
     # 出力形式 (厳守):
     * JSON以外のテキストは絶対に含めず、【単一のJSONオブジェクト】`{{ ... }}` のみを出力してください。
@@ -2812,8 +3146,9 @@ def run_step_c_analysis(
         {{
           "slide_title": "（指示1で考案したタイトル）",
           "slide_content": [
-            "（指示2で記述したインサイト1）",
-            "（指示2で記述したインサイト2）"
+            "（指示2, 3 に基づく Markdown 形式のインサイト1）",
+            "（指示2, 3 に基づく Markdown 形式のインサイト2）",
+            "（例： | キーワード | 件数 |\\n|---|---|\\n| **広島市** | 1500 | ）"
           ]
         }}
 
@@ -2822,23 +3157,21 @@ def run_step_c_analysis(
     
     prompt = PromptTemplate.from_template(ITERATIVE_SLIDE_PROMPT_TEMPLATE)
 
-    # (★) --- 修正: タイムアウトを 120秒 (2分) に設定 ---
-    # (★) リクエストはテキストのみなので、300秒も不要
+    # (★) タイムアウトを 120秒 (2分) に設定
     llm = get_llm(model_name=model_name, temperature=0.2, timeout_seconds=120)
     if llm is None:
         st.error(f"AIモデル({model_name})が利用できません。")
         return "[]" # 空のJSONリスト
     
     chain = prompt | llm | StrOutputParser()
-    # (★) --- ここまでが修正点 ---
 
-    # (★) --- 3. 逐次処理ループ (チャンキングは廃止) ---
+    # (★) --- 3. 逐次処理ループ (変更なし) ---
     report_slides_list = []
     log_messages_ui = []
     
     tasks_all = jsonl_data_string.strip().splitlines()
     
-    # (★) 3.1. OverallSummaryを抽出し、残りを処理対象タスクとする
+    # 3.1. OverallSummaryを抽出し、残りを処理対象タスクとする
     summary_line = "{}"
     tasks_to_process = []
     for line in tasks_all:
@@ -2854,7 +3187,7 @@ def run_step_c_analysis(
     total_tasks = len(tasks_to_process)
     logger.info(f"全 {total_tasks} タスクを逐次処理します。")
     
-    # (★) 3.2. 表紙スライドを追加
+    # 3.2. 表紙スライドを追加
     report_slides_list.append({
         "slide_title": "SNSデータ分析レポート",
         "slide_layout": "title_only",
@@ -2862,11 +3195,10 @@ def run_step_c_analysis(
         "image_base64": None
     })
     
-    # (★) 3.3. 目次スライドを追加 (この時点ではタスク名のみ)
+    # 3.3. 目次スライドを追加 (この時点ではタスク名のみ)
     try:
         agenda_items = []
         for i, task_line in enumerate(tasks_to_process):
-             # (★) 巨大タスク分割(JSONパース失敗)のフォールバック
             try:
                 task_name = json.loads(task_line).get('analysis_task', f'分析タスク {i+1}')
             except json.JSONDecodeError:
@@ -2883,42 +3215,41 @@ def run_step_c_analysis(
     except Exception as e:
         logger.error(f"目次スライドの生成に失敗: {e}")
 
-    # (★) 3.4. メインの分析スライドをループ処理
+    # 3.4. メインの分析スライドをループ処理
     for i, task_line in enumerate(tasks_to_process):
         
         task_name = f"Task {i+1}/{total_tasks}"
         original_task_json = {}
         
         try:
-            # (★) --- 3.4.1. タスクのパースと画像/テキストの分離 ---
+            # 3.4.1. タスクのパースと画像/テキストの分離
             original_task_json = json.loads(task_line)
             task_name = original_task_json.get('analysis_task', task_name)
 
-            # (★) 1. 画像をPython変数に退避
+            # 1. 画像をPython変数に退避
             image_to_pass_through = original_task_json.get("image_base64")
             
-            # (★) 2. AIに渡す「テキストのみ」のJSONを作成
+            # 2. AIに渡す「テキストのみ」のJSONを作成
             text_only_task_json = original_task_json.copy()
-            text_only_task_json["image_base64"] = None # (★) 画像を削除
-            # (★) dataが巨大すぎる場合も考慮し、dataも1000文字に制限
+            text_only_task_json["image_base64"] = None
             if "data" in text_only_task_json and len(json.dumps(text_only_task_json["data"])) > 1000:
                 text_only_task_json["data"] = f"（データプレビュー: {str(text_only_task_json['data'])[:1000]}...）"
             
-            task_data_text_only_str = json.dumps(text_only_task_json)
+            task_data_text_only_str = json.dumps(text_only_task_json, ensure_ascii=False) # (★) ensure_ascii=False
             
         except Exception as e:
             logger.error(f"タスク '{task_name}' のJSONパースに失敗: {e}")
             log_messages_ui.append(f"  -> ERROR: '{task_name}' のJSONパースに失敗。スキップします。")
-            continue # (★) このタスクはスキップ
+            continue
 
-        # (★) --- 3.4.2. UI（進捗バー・ログ）の更新 ---
-        progress_percent = (i + 1) / (total_tasks + 1) # (★) +1 は結論スライド分
+        # 3.4.2. UI（進捗バー・ログ）の更新
+        progress_percent = (i + 1) / (total_tasks + 1)
         progress_bar.progress(progress_percent, text=f"Step C (スライド生成中): {i+1}/{total_tasks} (モデル: {model_name})")
-        log_messages_ui.append(f"[{i+1}/{total_tasks}] '{task_name}' の処理を開始 (文字数: {len(task_data_text_only_str):,})...")
+        log_messages_ui.append(f"[{i+1}/{total_tasks}] '{task_name}' の処理を開始...")
         log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key=f"step_c_log_{i}")
 
         try:
-            # (★) --- 3.4.3. AIへのリクエスト (テキストのみ) ---
+            # 3.4.3. AIへのリクエスト (テキストのみ)
             log_messages_ui.append(f"  -> AI ({model_name}) にリクエストを送信... (Timeout: 120s)")
             log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key=f"step_c_log_{i}_sending")
             
@@ -2927,12 +3258,12 @@ def run_step_c_analysis(
             log_messages_ui.append(f"  -> AI が応答しました。レスポンスを解析中...")
             log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key=f"step_c_log_{i}_received")
 
-            # (★) AIの回答 (タイトルとコンテントのみ) をパース
+            # AIの回答 (タイトルとコンテントのみ) をパース
             match = re.search(r'\{.*\}', response_str, re.DOTALL)
             if match:
                 ai_response_json = json.loads(match.group(0))
                 
-                # (★) --- 3.4.4. AIの考察と、退避させた画像を「再結合」 ---
+                # 3.4.4. AIの考察と、退避させた画像を「再結合」
                 final_slide_object = {
                     "slide_title": ai_response_json.get("slide_title", task_name),
                     "slide_layout": "text_and_image" if image_to_pass_through else "title_and_content",
@@ -2954,13 +3285,13 @@ def run_step_c_analysis(
                 "image_base64": None
             })
         
-        # (★) --- 3.4.5. Rate Limit のための待機 ---
-        if i < total_tasks: # (★) 結論スライドのリクエストがまだ残っているため、必ず待機
+        # 3.4.5. Rate Limit のための待機
+        if i < total_tasks:
             log_messages_ui.append(f"  -> Rate Limit (RPM) のため {sleep_time:.1f} 秒待機します...")
             log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key=f"step_c_log_{i}_sleep")
             time.sleep(sleep_time)
 
-    # (★) 4. 結論スライドの生成
+    # (★) 4. 結論スライドの生成 (品質向上)
     try:
         chunk_name = f"結論スライド"
         progress_percent = 1.0
@@ -2972,6 +3303,7 @@ def run_step_c_analysis(
         if conclusion_llm is None:
             raise Exception("結論スライド用AIモデルの取得に失敗")
 
+        # (★) --- 結論プロンプトも Markdown を要求 ---
         CONCLUSION_PROMPT_TEMPLATE = """
         あなたはシニアデータアナリストです。
         以下の「分析サマリー」と「これまで生成したスライドのタイトルリスト」に基づき、
@@ -2987,7 +3319,8 @@ def run_step_c_analysis(
         1.  タイトルは「結論と戦略的提言」とします。
         2.  レイアウトは「title_and_content」とします。
         3.  内容は、分析全体から導かれる「結論」と、クライアントが次に取るべき「具体的なアクション（提言）」を3〜5点の箇条書きで記述してください。
-        4.  画像 (image_base64) は null とします。
+        4.  **(★) 書式設定: 回答は Markdown 形式を使用し、重要な結論や提言は `**太字**` で強調してください。**
+        5.  画像 (image_base64) は null とします。
 
         # 出力形式 (厳守):
         * JSON以外のテキストは絶対に含めず、【単一のJSONオブジェクト】`{{ ... }}` のみを出力してください。
@@ -3058,30 +3391,32 @@ def render_step_c():
     if uploaded_report_file:
         try:
             # (★) ファイルがアップロードされても、プロンプト生成は *行わない*
-            if st.session_state.step_c_jsonl_data is None:
+            # (★) ファイルが変更された場合のみロード
+            current_file_id_C = f"{uploaded_report_file.name}_{uploaded_report_file.size}"
+            if st.session_state.get('current_file_id_C') != current_file_id_C:
+                logger.info(f"Step C: 新しいJSON {current_file_id_C} をロードします。")
                 jsonl_data_string = uploaded_report_file.getvalue().decode('utf-8')
                 st.session_state.step_c_jsonl_data = jsonl_data_string
                 st.session_state.step_c_report_json = None # (★) 結果をリセット
+                st.session_state.current_file_id_C = current_file_id_C
                 st.success(f"ファイル「{uploaded_report_file.name}」読込完了")
-        
+            
         except Exception as e:
             logger.error(f"Step C ファイル読込エラー: {e}", exc_info=True)
             st.error(f"ファイル読み込み中にエラー: {e}")
+            st.session_state.step_c_jsonl_data = None
+            st.session_state.current_file_id_C = None
             return
     else:
         st.session_state.step_c_jsonl_data = None
         st.session_state.step_c_prompt = None
         st.session_state.step_c_report_json = None
+        st.session_state.current_file_id_C = None
         st.warning("分析を続けるには、Step B で生成した JSON ファイルをアップロードしてください。")
         return
 
-    # (★) --- 修正: 旧Step 2 (プロンプト編集) を削除 ---
-    # (★) 逐次処理モデルに変更したため、巨大なプロンプトの編集は不要になりました。
-    # (★) --- ここまでが修正点 ---
-
-
-    # --- 2. 分析レポートの実行 (★ 旧Step 3) ---
-    st.header("Step 2: AI分析レポートの実行") # (★) ステップ番号を 2 に変更
+    # --- 2. 分析レポートの実行 ---
+    st.header("Step 2: AI分析レポートの実行")
 
     # (★) --- 修正: モデル選択UI ---
     st.markdown("分析に使用するAIモデルを選択してください。")
@@ -3111,18 +3446,14 @@ def render_step_c():
             f"**`{MODEL_FLASH}` (無料枠) は 10 RPM (6秒/リクエスト) の制限があります。**\n"
             f"比較的 高速に生成できます。（推奨）"
         )
-    # (★) --- ここまでが修正点 ---
-
     
     if st.button(f"分析レポートを生成 (Step 2)", key="execute_button_C", type="primary", use_container_width=True):
         if not st.session_state.step_c_jsonl_data:
             st.error("データがありません。Step 1でファイルをアップロードしてください。")
             return
         
-        # (★) --- 修正: 進捗バーとログ用のプレースホルダを定義 ---
         progress_bar = st.progress(0.0, text="Step C: 分析待機中...")
         log_placeholder = st.empty()
-        # (★) --- ここまでが修正点 ---
 
         selected_model = st.session_state.step_c_model
         
@@ -3137,15 +3468,14 @@ def render_step_c():
             st.success("AIによる分析レポートが生成されました！")
             
         except Exception as e:
-            # (★) 実行時エラーのキャッチ
             logger.error(f"Step C 実行中に予期せぬエラー: {e}", exc_info=True)
             st.error(f"分析実行中に予期せぬエラーが発生しました: {e}")
             progress_bar.progress(1.0, text="エラーにより中断")
 
 
-    # --- 3. 結果のプレビューとエクスポート (★ 旧Step 4) ---
+    # --- 3. 結果のプレビューとエクスポート ---
     if st.session_state.step_c_report_json:
-        st.header("Step 3: 分析レポート（JSON）の確認とエクスポート") # (★) ステップ番号を 3 に変更
+        st.header("Step 3: 分析レポート（JSON）の確認とエクスポート")
         st.info("以下の構造化JSONは、Step D (PowerPoint生成) で使用します。")
 
         st.download_button(
@@ -3187,7 +3517,10 @@ def render_step_c():
                     
                     expander_label = f"**{i+1}: {title}** (Layout: {layout}, Image: {has_image})"
                     with st.expander(expander_label):
-                        st.markdown(f"**内容 (抜粋):**\n- {content_preview}...")
+                        # (★) プレビューで Markdown をレンダリング
+                        st.markdown(f"**内容:**")
+                        for content_line in slide_content_list:
+                            st.markdown(content_line)
             else:
                 st.error("AIの回答が期待したスライドのリスト形式ではありません。")
                 st.text_area("AIの生回答 (JSON):", value=st.session_state.step_c_report_json, height=200, disabled=True)
@@ -3206,43 +3539,82 @@ try:
     from pptx.util import Inches, Pt
     from pptx.enum.shapes import MSO_SHAPE
     from pptx.enum.dml import MSO_THEME_COLOR
+    from pptx.text.text import _Run # (★) Markdown削除のため
+    from pptx.table import _Cell    # (★) Markdown削除のため
 except ImportError:
     st.error(
         "PowerPoint生成ライブラリ(python-pptx)が見つかりません。"
         "pip install python-pptx を実行してください。"
     )
 
-try:
-    import pptx
-    from pptx import Presentation
-    from pptx.util import Inches, Pt
-    from pptx.enum.shapes import MSO_SHAPE
-    from pptx.enum.dml import MSO_THEME_COLOR
-except ImportError:
-    st.error(
-        "PowerPoint生成ライブラリ(python-pptx)が見つかりません。"
-        "pip install python-pptx を実行してください。"
-    )
+# (★) --- 修正: [NameError] 対策で、AI修正関数をここに追加 ---
+def run_step_d_ai_correction(
+    current_json_str: str, 
+    correction_prompt: str
+) -> str:
+    """
+    (Step D) ユーザーの修正指示に基づき、AI (Pro) がスライド構成JSONを修正する
+    """
+    logger.info("Step D AIスライド修正 (Pro) 実行...")
+    
+    # (★) Step D の AI修正は、高品質な Pro モデルを使用
+    llm = get_llm(model_name=MODEL_PRO, temperature=0.1, timeout_seconds=120)
+    if llm is None:
+        logger.error("run_step_d_ai_correction: LLM (Pro) が利用できません。")
+        st.error("AIモデル(Pro)が利用できませんでした。")
+        return current_json_str # (★) 失敗時は元のJSONを返す
 
-def find_layout_by_name(prs: pptx.presentation.Presentation, layout_name: str) -> Optional[pptx.slide.SlideLayout]:
-    """
-    (★) プレゼンテーションのマスターから、指定されたレイアウト名（完全一致）でスライドレイアウトを探す。
-    """
-    for layout in prs.slide_layouts:
-        if layout.name == layout_name:
-            return layout
-    logger.warning(f"  -> '{layout_name}' に一致するレイアウトが見つかりません。")
-    return None
+    prompt = PromptTemplate.from_template(
+        """
+        あなたはPowerPointの構成作家です。
+        以下の「現在のスライド構成 (JSON)」を読み、「修正指示」に基づいてJSONを厳密に修正してください。
+
+        # 修正指示:
+        {user_prompt}
+
+        # 現在のスライド構成 (JSON):
+        {current_json}
+
+        # 指示:
+        1. 「修正指示」を【厳密に】実行してください。(例: 「削除して」なら、そのJSONオブジェクトを配列から取り除く)
+        2. 「修正指示」にないスライドは、絶対に修正・削除しないでください。
+        3. 出力は【JSON配列形式のみ】 (`[...]`) とします。
+        4. JSON以外のテキスト（「承知しました」など）は【絶対に】含めないでください。
+
+        # 回答 (修正後のJSON配列のみ):
+        """
+    )
+    chain = prompt | llm | StrOutputParser()
+    
+    try:
+        response_str = chain.invoke({
+            "user_prompt": correction_prompt,
+            "current_json": current_json_str
+        })
+        
+        match = re.search(r'\[.*\]', response_str, re.DOTALL)
+        if match:
+            logger.info("Step D AIスライド修正 完了。")
+            return match.group(0)
+        else:
+            logger.error("Step D AIスライド修正: AIがJSON配列を返しませんでした。")
+            st.error("AIがJSON配列を返しませんでした。修正はキャンセルされました。")
+            return current_json_str
+            
+    except Exception as e:
+        logger.error(f"run_step_d_ai_correction 実行エラー: {e}", exc_info=True)
+        st.error(f"AIスライド修正中にエラーが発生しました: {e}")
+        return current_json_str
+
 
 def create_powerpoint_presentation(
     template_file: Optional[BytesIO],
     report_data: List[Dict[str, Any]],
-    layout_map_names: Dict[str, str] # (★) 選択されたレイアウト名を受け取る
+    layout_map_names: Dict[str, str]
 ) -> BytesIO:
     """
     (Step D) テンプレート(.pptx)とスライド構成(JSON)に基づき、
     python-pptx を使用して最終的なPowerPointファイルを生成する。
-    (★) ユーザーが選択したレイアウト名を使用するようロジックを改修
     """
     logger.info("PowerPoint生成処理 開始...")
     
@@ -3252,11 +3624,22 @@ def create_powerpoint_presentation(
             template_file.seek(0)
             prs = Presentation(template_file)
             logger.info("アップロードされたテンプレートを使用してPPTXを生成します。")
+            
+            logger.info(f"テンプレートから既存のスライド {len(prs.slides)} 枚を削除します...")
+            try:
+                for i in range(len(prs.slides) - 1, -1, -1):
+                    rId = prs.slides._sldIdLst[i].rId
+                    prs.part.drop_rel(rId)
+                    del prs.slides._sldIdLst[i]
+                logger.info("テンプレートスライドの削除完了。")
+            except Exception as e:
+                logger.error(f"テンプレートスライドの削除に失敗: {e}。処理を続行します。")
+
         else:
             prs = Presentation()
             logger.info("デフォルトのテンプレートを使用してPPTXを生成します。")
 
-        # (★) 2. ユーザーが選択したレイアウトをマッピング
+        # (★) 2. ユーザーが選択したレイアウトをマッピング (変更なし)
         layout_map = {
             "title_only": find_layout_by_name(prs, layout_map_names.get("title")),
             "agenda": find_layout_by_name(prs, layout_map_names.get("agenda")),
@@ -3264,7 +3647,6 @@ def create_powerpoint_presentation(
             "text_and_image": find_layout_by_name(prs, layout_map_names.get("content_image")),
         }
         
-        # (★) フォールバックレイアウト (最も汎用的なもの)
         fallback_layout = prs.slide_layouts[1] # 「タイトルとコンテンツ」
         fallback_title_layout = prs.slide_layouts[0] # 「タイトル スライド」
         
@@ -3278,81 +3660,47 @@ def create_powerpoint_presentation(
              layout_map["title_and_content"] = fallback_layout
              logger.warning("「テキスト」レイアウトが見つからないため、デフォルトの「タイトルとコンテンツ」を使用します。")
         if layout_map["text_and_image"] is None:
-             layout_map["text_and_image"] = fallback_layout # 画像ありも最悪これで代用
+             layout_map["text_and_image"] = fallback_layout
              logger.warning("「画像+テキスト」レイアウトが見つからないため、デフォルトの「タイトルとコンテンツ」を使用します。")
 
         logger.info(f"使用レイアウトマッピング: {layout_map_names}")
 
-        # (★) 3. スライドの生成 (JSONデータをループ)
+        # (★) --- 3. スライドの生成 (JSONデータをループ) ---
         
-        # (★) --- 3.1. 表紙スライド ---
+        # (★) 3.1. 表紙スライド (変更なし)
         first_slide_data = report_data[0]
         if first_slide_data.get("slide_layout") == "title_only":
-            slide = prs.slides.add_slide(layout_map["title_only"]) # (★) 選択されたレイアウト
+            slide = prs.slides.add_slide(layout_map["title_only"])
             try:
                 slide.shapes.title.text = first_slide_data.get("slide_title", "分析レポート")
             except: pass
             try:
-                # (★) 多くのテンプレートでは Title Layout の Placeholder[1] が Subtitle
                 if len(slide.placeholders) > 1 and slide.placeholders[1]:
                      slide.placeholders[1].text = first_slide_data.get("slide_content", [""])[0]
             except: pass
             
-            report_data = report_data[1:]
+            report_data = report_data[1:] # (★) 表紙をリストから削除
         
-        # (★) --- 3.2. 目次(Agenda)スライドの自動生成 ---
-        try:
-            logger.info("目次スライドを自動生成します...")
-            agenda_slide = prs.slides.add_slide(layout_map["agenda"]) # (★) 選択されたレイアウト
-            
-            # (★) タイトルプレースホルダを探す
-            title_shape = None
-            try:
-                title_shape = agenda_slide.shapes.title
-            except AttributeError:
-                for shape in agenda_slide.placeholders:
-                    # 0 or 100 (Title) or 136 (Center Title)
-                    if shape.placeholder_format.idx == 0 or shape.placeholder_format.idx == 100 or shape.placeholder_format.idx == 136:
-                        title_shape = shape
-                        break
-            if title_shape:
-                title_shape.text = "本日のアジェンダ"
-            
-            # (★) 目次用の本文プレースホルダを探す
-            agenda_body_shape = None
-            for shape in agenda_slide.placeholders:
-                 # 1 (Body) or 101 (Content)
-                 if shape.placeholder_format.idx == 1 or shape.placeholder_format.idx == 101: 
-                     agenda_body_shape = shape
-                     break
-            
-            if agenda_body_shape:
-                tf = agenda_body_shape.text_frame
-                tf.clear()
-                for i, slide_data in enumerate(report_data):
-                    p = tf.add_paragraph()
-                    p.text = f"{i+1}. {slide_data.get('slide_title', '（無題のスライド）')}"
-                    p.level = 0
-            else:
-                 logger.warning("目次スライドの本文プレースホルダが見つかりませんでした。")
-                 
-        except Exception as e:
-            logger.error(f"目次スライドの自動生成に失敗: {e}")
+        # (★) 3.2. 目次(Agenda)スライドの自動生成 (変更なし)
+        # (★) --- 修正: Step Cで目次スライドが生成されるようになったため、
+        # (★) --- この「自動生成」ロジックは不要になりました。
+        # (★) --- L2347〜L2371 までの try-except ブロックを削除 ---
 
         # (★) --- 3.3. コンテンツスライド (残り) ---
         for i, slide_data in enumerate(report_data):
-            slide_title = slide_data.get("slide_title", f"スライド {i+3}")
+            slide_title = slide_data.get("slide_title", f"スライド {i+2}") # (★) 表紙が0だったので i+2
             slide_layout_key = slide_data.get("slide_layout", "title_and_content")
             slide_content = slide_data.get("slide_content", ["（コンテンツなし）"])
-            image_base64 = slide_data.get("image_base664") # (★) 既存コードの typo を修正 (664 -> 64)
-            if image_base64 is None:
-                image_base64 = slide_data.get("image_base64") # (★) 正しいキーでも取得
+            
+            image_base64 = slide_data.get("image_base64")
 
             if image_base64 and slide_layout_key == "title_and_content":
                 slide_layout_key = "text_and_image"
             
             # (★) マップからレイアウトを取得
-            if image_base64:
+            if slide_title == "本日のアジェンダ":
+                layout_to_use = layout_map["agenda"]
+            elif image_base64:
                 layout_to_use = layout_map["text_and_image"]
             else:
                 layout_to_use = layout_map["title_and_content"]
@@ -3362,41 +3710,39 @@ def create_powerpoint_presentation(
             try:
                 slide.shapes.title.text = slide_title
             except Exception as e:
-                logger.warning(f"スライド {i+3} のタイトル設定失敗: {e}")
+                logger.warning(f"スライド {i+2} のタイトル設定失敗: {e}")
 
             # (★) --- コンテンツと画像の配置 (ロジックを堅牢化) ---
             try:
-                # (★) プレースホルダをタイプ別に分類
                 text_placeholders = []
                 image_placeholders = []
                 
                 for shape in slide.placeholders:
-                    if shape.placeholder_format.idx == 0: continue # タイトルは除外
-                    
+                    if shape.placeholder_format.idx == 0: continue
                     if shape.has_text_frame:
                         text_placeholders.append(shape)
-                    # (★) 画像用プレースホルダ (idx 101-107, 114-118 など) を推測
                     elif shape.placeholder_format.idx > 100: 
                         image_placeholders.append(shape)
 
                 # (★) 画像がある場合の処理 (text_and_image)
                 if image_base64:
-                    # (★) 1. テキストを挿入 (最初に見つかったテキストプレースホルダに)
+                    # (★) 1. テキストを挿入
                     if text_placeholders:
                         tf = text_placeholders[0].text_frame
                         tf.clear()
+                        # (★) --- 修正: Markdownクリーンアップ ---
+                        cleaned_content = [re.sub(r'\*\*(.*?)\*\*', r'\1', item) for item in slide_content]
                         p = tf.paragraphs[0]
-                        p.text = str(slide_content[0])
-                        for item in slide_content[1:]:
+                        p.text = str(cleaned_content[0])
+                        for item in cleaned_content[1:]:
                             p = tf.add_paragraph()
                             p.text = str(item)
                     
-                    # (★) 2. 画像を挿入 (最初に見つかった画像プレースホルダに)
+                    # (★) 2. 画像を挿入
                     image_ph = None
                     if image_placeholders:
                         image_ph = image_placeholders[0]
                     elif len(text_placeholders) > 1:
-                        # (★) 画像用がなければ、2番目のテキストプレースホルダを代用
                         image_ph = text_placeholders[1] 
 
                     if image_ph:
@@ -3419,14 +3765,16 @@ def create_powerpoint_presentation(
                          continue
                     tf = text_placeholders[0].text_frame
                     tf.clear()
+                    # (★) --- 修正: Markdownクリーンアップ ---
+                    cleaned_content = [re.sub(r'\*\*(.*?)\*\*', r'\1', item) for item in slide_content]
                     p = tf.paragraphs[0]
-                    p.text = str(slide_content[0])
-                    for item in slide_content[1:]:
+                    p.text = str(cleaned_content[0])
+                    for item in cleaned_content[1:]:
                         p = tf.add_paragraph()
                         p.text = str(item)
 
             except Exception as e:
-                logger.error(f"スライド {i+3} ('{slide_title}') のコンテンツ/画像設定中にエラー: {e}", exc_info=True)
+                logger.error(f"スライド {i+2} ('{slide_title}') のコンテンツ/画像設定中にエラー: {e}", exc_info=True)
 
         logger.info("PowerPoint生成処理 完了。")
         file_stream = BytesIO()
@@ -3443,15 +3791,19 @@ def render_step_d():
     """(Step D) PowerPoint生成UIを描画する"""
     st.title(f"プレゼンテーション (PowerPoint) 生成 (Step D)")
 
-    # Step D 固有のセッションステート
     if 'step_d_template_file' not in st.session_state:
         st.session_state.step_d_template_file = None
+    if 'step_d_template_file_id' not in st.session_state:
+        st.session_state.step_d_template_file_id = None
     if 'step_d_report_data' not in st.session_state:
         st.session_state.step_d_report_data = []
+    if 'current_report_file_id_D' not in st.session_state:
+        st.session_state.current_report_file_id_D = None
+        
     if 'step_d_generated_pptx' not in st.session_state:
         st.session_state.step_d_generated_pptx = None
     if 'step_d_layout_map' not in st.session_state:
-        st.session_state.step_d_layout_map = {} # (★) 選択されたレイアウト名を保持
+        st.session_state.step_d_layout_map = {}
     if 'tips_list' not in st.session_state:
         st.session_state.tips_list = []
     if 'current_tip_index' not in st.session_state:
@@ -3478,29 +3830,37 @@ def render_step_d():
     
     if template_file:
         try:
-            # (★) アップロード時にレイアウト名を読み込む
-            template_file.seek(0)
-            template_bytes = template_file.getvalue()
-            prs = Presentation(BytesIO(template_bytes))
-            template_layout_names = [layout.name for layout in prs.slide_layouts]
+            # (★) --- 修正: ファイルロード制御 ---
+            template_file_id = f"{template_file.name}_{template_file.size}"
             
-            # (★) テンプレートが変更されたら、レイアウトマップをリセットするためにNoneをセット
-            if (st.session_state.step_d_template_file is None or 
-                st.session_state.step_d_template_file.getvalue() != template_bytes):
+            if st.session_state.get('step_d_template_file_id') != template_file_id:
+                logger.info(f"Step D: 新しいテンプレート {template_file_id} をロードします。")
+                template_file.seek(0)
+                template_bytes = template_file.getvalue()
+                prs = Presentation(BytesIO(template_bytes))
+                template_layout_names = [layout.name for layout in prs.slide_layouts]
                 
                 st.success(f"テンプレート「{template_file.name}」を読み込みました。")
                 st.session_state.step_d_template_file = BytesIO(template_bytes)
+                st.session_state.step_d_template_file_id = template_file_id
                 st.session_state.step_d_layout_map = {} # (★) マップをリセット
-            
+            else:
+                # (★) ロード済みの場合は、レイアウト名のみ再取得
+                st.session_state.step_d_template_file.seek(0)
+                prs = Presentation(st.session_state.step_d_template_file)
+                template_layout_names = [layout.name for layout in prs.slide_layouts]
+
         except Exception as e:
             st.error(f"テンプレートの読み込みに失敗: {e}")
             template_layout_names = []
             st.session_state.step_d_template_file = None
-
+            st.session_state.step_d_template_file_id = None
+            
     else:
         # (★) ファイルがクリアされたらリセット
         if st.session_state.step_d_template_file is not None:
              st.session_state.step_d_template_file = None
+             st.session_state.step_d_template_file_id = None
              st.session_state.step_d_layout_map = {}
 
 
@@ -3515,35 +3875,46 @@ def render_step_d():
 
     if report_file:
         try:
-            # (★) 辞書のリストであることを確認
-            report_json_string = report_file.getvalue().decode('utf-8')
-            report_data = json.loads(report_json_string)
+            # (★) --- 修正: Step B と同様のロード制御 (L2254) ---
+            current_report_file_id = f"{report_file.name}_{report_file.size}"
             
-            if isinstance(report_data, list) and all(isinstance(item, dict) for item in report_data):
-                # (★) データの参照を更新する
-                if st.session_state.step_d_report_data != report_data:
+            if ('step_d_report_data' not in st.session_state or 
+                not st.session_state.step_d_report_data or 
+                st.session_state.get('current_report_file_id_D') != current_report_file_id):
+                
+                logger.info(f"Step D: 新しいレポート {current_report_file_id} をロードします。")
+                report_json_string = report_file.getvalue().decode('utf-8')
+                report_data = json.loads(report_json_string)
+            
+                if isinstance(report_data, list) and all(isinstance(item, dict) for item in report_data):
                     st.success(f"分析レポート「{report_file.name}」を読み込みました ({len(report_data)}スライド)。")
                     st.session_state.step_d_report_data = report_data
-            else:
-                st.error("アップロードされたJSONが期待する形式（スライドのリスト）ではありません。")
-                st.session_state.step_d_report_data = []
+                    st.session_state.current_report_file_id_D = current_report_file_id
+                    st.session_state.step_d_generated_pptx = None
+                else:
+                    st.error("アップロードされたJSONが期待する形式（スライドのリスト）ではありません。")
+                    st.session_state.step_d_report_data = []
+                    st.session_state.current_report_file_id_D = None
+
         except Exception as e:
             logger.error(f"Step D JSONレポート読込エラー: {e}", exc_info=True)
             st.error(f"分析レポートの読み込み中にエラー: {e}")
             st.session_state.step_d_report_data = []
+            st.session_state.current_report_file_id_D = None
     
     if not st.session_state.step_d_report_data:
         st.session_state.step_d_report_data = []
         st.session_state.step_d_generated_pptx = None
+        st.session_state.current_report_file_id_D = None
         st.warning("PowerPointを生成するには、Step C で生成した JSON レポートをアップロードしてください。")
         return
 
-    # --- 3. (★) テンプレートのレイアウト割り当て ---
+    # --- 3. (★) テンプレートのレイアウト割り当て (変更なし) ---
     st.header("Step 3: テンプレートレイアウトの割り当て")
     
     if not st.session_state.step_d_template_file:
         st.info("Step 1 でテンプレートをアップロードすると、レイアウト名を選択できます。（現在デフォルト設定）")
-        layout_options = list(default_layouts.values()) # デフォルト名を表示
+        layout_options = list(default_layouts.values())
     else:
         st.info("テンプレートから読み込んだレイアウト名を、各スライドタイプに割り当ててください。")
         layout_options = template_layout_names
@@ -3552,27 +3923,22 @@ def render_step_d():
          st.error("レイアウトの読み込みに失敗しました。デフォルト設定を使用します。")
          layout_options = list(default_layouts.values())
 
-    # (★) デフォルトのインデックスを探すヘルパー
     def get_default_index(default_name_key):
-        # (★) 1. セッションステートに保存された値があればそれを優先
         if default_name_key in st.session_state.step_d_layout_map:
             saved_name = st.session_state.step_d_layout_map[default_name_key]
             if saved_name in layout_options:
                 return layout_options.index(saved_name)
         
-        # (★) 2. なければ、デフォルト名（"タイトル スライド" など）を探す
         target_name = default_layouts[default_name_key]
         if target_name in layout_options:
             return layout_options.index(target_name)
             
-        # (★) 3. それもなければ、部分一致（"タイトル"など）で探す
         for i, opt in enumerate(layout_options):
-            if default_name_key in opt.lower(): # "title"
+            if default_name_key in opt.lower():
                 return i
-            if target_name.split(' ')[0] in opt: # "タイトル"
+            if target_name.split(' ')[0] in opt:
                 return i
-
-        return 0 # 見つからなければ先頭
+        return 0
 
     layout_map = {}
     col1, col2 = st.columns(2)
@@ -3595,11 +3961,10 @@ def render_step_d():
             index=get_default_index("content_image"), key="layout_select_image"
         )
     
-    # (★) 選択結果をセッションステートに即時保存
     st.session_state.step_d_layout_map = layout_map
 
 
-    # --- 4. スライド構成の編集 (★ 旧Step 3) ---
+    # --- 4. スライド構成の編集 (変更なし) ---
     st.header("Step 4: スライド構成の確認・編集")
     st.info("（(★) マウスのドラッグ＆ドロップでスライドの順番を入れ替えることができます）")
 
@@ -3618,7 +3983,7 @@ def render_step_d():
             
             title = item.get('slide_title', '（タイトルなし）')
             layout = item.get('slide_layout', 'N/A')
-            has_image = "🖼️" if (item.get("image_base64") or item.get("image_base664")) else "📄" # (★) Typo修正
+            has_image = "🖼️" if (item.get("image_base64")) else "📄" # (★) Typo修正
             header_str = f"**{i+1}: {title}** (Layout: `{layout}`, {has_image})"
             headers_list.append(header_str)
             header_to_item_map[header_str] = item
@@ -3629,7 +3994,7 @@ def render_step_d():
 
         sorted_headers = sort_items(
             items=headers_list,
-            key="sortable_slides_v4" # (★) キーを更新
+            key="sortable_slides_v4"
         )
         
         cleaned_sorted_data = []
@@ -3646,7 +4011,7 @@ def render_step_d():
         st.error(f"スライド編集UIの描画に失敗: {e}。")
 
 
-    # --- 5. AIによる修正指示 (★ 旧Step 4) ---
+    # --- 5. AIによる修正指示 (変更なし) ---
     st.header("Step 5: (オプション) AIによる内容の修正指示")
     st.markdown(f"（(★) 使用モデル: `{MODEL_PRO}`）")
     
@@ -3671,7 +4036,7 @@ def render_step_d():
                         if isinstance(corrected_data, list):
                             st.session_state.step_d_report_data = corrected_data
                             st.success("AIによるスライド構成の修正が完了しました。Step 4 の構成が更新されています。")
-                            st.rerun() # UIを即時更新
+                            st.rerun()
                         else:
                             st.error("AIがリスト形式でないデータを返しました。修正はキャンセルされました。")
                     except Exception as e:
@@ -3679,7 +4044,7 @@ def render_step_d():
             else:
                 st.warning("修正指示を入力してください。")
 
-    # --- 6. PowerPoint生成 (★ 旧Step 5) ---
+    # --- 6. PowerPoint生成 (変更なし) ---
     st.header("Step 6: PowerPointの生成とエクスポート")
     
     tip_placeholder_d = st.empty()
@@ -3690,9 +4055,8 @@ def render_step_d():
         if not st.session_state.tips_list or len(st.session_state.tips_list) <= 1:
             with st.spinner("分析TIPSをAIで生成中..."):
                 st.session_state.tips_list = get_analysis_tips_list_from_ai()
-                if st.session_state.tips_list:
-                    st.session_state.current_tip_index = random.randint(0, len(st.session_state.tips_list) - 1)
-                    st.session_state.last_tip_time = time.time()
+                st.session_state.current_tip_index = random.randint(0, len(st.session_state.tips_list) - 1) if st.session_state.tips_list else 0
+                st.session_state.last_tip_time = time.time()
         
         with st.spinner("PowerPointファイルを生成中..."):
             now = time.time()
@@ -3701,14 +4065,16 @@ def render_step_d():
                     st.session_state.current_tip_index = (st.session_state.current_tip_index + 1) % len(st.session_state.tips_list)
                 st.session_state.last_tip_time = now
             if st.session_state.tips_list:
-                current_tip = st.session_state.tips_list[st.session_state.current_tip_index]
-                tip_placeholder_d.info(f"💡 データ分析TIPS: {current_tip}")
+                try:
+                    current_tip = st.session_state.tips_list[st.session_state.current_tip_index]
+                    tip_placeholder_d.info(f"💡 データ分析TIPS: {current_tip}")
+                except IndexError:
+                    st.session_state.current_tip_index = 0
 
-            # (★) --- 修正: 選択されたレイアウトマップを渡す ---
             generated_file_stream = create_powerpoint_presentation(
                 st.session_state.step_d_template_file,
                 st.session_state.step_d_report_data,
-                st.session_state.step_d_layout_map # (★) ここで渡す
+                st.session_state.step_d_layout_map
             )
             
             tip_placeholder_d.empty()
@@ -3723,12 +4089,11 @@ def render_step_d():
         st.download_button(
             label="生成された PowerPoint をダウンロード",
             data=st.session_state.step_d_generated_pptx,
-            file_name="AI_Analysis_Report_v3.pptx", # (★) v3
+            file_name="AI_Analysis_Report_v3.pptx",
             mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
             use_container_width=True
         )
         st.balloons()
-
 
 # --- 11. (★) Main関数 (アプリケーション実行) ---
 def main():
