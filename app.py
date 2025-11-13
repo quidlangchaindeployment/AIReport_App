@@ -25,8 +25,7 @@ import streamlit.components.v1 as components
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from io import StringIO, BytesIO
-from typing import Optional, Dict, List, Any, Union
-import random  # (★) Tipsローテーションのために追加
+from typing import Optional, Dict, List, Any, Union, Set
 from dotenv import load_dotenv  # (★) .env読み込みのために追加
 import matplotlib
 matplotlib.use('Agg') # (★) Streamlitのバックエンドで動作させるためのおまじない
@@ -280,9 +279,8 @@ def read_file(file: st.runtime.uploaded_file_manager.UploadedFile) -> (Optional[
 def get_dynamic_categories(analysis_prompt: str) -> Optional[Dict[str, str]]:
     """
     (Step A) ユーザーの分析指針に基づき、AIが動的なカテゴリをJSON形式で生成する。
-    (★) モデル: MODEL_FLASH_LITE (gemini-2.5-flash-lite)
+    (★) モデル: MODEL_FLASH_LITE
     """
-    # (★) Step A の要件に基づき、FLASH_LITE モデルを明示的に指定
     llm = get_llm(model_name=MODEL_FLASH_LITE, temperature=0.0)
     if llm is None:
         logger.error("get_dynamic_categories: LLM (Flash Lite) が利用できません。")
@@ -290,14 +288,27 @@ def get_dynamic_categories(analysis_prompt: str) -> Optional[Dict[str, str]]:
         return None
 
     logger.info("動的カテゴリ生成AI (Flash Lite) を呼び出し...")
+    
     prompt = PromptTemplate.from_template(
         """
-        あなたはデータ分析のスキーマ設計者です。「分析指針」を読み、テキストから抽出するべき「トピックのカテゴリ」を考案してください。「市区町村」は必須カテゴリとして自動で追加されるため、それ以外のカテゴリを定義してください。
-        # 指示: 1.「分析指針」のトピックをカテゴリ化 2.各カテゴリの説明記述 3.厳格なJSON辞書出力 4.地名カテゴリ禁止 5.該当なければ空JSON
-        # 分析指針:{user_prompt}
-        # 回答 (JSON辞書形式):
+        あなたはデータ分析のスキーマ設計者です。「分析指針」を読み、テキストから抽出するべき「カテゴリ」を考案してください。
+        
+        # 分析指針:
+        {user_prompt}
+
+        # 指示:
+        1.  「分析指針」を注意深く読みます。
+        2.  もし「分析指針」が【ユーザー定義のカテゴリ名と説明】（例: 「①話題カテゴリ：...」や「②観光地：...」）を明示的に指定している場合、**その指示に厳密に従い**、指定されたカテゴリ名（例: "話題カテゴリ"）と説明（例: "どの話題に関する言及か..."）を抽出してください。
+        3.  もし「分析指針」がカテゴリを明示的に指定していない場合（例: 「広島の観光について分析したい」）、分析指針のトピックを元に、抽出するべきカテゴリ（キー）とそ
+            の説明（値）を【あなた自身で考案】してください。
+        4.  「市区町村」や「地名」に関するカテゴリは、必須カテゴリとして自動で追加されるため、**絶対に考案・抽出しないでください**。
+        5.  出力は【厳格なJSON辞書形式】 `{{ "カテゴリ名1": "カテゴリの説明1", "カテゴリ名2": "カテゴリの説明2" }}` のみとします。
+        6.  該当するカテゴリが（地名以外に）無い場合は、空のJSON `{{}}` を返してください。
+
+        # 回答 (JSON辞書形式のみ):
         """
     )
+    
     chain = prompt | llm | StrOutputParser()
     try:
         response_str = chain.invoke({"user_prompt": analysis_prompt})
@@ -406,21 +417,19 @@ def filter_relevant_data_by_ai(df_batch: pd.DataFrame, analysis_prompt: str) -> 
 def get_location_normalization_maps(
     db: Dict[str, List[str]], 
     analysis_prompt_str: str
-) -> (Dict[str, str], Set[str]):
+) -> (Dict[str, str], Set[str], Set[str]): # (★) 型ヒントに Set[str] を追加
     """
     (★) Step A 改善: 地名正規化用の辞書を動的生成する
     JAPAN_GEOGRAPHY_DB 全体をスキャンし、エイリアス辞書と曖昧な単語セットを作成する
     """
     if not db:
-        return {}, set()
+        return {}, set(), set() # (★) 3つの値を返す
 
     logger.info("地名正規化マップの動的生成開始...")
     alias_to_city_map = {} # {"日光": "日光市", "尾道": "尾道市"}
     ambiguous_keys = set() # {"広島", "東京", "札幌"}
     prefectures = set() # {"広島県", "東京都"}
     all_cities_wards = set() # {"広島市", "中区", "日光市"}
-    
-    # --- (★) 変更点: ハードコードされた LANDMARK_ALIAS_DB を削除 ---
     
     # 1. DB全体をスキャン
     for key, values in db.items():
@@ -452,8 +461,9 @@ def get_location_normalization_maps(
                     alias_to_city_map[alias] = city_or_ward
                 else:
                     # (★) "府中" (東京都/広島県) のような重複エイリアスは曖昧キーに
+                    if alias in alias_to_city_map: # (★) 修正: del の前に存在確認
+                        del alias_to_city_map[alias]
                     ambiguous_keys.add(alias)
-                    del alias_to_city_map[alias]
 
     # 2. 曖昧キーから、分析指針で特定できるものを救出
     prompt_lower = analysis_prompt_str.lower()
@@ -481,7 +491,8 @@ def get_location_normalization_maps(
     
     logger.info(f"地名正規化マップ動的生成完了。エイリアス: {len(alias_to_city_map)}件, 曖昧キー: {len(final_ambiguous_set)}件")
     
-    return alias_to_city_map, final_ambiguous_set
+    # (★) --- [修正] 3つの値を返す ---
+    return alias_to_city_map, final_ambiguous_set, all_cities_wards
 
 def perform_ai_tagging(
     df_batch: pd.DataFrame,
@@ -508,7 +519,6 @@ def perform_ai_tagging(
             relevant_geo_db = {}
             prompt_lower = analysis_prompt.lower()
             
-            # (★) 既存のロジック (L546-L578) を維持
             hints = ["広島", "福岡", "大阪", "東京", "北海道", "愛知", "宮城", "札幌", "横浜", "名古屋", "京都", "神戸", "仙台"]
             keys_found = [
                 key for key in JAPAN_GEOGRAPHY_DB.keys()
@@ -537,16 +547,19 @@ def perform_ai_tagging(
                 
             logger.info(f"AIに渡す地名辞書(絞込済): {list(relevant_geo_db.keys())}")
             
-            # (★) L518 の新しいヘルパー関数を呼び出す
-            alias_map, ambiguous_set = get_location_normalization_maps(JAPAN_GEOGRAPHY_DB, analysis_prompt)
+            # (★) --- [修正] 3つの値を受け取る ---
+            alias_map, ambiguous_set, all_cities_wards = get_location_normalization_maps(JAPAN_GEOGRAPHY_DB, analysis_prompt)
+            # (★) --- ここまで ---
 
         except Exception as e:
             logger.error(f"地名辞書の準備中にエラー: {e}", exc_info=True)
             geo_context_str = "{}" 
-            alias_map, ambiguous_set = {}, set() 
+            # (★) --- [修正] 3つの変数を初期化 ---
+            alias_map, ambiguous_set, all_cities_wards = {}, set(), set()
             
     else:
-        alias_map, ambiguous_set = {}, set() 
+        # (★) --- [修正] 3つの変数を初期化 ---
+        alias_map, ambiguous_set, all_cities_wards = {}, set(), set() 
 
     # テキストが長すぎる場合、先頭500文字に切り詰める
     input_texts_jsonl = df_batch.apply(
@@ -557,6 +570,7 @@ def perform_ai_tagging(
         axis=1
     ).tolist()
 
+    # (★) プロンプトは変更なし (AIはキーワードを抽出するだけ)
     prompt = PromptTemplate.from_template(
         """
         あなたは高精度データ分析アシスタントです。「カテゴリ定義」「地名辞書」「分析指針」に基づき、キーワードを抽出します。
@@ -629,25 +643,25 @@ def perform_ai_tagging(
                     if processed_value.lower() in ["該当なし", "none", "null", "", "n/a"]:
                         processed_value = ""
                     
-                    # (★) --- 改善: Python 地名正規化ロジック (L518 のマップを使用) ---
+                    # (★) --- [修正] Python 地名正規化ロジック (all_cities_wards が使える) ---
                     if key == "市区町村キーワード" and processed_value:
                         
-                        # (★) 1. エイリアスマップで変換 (例: "日光" -> "日光市", "中区" -> "広島市 中区")
+                        # 1. エイリアスマップで変換 (例: "日光" -> "日光市", "中区" -> "広島市 中区")
                         if processed_value in alias_map:
                             processed_value = alias_map[processed_value]
                         
-                        # (★) 2. 曖昧なキー (例: "広島", "東京", "札幌") は破棄
+                        # 2. 曖昧なキー (例: "広島", "東京", "札幌") は破棄
                         elif processed_value in ambiguous_set:
                             logger.debug(f"地名正規化: 曖昧なキー '{processed_value}' を破棄しました。")
                             processed_value = ""
                         
-                        # (★) 3. 都道府県名 (例: "広島県") は破棄 (ambiguous_set に含まれる)
+                        # 3. 都道府県名 (例: "広島県") は破棄 (ambiguous_set に含まれる)
                         
-                        # (★) 4. DBに存在する正式名称 (例: "広島市") か確認
+                        # 4. DBに存在する正式名称 (例: "広島市") か確認
                         elif processed_value in all_cities_wards:
                             pass # (例: "広島市" はそのまま通す)
                         
-                        # (★) 5. それ以外 (例: "アメリカ") は破棄
+                        # 5. それ以外 (例: "アメリカ") は破棄
                         else:
                             # (★) ただし、"広島市 中区" のような「市 区」形式は許可
                             if " " in processed_value and any(s in processed_value for s in ["市", "区"]):
@@ -655,6 +669,7 @@ def perform_ai_tagging(
                             else:
                                 logger.debug(f"地名正規化: 不明なキー '{processed_value}' を破棄しました。")
                                 processed_value = ""
+                    # (★) --- 正規化ロジックここまで ---
 
                     row_result[key] = processed_value
                 
@@ -673,6 +688,134 @@ def perform_ai_tagging(
         st.error(f"AIタグ付け処理エラー: {e}")
         return pd.DataFrame()
 
+def perform_ai_location_inference(
+    df_batch: pd.DataFrame,
+    analysis_prompt: str,
+    normalization_maps: tuple
+) -> pd.DataFrame:
+    """
+    (★ Pass 2) AIを使い、投稿内容や他カテゴリから間接的に地名を「推論」する
+    (★) モデル: MODEL_FLASH_LITE
+    """
+    llm = get_llm(model_name=MODEL_FLASH_LITE, temperature=0.0)
+    if llm is None:
+        logger.error("perform_ai_location_inference: LLM (Flash Lite) が利用できません。")
+        return pd.DataFrame()
+
+    logger.info(f"{len(df_batch)}件 AI地名推論 (Flash Lite) 開始...")
+    
+    # (★) 正規化マップをアンパック (AIの回答を検証するため)
+    alias_map, ambiguous_set, all_cities_wards = normalization_maps
+
+    # AIに渡すコンテキストをJSONL形式で作成
+    # (★) 投稿本文 + Pass 1 でタグ付けされた全カテゴリ をコンテキストにする
+    def create_context(row):
+        context_data = {
+            "id": row['id'],
+            "text": str(row['ANALYSIS_TEXT_COLUMN'])[:500]
+        }
+        # 他のカテゴリ（観光地、農産品など）をヒントとして追加
+        other_tags = {
+            k: v for k, v in row.items() 
+            if k not in ['id', 'ANALYSIS_TEXT_COLUMN', '市区町村キーワード'] and pd.notna(v) and str(v).strip()
+        }
+        if other_tags:
+            context_data["other_tags_context"] = other_tags
+        return json.dumps(context_data, ensure_ascii=False)
+
+    input_contexts_jsonl = df_batch.apply(create_context, axis=1).tolist()
+
+    prompt = PromptTemplate.from_template(
+        """
+        あなたは日本の地理に精通した地名推論AIです。
+        「分析指針」と「コンテキストデータ(JSONL)」を読み、各データから最も関連性の高い「市区町村名」を【1つだけ】推論してください。
+
+        # 分析指針 (Analysis Scope): {analysis_prompt}
+        # コンテキストデータ (JSONL):
+        {text_data_jsonl}
+
+        # 指示:
+        1.  `text`（投稿本文）や `other_tags_context`（他のカテゴリのヒント）を注意深く読みます。
+        2.  ヒントから、最も可能性の高い「市区町村名」を【1つだけ】推論します。
+            (例: "厳島神社" -> "廿日市市")
+            (例: "那須の牛乳" -> "那須塩原市" または "那須町")
+            (例: "テキストに「札幌」とあり、other_tagsに「中央」とあれば" -> "札幌市 中央区")
+        3.  推論した地名キーワード（例: "廿日市市"）を `inferred_location` として返します。
+        4.  地名の変換は不要です（例：「廿日市市」を「廿日市」にしないでください）。
+        5.  推論できない、または「分析指針」と無関係な場合は `null` を返します。
+        6.  出力は【JSONL形式のみ】（id と inferred_location (string or null) を含む辞書）。
+
+        # 回答 (JSONL形式のみ):
+        """
+    )
+    chain = prompt | llm | StrOutputParser()
+    
+    try:
+        invoke_params = {
+            "analysis_prompt": analysis_prompt,
+            "text_data_jsonl": "\n".join(input_contexts_jsonl)
+        }
+        response_str = chain.invoke(invoke_params)
+        logger.debug(f"AI Location Inference - Raw response received.")
+
+        results = []
+        
+        match = re.search(r'```(?:jsonl|json)?\s*([\s\S]*?)\s*```', response_str, re.DOTALL)
+        jsonl_content = match.group(1).strip() if match else response_str.strip()
+
+        for line in jsonl_content.strip().split('\n'):
+            cleaned_line = line.strip()
+            if not cleaned_line: continue
+            try:
+                data = json.loads(cleaned_line)
+                inferred_value = data.get("inferred_location")
+                
+                processed_value = ""
+                if inferred_value and isinstance(inferred_value, str):
+                    processed_value = inferred_value.strip()
+                
+                if processed_value.lower() in ["該当なし", "none", "null", "", "n/a"]:
+                    processed_value = ""
+                
+                # (★) --- 推論結果もPython側で厳密に正規化・検証 ---
+                if processed_value:
+                    # 1. エイリアスマップで変換 (例: AIが "日光" と返した場合)
+                    if processed_value in alias_map:
+                        processed_value = alias_map[processed_value]
+                    
+                    # 2. 曖昧なキー (例: "広島") は破棄
+                    elif processed_value in ambiguous_set:
+                        processed_value = ""
+                    
+                    # 3. DBに存在する正式名称 (例: "廿日市市") か確認
+                    elif processed_value in all_cities_wards:
+                        pass # OK
+                    
+                    # 4. それ以外 (例: "アメリカ") は破棄
+                    else:
+                        if " " in processed_value and any(s in processed_value for s in ["市", "区"]):
+                            pass # "札幌市 中央区" は OK
+                        else:
+                            processed_value = "" # 不明な地名として破棄
+                # (★) --- 正規化ロジックここまで ---
+                
+                results.append({
+                    "id": data.get("id"),
+                    "inferred_location": processed_value
+                })
+                
+            except (json.JSONDecodeError, AttributeError) as json_e:
+                logger.warning(f"AI地名推論 回答パース失敗: {cleaned_line} - Error: {json_e}")
+                id_match = re.search(r'"id":\s*(\d+)', cleaned_line)
+                if id_match:
+                    results.append({"id": int(id_match.group(1)), "inferred_location": ""})
+                    
+        return pd.DataFrame(results) if results else pd.DataFrame(columns=['id', 'inferred_location'])
+
+    except Exception as e:
+        logger.error(f"AI地名推論 バッチ処理中エラー: {e}", exc_info=True)
+        st.error(f"AI地名推論処理エラー: {e}")
+        return pd.DataFrame() # 失敗時は空のDF
 
 # --- 7. (★) Step A: UI描画関数 ---
 
@@ -831,7 +974,7 @@ def render_step_a():
             is_checked = st.checkbox(
                 cat,
                 value=(cat == "市区町村キーワード" or cat in st.session_state.selected_categories),
-                help=desc,
+                help=str(desc),
                 key=f"cat_cb_{cat}",
                 disabled=(cat == "市区町村キーワード")
             )
