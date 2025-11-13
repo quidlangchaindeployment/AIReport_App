@@ -926,7 +926,7 @@ def render_step_a():
         "AIがタグ付けとキュレーションを行う際の指針を入力してください（必須）:",
         value=st.session_state.analysis_prompt_A,
         height=100,
-        placeholder="例: 広島県の観光に関するInstagramの投稿。無関係な地域の投稿や、単なる挨拶・宣伝は除外したい。",
+        placeholder="例: 広島県の観光に関するInstagramの投稿。無関係な地域の投稿や、単なる挨拶・宣伝は除外したい。\n例: ①農産品カテゴリ（牛乳,チーズ,米） ②農産品のイメージ（濃厚,新鮮）",
         key="analysis_prompt_input_A"
     )
     st.session_state.analysis_prompt_A = analysis_prompt
@@ -955,15 +955,12 @@ def render_step_a():
         st.warning("分析指針は必須です。AIがデータを理解するために目的を入力してください。")
         return
 
-    # (★) --- 修正: Step 3 はカテゴリの選択のみに変更 ---
     st.header("Step 3: 分析カテゴリの選択")
     if not st.session_state.generated_categories:
         st.info("Step 2 で「AIにカテゴリ候補を生成させる」ボタンを押してください。")
         return
         
     st.markdown("タグ付けしたいカテゴリを以下から選択してください（「市区町村キーワード」は必須です）")
-    # (★) ... (st.header("Step 4: ...") に名称変更) ...
-    # (★) --- 修正: 名称をStep 4, 5, 6, 7 に変更 ---
     
     selected_cats = []
     cols = st.columns(3)
@@ -974,7 +971,7 @@ def render_step_a():
             is_checked = st.checkbox(
                 cat,
                 value=(cat == "市区町村キーワード" or cat in st.session_state.selected_categories),
-                help=str(desc),
+                help=str(desc), # (★ TypeError 修正)
                 key=f"cat_cb_{cat}",
                 disabled=(cat == "市区町村キーワード")
             )
@@ -1017,7 +1014,6 @@ def render_step_a():
             st.session_state.log_messages = []
             st.session_state.tagged_df_A = pd.DataFrame()
             
-            # (★) --- Tips表示の初期化 ---
             tip_placeholder = st.empty()
             try:
                 with st.spinner("分析TIPSをAIで生成中..."):
@@ -1097,7 +1093,7 @@ def render_step_a():
                         progress_placeholder.progress(1.0, text="処理完了 (対象データ0件)")
                         return
 
-                    # --- 4. (★) AIタグ付け ---
+                    # --- 4. (★) AIタグ付け (Pass 1) ---
                     selected_category_definitions = {
                         cat: desc for cat, desc in st.session_state.generated_categories.items()
                         if cat in st.session_state.selected_categories
@@ -1118,7 +1114,7 @@ def render_step_a():
                         update_progress_ui(
                             progress_placeholder, log_placeholder, tip_placeholder,
                             min(i + TAGGING_BATCH_SIZE, total_rows), total_rows,
-                            f"AIタグ付け (バッチ {current_batch_num}/{total_batches})"
+                            f"AIタグ付け[1/2] (バッチ {current_batch_num}/{total_batches})"
                         )
 
                         tagged_df = perform_ai_tagging(batch_df, selected_category_definitions, analysis_prompt)
@@ -1128,12 +1124,66 @@ def render_step_a():
                         time.sleep(TAGGING_SLEEP_TIME)
 
                     if not all_tagged_results:
-                        raise Exception("AIタグ付け処理に失敗しました。")
-
-                    # --- 5. 最終マージ ---
-                    logger.info("全AIタグ付け結果結合...");
+                        raise Exception("AIタグ付け処理(Pass 1)に失敗しました。")
+                    
                     tagged_results_df = pd.concat(all_tagged_results, ignore_index=True)
 
+                    # --- (★) [改善 A-2] 5. AI地名推論 (Pass 2) ---
+                    
+                    # (★) Pass 1 の結果を一時的にマージ
+                    temp_merged_df = pd.merge(master_df_for_tagging, tagged_results_df, on='id', how='left')
+                    
+                    # (★) 「市区町村キーワード」が空の行を抽出
+                    rows_needing_inference = temp_merged_df[
+                        temp_merged_df['市区町村キーワード'].isnull() | (temp_merged_df['市区町村キーワード'] == '')
+                    ]
+                    
+                    all_inferred_results = []
+                    total_inference_rows = len(rows_needing_inference)
+                    
+                    if total_inference_rows > 0:
+                        logger.info(f"AI地名推論(Pass 2) 開始。対象: {total_inference_rows}件")
+                        # (★) 地名正規化マップを（キャッシュから）取得
+                        norm_maps = get_location_normalization_maps(JAPAN_GEOGRAPHY_DB, analysis_prompt)
+                        
+                        total_inf_batches = (total_inference_rows + TAGGING_BATCH_SIZE - 1) // TAGGING_BATCH_SIZE
+                        
+                        for i in range(0, total_inference_rows, TAGGING_BATCH_SIZE):
+                            if st.session_state.cancel_analysis:
+                                raise Exception("分析がキャンセルされました")
+                            
+                            batch_df = rows_needing_inference.iloc[i:i + TAGGING_BATCH_SIZE]
+                            current_batch_num = (i // TAGGING_BATCH_SIZE) + 1
+                            
+                            update_progress_ui(
+                                progress_placeholder, log_placeholder, tip_placeholder,
+                                min(i + TAGGING_BATCH_SIZE, total_inference_rows), total_inference_rows,
+                                f"AI地名推論[2/2] (バッチ {current_batch_num}/{total_inf_batches})"
+                            )
+
+                            inferred_df = perform_ai_location_inference(batch_df, analysis_prompt, norm_maps)
+                            if inferred_df is not None and not inferred_df.empty:
+                                all_inferred_results.append(inferred_df)
+                            
+                            time.sleep(TAGGING_SLEEP_TIME)
+                        
+                        if all_inferred_results:
+                            inferred_results_df = pd.concat(all_inferred_results, ignore_index=True)
+                            
+                            # (★) Pass 2 の結果を Pass 1 の結果にマージ
+                            tagged_results_df = tagged_results_df.set_index('id')
+                            inferred_results_df = inferred_results_df.set_index('id')
+                            
+                            # (★) inferred_location の値で、'市区町村キーワード' の null/空 を埋める
+                            tagged_results_df['市区町村キーワード'].fillna(inferred_results_df['inferred_location'], inplace=True)
+                            tagged_results_df.loc[tagged_results_df['市区町村キーワード'] == '', '市区町村キーワード'] = inferred_results_df['inferred_location']
+                            
+                            tagged_results_df = tagged_results_df.reset_index()
+                            logger.info("AI地名推論(Pass 2)の結果をマージしました。")
+
+                    # --- 6. 最終マージ ---
+                    logger.info("全AIタグ付け結果結合...");
+                    
                     logger.info("最終マージ処理開始...");
                     final_df = pd.merge(master_df_for_tagging, tagged_results_df, on='id', how='right')
                     
