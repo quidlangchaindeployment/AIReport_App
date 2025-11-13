@@ -3552,327 +3552,194 @@ def render_step_b():
 
 def run_step_c_analysis(
     jsonl_data_string: str,
-    model_name: str,
+    model_name: str, # (★) 引数は残すが、Proに固定
     progress_bar: st.delta_generator.DeltaGenerator,
     log_placeholder: st.delta_generator.DeltaGenerator,
-    custom_instruction: str = "" # (★) 改善 C-4: UIからカスタム指示を受け取る
+    custom_instruction: str = "" 
 ) -> str:
     """
-    (★) Step C: AIレポート生成 (ハイブリッド・RateLimit対応版)
+    (★) Step C: AIレポート生成 (単一リクエスト・ハイブリッド版)
     
-    [新ロジック] ハングアップ (504 Timeout) を回避するため、AIにBase64画像(巨大トークン)を
-    渡すのを *やめ* 、「テキストデータ」のみを渡して考察を生成させる。
-    Python側で、AIの考察(テキスト)と、元のBase64画像を「再結合」する。
+    [新ロジック] gemini-2.5-pro の RPD 50回制限を回避するため、
+    AIへのリクエストを「1回」に限定する。
+    1. Python側で Base64画像 と テキストデータ を分離する。
+    2. AI(Pro)に全テキストデータを渡し、レポート全体のJSON配列を「1回」で生成させる。
+    3. Python側で AIの回答(テキスト) と 元の画像 をマージ（再結合）する。
     """
-    logger.info(f"Step C AIレポート生成 (ハイブリッド処理) 開始... (Model: {model_name})")
+    logger.info(f"Step C AIレポート生成 (単一リクエスト処理) 開始... (Model: {MODEL_PRO})")
+    log_messages_ui = []
+    
+    # --- (★) 1. Python側での前処理 (画像とテキストの分離) ---
+    image_map: Dict[str, Optional[str]] = {}
+    text_data_for_ai: List[str] = []
+    original_tasks: List[Dict[str, Any]] = []
+    
+    try:
+        if not jsonl_data_string:
+            raise ValueError("アップロードされたJSONLデータが空です。")
+            
+        for line in jsonl_data_string.strip().splitlines():
+            if not line.strip(): continue
+            
+            task_json = json.loads(line)
+            original_tasks.append(task_json) # (★) マージ用の元データを保持
+            
+            task_name = task_json.get("analysis_task")
+            if not task_name:
+                continue
+                
+            # (★) 1a. 画像をPython側(image_map)に退避
+            image_base64 = task_json.pop("image_base64", None)
+            if task_name not in image_map:
+                 image_map[task_name] = image_base64
+            
+            # (★) 1b. AIに渡すためのテキスト・数値データのみにする
+            task_json["image_base64"] = None
+            
+            # (★) トークン数節約のため、巨大なデータはサマリのみにする
+            if "data" in task_json and len(json.dumps(task_json["data"])) > 1000:
+                task_json["data"] = f"（データプレビュー: {str(task_json['data'])[:1000]}...）"
+            
+            text_data_for_ai.append(json.dumps(task_json, ensure_ascii=False))
 
-    # (★) --- 1. モデルのRPM制限とスリープ時間を定義 ---
-    if model_name == MODEL_PRO:
-        rpm_limit = 2
-        tpm_limit = 125000
-    else: # (★) デフォルトは Flash
-        model_name = MODEL_FLASH
-        rpm_limit = 10
-        tpm_limit = 250000
+        if not text_data_for_ai:
+            raise ValueError("分析対象のタスクデータが0件です。")
+            
+        text_data_input_str = "\n".join(text_data_for_ai)
+        logger.info(f"AIへの入力データ準備完了。{len(text_data_for_ai)}件のタスクを1回のリクエストに統合。")
         
-    sleep_time = (60 / rpm_limit) + 0.5 # (e.g., Pro: 30.5s, Flash: 6.5s)
-    
-    logger.info(f"モデル: {model_name}, RPM: {rpm_limit}, 待機: {sleep_time:.1f}秒")
+    except Exception as e:
+        logger.error(f"Step C: AIへの入力データ前処理中にエラー: {e}", exc_info=True)
+        st.error(f"Step C 入力データ処理エラー: {e}")
+        return "[]"
 
-    # (★) --- 2. チャンク生成用のAIプロンプトテンプレートを定義 (品質向上) ---
+    # --- (★) 2. AIプロンプトの構築 (単一リクエスト用) ---
     
-    # (★) [改善 C-4] カスタム指示が空でない場合、プロンプトに挿入するブロックを定義
+    # (★) ユーザー指示ブロック
     custom_instruction_block = ""
     if custom_instruction and custom_instruction.strip():
         custom_instruction_block = f"""
-        # (重要) ユーザーからの追加指示:
+        # (重要) ユーザーからの全体方針:
         * {custom_instruction.strip()}
-        * この指示を最優先で考慮してください。
+        * この指示を最優先で考慮し、レポート全体のトーンと考察に反映してください。
         """
 
-    # (★) [改善 C-1, C-2]
-    ITERATIVE_SLIDE_PROMPT_TEMPLATE = """
-    あなたはシニアデータアナリストであり、クライアント向けレポートの「スライド1枚」の
-    【テキスト部分】を作成しています。
-    提供される「分析タスクデータ」を読み、このタスク専用の
-    スライドタイトルと考察（slide_content）を生成してください。
+    # (★) ご提示いただいたプロンプト方針を反映
+    ONE_SHOT_PROMPT_TEMPLATE = """
+    あなたは、シニアデータアナリスト兼PowerPoint構成作家です。
+    以下の「分析データ（JSONL形式）」と「資料作成の指針」に基づき、
+    クライアント向けPowerPointレポートの全スライドを構成する
+    【単一のJSON配列（`[...]`）】を生成してください。
 
-    # 分析タスクデータ (テキスト・数値データのみ):
-    {task_data_text_only}
+    # 分析データ (Input: JSONL形式):
+    {text_data_jsonl}
     
-    # (★) [改善 C-2] 画像コンテキスト:
-    {image_context}
-    
-    # (★) [改善 C-4] ユーザーの全体方針:
+    # ユーザーの全体方針 (User Instruction):
     {custom_instruction}
 
-    # 指示:
-    1.  **タイトル**: `task_data_text_only` の `analysis_task` 名に基づき、 professional な「slide_title」を考案してください。
-    
-    2.  **(★) [改善 C-1] 考察 (最重要)**: 
-        `task_data_text_only` の `summary` と `data`（テーブルデータ）を解釈し、クライアントが知るべき【インサイト】を **Markdownの箇条書き** で記述してください。
-        以下の3つの視点（何を・なぜ・だから何）で構成してください。
+    # 資料作成の指針 (Rules):
+    1.  **ストーリー構築:** 「分析データ」全体を俯瞰し、「背景→課題→解決策→効果」や「結論ファースト」など、一貫性のあるストーリーを構築してください。
         
-        * **何を（What）:** データが示す最も重要な「事実」や「傾向」は何か？ (例: `**〇〇** が **XX%** 増加...`)
-        * **なぜ（Why）:** なぜその傾向が起きているのか？（背景や原因の「仮説」）
-        * **だから何（So What）:** この事実から推測できる「次のアクションのヒント」は何か？
-
-    3.  **書式**:
-        - 回答は【Markdown形式】を使用してください。
-        - 重要なキーワードや数値は `**太字**` で強調してください。
+    2.  **スライド構成:**
+        「表紙」「目次（アジェンダ）」「各分析スライド」「結論と戦略的提言」を必ず含めてください。
+        
+    3.  **グラフ・表の解釈:** `image_note: "Base64 encoded..."` や `image_note: "No image (pyvis HTML)"` と書かれたタスクは「グラフ」や「ネットワーク図」です。
+        あなたに画像は見えませんが、付随する `data`（JSON文字列）や `summary` を読み解き、そのグラフが「何を意味するのか」の**考察（インサイト）**を生成してください。
+        
+    4.  **考察の品質 (最重要):** 各スライドの考察（`slide_content`）は、**「何を（What）」「なぜ（Why）」「だから何（So What）」**の3点を含む、高品質なMarkdownの箇条書き（`**太字**`強調あり）にしてください。
+    
+    5.  **(★) キーの保持:**
+        生成する各スライドオブジェクトには、`slide_title`（AIが考案したタイトル）に加えて、
+        **`"analysis_task_key": "（元の analysis_task 名）"`** というキーを必ず含めてください。（例: `"analysis_task_key": "単純集計: 話題カテゴリ"`）
+        * これにより、Python側で後から画像を正しくマージできます。
+        * 「表紙」「目次」「結論」スライドの `analysis_task_key` は `null` にしてください。
 
     # 出力形式 (厳守):
-    * JSON以外のテキストは絶対に含めず、【単一のJSONオブジェクト】`{{ ... }}` のみを出力してください。
-    * 以下の構造を厳格に守ってください。
-        {{
-          "slide_title": "（指示1で考案したタイトル）",
-          "slide_content": [
-            "（指示2, 3 に基づく Markdown 形式のインサイト1: **何を**...）",
-            "（指示2, 3 に基づく Markdown 形式のインサイト2: **なぜ**...）",
-            "（指示2, 3 に基づく Markdown 形式のインサイト3: **だから何**...）"
-          ]
-        }}
+    * **JSON以外のテキスト（「承知しました」など）は【絶対に】含めないでください。**
+    * **出力は【単一のJSON配列 `[...]` のみ】** とします。
+    * 各スライドオブジェクトの `image_base64` キーの値は、すべて `null` にしてください。
+    * 構造例:
+      [
+        {{ "slide_title": "SNSデータ分析レポート", "slide_layout": "title_only", "slide_content": ["..."], "analysis_task_key": null, "image_base64": null }},
+        {{ "slide_title": "本日のアジェンダ", "slide_layout": "title_and_content", "slide_content": ["1. ...", "2. ..."], "analysis_task_key": null, "image_base64": null }},
+        {{ "slide_title": "(AI考案のタイトル)", "slide_layout": "title_and_content", "slide_content": ["- **何を**: ...", "- **なぜ**: ..."], "analysis_task_key": "(元の analysis_task 名)", "image_base64": null }},
+        {{ "slide_title": "結論と戦略的提言", "slide_layout": "title_and_content", "slide_content": ["- **結論**: ...", "- **提言**: ..."], "analysis_task_key": null, "image_base64": null }}
+      ]
 
-    # 回答 (単一のJSONオブジェクトのみ):
+    # 回答 (単一のJSON配列のみ):
     """
     
-    prompt = PromptTemplate.from_template(ITERATIVE_SLIDE_PROMPT_TEMPLATE)
+    prompt = PromptTemplate.from_template(ONE_SHOT_PROMPT_TEMPLATE)
 
-    # (★) タイムアウトを 120秒 (2分) に設定
-    llm = get_llm(model_name=model_name, temperature=0.2, timeout_seconds=120)
+    # (★) Proモデル(RPD 50)に固定。タイムアウトを 300秒 (5分) に延長
+    llm = get_llm(model_name=MODEL_PRO, temperature=0.2, timeout_seconds=300)
     if llm is None:
-        st.error(f"AIモデル({model_name})が利用できません。")
+        st.error(f"AIモデル({MODEL_PRO})が利用できません。")
         return "[]" # 空のJSONリスト
     
     chain = prompt | llm | StrOutputParser()
 
-    # (★) --- 3. 逐次処理ループ (変更なし) ---
-    report_slides_list = []
-    log_messages_ui = []
-    
-    tasks_all = jsonl_data_string.strip().splitlines()
-    
-    # 3.1. OverallSummaryを抽出し、残りを処理対象タスクとする
-    summary_line = "{}"
-    tasks_to_process = []
-    for line in tasks_all:
-        if '"analysis_task": "OverallSummary"' in line:
-            summary_line = line
-        else:
-            tasks_to_process.append(line)
-            
-    if not tasks_to_process:
-        logger.warning("処理対象の分析タスクが0件です。")
-        return "[]"
-
-    total_tasks = len(tasks_to_process)
-    logger.info(f"全 {total_tasks} タスクを逐次処理します。")
-    
-    # 3.2. 表紙スライドを追加
-    report_slides_list.append({
-        "slide_title": "SNSデータ分析レポート",
-        "slide_layout": "title_only",
-        "slide_content": ["AI-Generated Analysis (Powered by Gemini)"],
-        "image_base64": None
-    })
-    
-    # 3.3. 目次スライドを追加 (この時点ではタスク名のみ)
+    # --- (★) 3. AIへのリクエスト (RPD 1回) ---
     try:
-        agenda_items = []
-        for i, task_line in enumerate(tasks_to_process):
-            try:
-                task_name = json.loads(task_line).get('analysis_task', f'分析タスク {i+1}')
-            except json.JSONDecodeError:
-                task_name = f'分析タスク {i+1} (読み込みエラー)'
-            agenda_items.append(f"{i+1}. {task_name}")
+        progress_bar.progress(0.1, text=f"Step C: AI({MODEL_PRO})へ全データを送信中...")
+        log_messages_ui.append(f"AI({MODEL_PRO})へ全 {len(text_data_for_ai)} タスクを送信...")
+        log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key="step_c_log_sending")
 
-        agenda_items.append(f"{len(tasks_to_process) + 1}. 結論と戦略的提言")
-        report_slides_list.append({
-            "slide_title": "本日のアジェンダ",
-            "slide_layout": "title_and_content",
-            "slide_content": agenda_items,
-            "image_base64": None
+        response_str = chain.invoke({
+            "text_data_jsonl": text_data_input_str,
+            "custom_instruction": custom_instruction_block
         })
-    except Exception as e:
-        logger.error(f"目次スライドの生成に失敗: {e}")
-
-    # 3.4. メインの分析スライドをループ処理
-    for i, task_line in enumerate(tasks_to_process):
         
-        task_name = f"Task {i+1}/{total_tasks}"
-        original_task_json = {}
+        progress_bar.progress(0.8, text=f"Step C: AI({MODEL_PRO})が応答しました。解析中...")
+        log_messages_ui.append("AIが応答。レポート全体のJSONを解析・マージします...")
+        log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key="step_c_log_received")
+
+        # (★) 堅牢なJSON配列パース
+        start = response_str.find('[')
+        end = response_str.rfind(']')
         
-        try:
-            # 3.4.1. タスクのパースと画像/テキストの分離
-            original_task_json = json.loads(task_line)
-            task_name = original_task_json.get('analysis_task', task_name)
+        if start == -1 or end == -1 or end < start:
+            raise Exception("AIがJSON配列 `[...]` を返しませんでした。")
+        
+        json_array_str = response_str[start:end+1]
+        ai_generated_list = json.loads(json_array_str)
 
-            # 1. 画像をPython変数に退避
-            image_to_pass_through = original_task_json.get("image_base64")
-            
-            # (★) [改善 C-2] 画像コンテキストを定義
-            image_context_str = "（このスライドには画像は含まれません。）"
-            if image_to_pass_through:
-                image_context_str = (
-                    "（(注) このスライドにはグラフやワードクラウド等の「データ可視化画像」が1枚含まれます。\n"
-                    "   あなたに画像は見えませんが、`data` や `summary` を根拠に、"
-                    "   その画像が「何を意味するのか」を解説する考察を記述してください。）"
-                )
-            
-            # 2. AIに渡す「テキストのみ」のJSONを作成
-            text_only_task_json = original_task_json.copy()
-            text_only_task_json["image_base64"] = None
-            if "data" in text_only_task_json and len(json.dumps(text_only_task_json["data"])) > 1000:
-                text_only_task_json["data"] = f"（データプレビュー: {str(text_only_task_json['data'])[:1000]}...）"
-            
-            task_data_text_only_str = json.dumps(text_only_task_json, ensure_ascii=False) # (★) ensure_ascii=False
-            
-        except Exception as e:
-            logger.error(f"タスク '{task_name}' のJSONパースに失敗: {e}")
-            log_messages_ui.append(f"  -> ERROR: '{task_name}' のJSONパースに失敗。スキップします。")
-            continue
+        if not isinstance(ai_generated_list, list):
+             raise Exception("AIの回答がJSON配列(リスト)ではありません。")
 
-        # 3.4.2. UI（進捗バー・ログ）の更新
-        progress_percent = (i + 1) / (total_tasks + 1)
-        progress_bar.progress(progress_percent, text=f"Step C (スライド生成中): {i+1}/{total_tasks} (モデル: {model_name})")
-        log_messages_ui.append(f"[{i+1}/{total_tasks}] '{task_name}' の処理を開始...")
-        log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key=f"step_c_log_{i}")
-
-        try:
-            # 3.4.3. AIへのリクエスト (テキストのみ)
-            log_messages_ui.append(f"  -> AI ({model_name}) にリクエストを送信... (Timeout: 120s)")
-            log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key=f"step_c_log_{i}_sending")
+        # --- (★) 4. Python側での後処理 (画像のマージ) ---
+        final_report_list = []
+        
+        for slide in ai_generated_list:
+            if not isinstance(slide, dict): continue
             
-            response_str = chain.invoke({
-                "task_data_text_only": task_data_text_only_str,
-                "image_context": image_context_str, # (★) C-2
-                "custom_instruction": custom_instruction_block # (★) C-4
-            })
+            task_key = slide.get("analysis_task_key")
             
-            log_messages_ui.append(f"  -> AI が応答しました。レスポンスを解析中...")
-            log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key=f"step_c_log_{i}_received")
-
-            # (★) [改善 C-3] 堅牢なJSONパース
-            start = response_str.find('{')
-            end = response_str.rfind('}')
-            
-            if start != -1 and end != -1 and end > start:
-                json_str = response_str[start:end+1]
-                ai_response_json = json.loads(json_str)
+            # (★) AIが指定したキーに基づき、退避させていた画像をマージ
+            if task_key and task_key in image_map:
+                image_data = image_map[task_key]
+                slide["image_base64"] = image_data
                 
-                # 3.4.4. AIの考察と、退避させた画像を「再結合」
-                final_slide_object = {
-                    "slide_title": ai_response_json.get("slide_title", task_name),
-                    "slide_layout": "text_and_image" if image_to_pass_through else "title_and_content",
-                    "slide_content": ai_response_json.get("slide_content", ["AIによる考察の生成に失敗しました。"]),
-                    "image_base64": image_to_pass_through # (★) ここで画像を戻す
-                }
-                report_slides_list.append(final_slide_object)
-                log_messages_ui.append(f"  -> SUCCESS: スライド '{final_slide_object.get('slide_title')}' を生成しました。")
-            else:
-                raise Exception("AIがJSONオブジェクト `{{...}}` を返しませんでした。")
-        
-        except Exception as e:
-            logger.error(f"タスク '{task_name}' の処理に失敗: {e}", exc_info=True)
-            log_messages_ui.append(f"  -> ERROR: '{task_name}' の処理に失敗。{e}")
-            report_slides_list.append({
-                "slide_title": f"エラー: {task_name}",
-                "slide_layout": "title_and_content",
-                "slide_content": [f"このスライドの生成に失敗しました。", f"エラー: {e}"],
-                "image_base64": None
-            })
-        
-        # 3.4.5. Rate Limit のための待機
-        if i < total_tasks:
-            log_messages_ui.append(f"  -> Rate Limit (RPM) のため {sleep_time:.1f} 秒待機します...")
-            log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key=f"step_c_log_{i}_sleep")
-            time.sleep(sleep_time)
-
-    # (★) 4. 結論スライドの生成 (品質向上)
-    try:
-        chunk_name = f"結論スライド"
-        progress_percent = 1.0
-        progress_bar.progress(progress_percent, text=f"Step C (チャンク処理中): {chunk_name} (モデル: {model_name})")
-        log_messages_ui.append(f"[{total_tasks+1}/{total_tasks+1}] {chunk_name} の処理を開始...")
-        log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key="step_c_log_final")
-
-        conclusion_llm = get_llm(model_name=model_name, temperature=0.2, timeout_seconds=120)
-        if conclusion_llm is None:
-            raise Exception("結論スライド用AIモデルの取得に失敗")
-
-        # (★) [改善 C-1, C-4] 結論プロンプトも強化
-        CONCLUSION_PROMPT_TEMPLATE = """
-        あなたはシニアデータアナリストです。
-        以下の「分析サマリー」と「生成したスライドタイトル」に基づき、
-        レポートの締めくくりとなる【結論と戦略的提言】のスライド1枚分のJSONオブジェクトを生成してください。
-
-        # 分析サマリー (OverallSummary):
-        {summary_data_line}
-        
-        # 生成済みスライドタイトル:
-        {slide_titles}
-
-        # (★) ユーザーの全体方針:
-        {custom_instruction}
-
-        # 指示:
-        1.  タイトルは「結論と戦略的提言」とします。
-        2.  レイアウトは「title_and_content」とします。
-        3.  **(★) [改善 C-1] 内容**:
-            分析全体から導かれる「結論（主要な発見）」と、クライアントが次に取るべき「具体的なアクション（提言）」を、Markdownの箇条書きで3〜5点にまとめてください。
+                # (★) 画像があるのにレイアウトがテキストのみなら、強制的に画像レイアウトに変更
+                if image_data and slide.get("slide_layout") == "title_and_content":
+                    slide["slide_layout"] = "text_and_image"
             
-            * **結論 (Key Findings):** （例: `**〇〇** が最も重要な課題であると判明...`）
-            * **提言 (Recommendations):** （例: `**〇〇** にリソースを集中投下し、...`）
-        
-        4.  画像 (image_base64) は null とします。
+            final_report_list.append(slide)
 
-        # 出力形式 (厳守):
-        * JSON以外のテキストは絶対に含めず、【単一のJSONオブジェクト】`{{ ... }}` のみを出力してください。
+        logger.info(f"AIレポート生成・画像マージ完了。{len(final_report_list)}枚のスライドを生成。")
+        progress_bar.progress(1.0, text="Step C: 完了！")
+        log_messages_ui.append(f"SUCCESS: {len(final_report_list)}枚のスライドを生成しました。")
+        log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key="step_c_log_done")
+        
+        return json.dumps(final_report_list, ensure_ascii=False, indent=2)
 
-        # 回答 (単一のJSONオブジェクトのみ):
-        """
-        
-        conclusion_prompt = PromptTemplate.from_template(CONCLUSION_PROMPT_TEMPLATE)
-        conclusion_chain = conclusion_prompt | conclusion_llm | StrOutputParser()
-        
-        log_messages_ui.append(f"  -> AI ({model_name}) にリクエストを送信... (Timeout: 120s)")
-        log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key="step_c_log_final_sending")
-        
-        response_str = conclusion_chain.invoke({
-            "summary_data_line": summary_line,
-            "slide_titles": json.dumps([s.get('slide_title') for s in report_slides_list], ensure_ascii=False),
-            "custom_instruction": custom_instruction_block # (★) C-4
-        })
-        
-        log_messages_ui.append(f"  -> AI が応答しました。レスポンスを解析中...")
-        log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key="step_c_log_final_received")
-
-        # (★) [改善 C-3] 堅牢なJSONパース
-        start = response_str.find('{')
-        end = response_str.rfind('}')
-            
-        if start != -1 and end != -1 and end > start:
-            json_str = response_str[start:end+1]
-            report_slides_list.append(json.loads(json_str))
-            log_messages_ui.append(f"  -> SUCCESS: 結論スライドを生成しました。")
-        else:
-            raise Exception("AIが結論スライドのJSONを返しませんでした。")
-            
     except Exception as e:
-         logger.error(f"結論スライドの生成に失敗: {e}")
-         log_messages_ui.append(f"  -> ERROR: 結論スライドの生成に失敗。{e}")
-         report_slides_list.append({
-                "slide_title": "結論と戦略的提言 (生成失敗)",
-                "slide_layout": "title_and_content",
-                "slide_content": [f"結論スライドの自動生成に失敗しました。", f"エラー: {e}"],
-                "image_base64": None
-            })
-
-    # (★) 5. 最終的なJSON文字列を返す
-    progress_bar.progress(1.0, text="Step C: 完了！")
-    log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key="step_c_log_done")
-    
-    return json.dumps(report_slides_list, ensure_ascii=False, indent=2)
+        logger.error(f"Step C (単一リクエスト) 実行エラー: {e}", exc_info=True)
+        st.error(f"AIレポート生成中にエラーが発生しました: {e}")
+        progress_bar.progress(1.0, text="エラーにより中断")
+        log_messages_ui.append(f"ERROR: {e}")
+        log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key="step_c_log_error")
+        return "[]"
 
 def render_step_c():
     """(Step C) AIレポート生成UIを描画する"""
@@ -3882,14 +3749,16 @@ def render_step_c():
     if 'step_c_jsonl_data' not in st.session_state:
         st.session_state.step_c_jsonl_data = None
     
-    # (★) 改善 C-4: UIで編集する指示 (Task ⑨ に相当)
     if 'step_c_custom_instruction' not in st.session_state:
         st.session_state.step_c_custom_instruction = ""
         
     if 'step_c_report_json' not in st.session_state:
         st.session_state.step_c_report_json = None
-    if 'step_c_model' not in st.session_state:
-        st.session_state.step_c_model = MODEL_FLASH 
+        
+    # (★) 廃止: step_c_model
+    # if 'step_c_model' not in st.session_state:
+    #     st.session_state.step_c_model = MODEL_FLASH 
+        
     if 'current_file_id_C' not in st.session_state:
         st.session_state.current_file_id_C = None
 
@@ -3909,7 +3778,7 @@ def render_step_c():
                 logger.info(f"Step C: 新しいJSON {current_file_id_C} をロードします。")
                 jsonl_data_string = uploaded_report_file.getvalue().decode('utf-8')
                 st.session_state.step_c_jsonl_data = jsonl_data_string
-                st.session_state.step_c_report_json = None # (★) 結果をリセット
+                st.session_state.step_c_report_json = None 
                 st.session_state.current_file_id_C = current_file_id_C
                 st.success(f"ファイル「{uploaded_report_file.name}」読込完了")
             
@@ -3929,35 +3798,15 @@ def render_step_c():
     # --- 2. 分析レポートの実行 ---
     st.header("Step 2: AI分析レポートの実行")
 
-    # (★) --- 修正: モデル選択UI ---
-    st.markdown("分析に使用するAIモデルを選択してください。")
-    
-    model_options = [MODEL_FLASH, MODEL_PRO]
-    try:
-        default_index = model_options.index(st.session_state.step_c_model)
-    except ValueError:
-        default_index = 0
-        
-    selected_model_name = st.radio(
-        "使用モデル",
-        options=model_options,
-        index=default_index,
-        key="step_c_model_radio",
-        horizontal=True,
+    # (★) --- [修正] モデル選択UIを削除し、Proモデル固定の警告を表示 ---
+    st.warning(
+        f"**`{MODEL_PRO}` (50 RPD / 2 RPM) を使用します。**\n"
+        f"RPD（1日あたりのリクエスト）を節約するため、AIへのリクエストは**1回**のみ実行されます。\n"
+        f"（生成には数分かかる場合があります）"
     )
-    st.session_state.step_c_model = selected_model_name
-
-    if selected_model_name == MODEL_PRO:
-        st.warning(
-            f"**`{MODEL_PRO}` (無料枠) は 2 RPM (30秒/リクエスト) の制限があります。**\n"
-            f"スライド10枚の生成には約5分かかります。ご注意ください。"
-        )
-    else:
-        st.info(
-            f"**`{MODEL_FLASH}` (無料枠) は 10 RPM (6秒/リクエスト) の制限があります。**\n"
-            f"比較的 高速に生成できます。（推奨）"
-        )
+    # (★) --- (L2701-L2731 の st.radio と if/else を削除) ---
     
+    # (★) --- カスタム指示のUI (変更なし) ---
     st.markdown("---")
     st.subheader("（オプション）AIへの追加指示")
     st.info("レポート全体を通してAIに意識させたい「分析の視点」や「特に注目すべき点」があれば入力してください。")
@@ -3979,12 +3828,13 @@ def render_step_c():
         progress_bar = st.progress(0.0, text="Step C: 分析待機中...")
         log_placeholder = st.empty()
 
-        selected_model = st.session_state.step_c_model
+        # (★) [修正] selected_model を MODEL_PRO に固定
+        selected_model = MODEL_PRO
         
         try:
             st.session_state.step_c_report_json = run_step_c_analysis(
                 st.session_state.step_c_jsonl_data,
-                selected_model,
+                selected_model, # (★) Pro が渡される
                 progress_bar, 
                 log_placeholder,
                 st.session_state.step_c_custom_instruction 
@@ -4041,13 +3891,12 @@ def render_step_c():
                     
                     expander_label = f"**{i+1}: {title}** (Layout: {layout}, Image: {has_image})"
                     with st.expander(expander_label):
-                        # (★) プレビューで Markdown をレンダリング
                         st.markdown(f"**内容:**")
                         if isinstance(slide_content_list, list):
                             for content_line in slide_content_list:
                                 st.markdown(content_line)
                         else:
-                            st.markdown(str(slide_content_list)) # フォールバック
+                            st.markdown(str(slide_content_list)) 
             else:
                 st.error("AIの回答が期待したスライドのリスト形式ではありません。")
                 st.text_area("AIの生回答 (JSON):", value=st.session_state.step_c_report_json, height=200, disabled=True)
@@ -4057,7 +3906,6 @@ def render_step_c():
             st.text_area("AIの生回答 (パース失敗):", value=st.session_state.step_c_report_json, height=200, disabled=True)
             
         st.success("データをダウンロードし、Step D (PowerPoint生成) に進んでください。")
-
 
 # (★) ---Step D---
 try:
