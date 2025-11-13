@@ -107,7 +107,7 @@ MODEL_PRO = "gemini-2.5-pro"             # Step C, D (高品質)
 # バッチサイズと待機時間 (KISS)
 FILTER_BATCH_SIZE = 50
 FILTER_SLEEP_TIME = 6.1  # Rate Limit 対策 (10 requests per 60 seconds)
-TAGGING_BATCH_SIZE = 10
+TAGGING_BATCH_SIZE = 50  
 TAGGING_SLEEP_TIME = 6.1  # Rate Limit 対策
 
 # 地名辞書
