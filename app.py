@@ -15,6 +15,7 @@ import os
 import re
 import json
 import logging
+import random  
 import time
 import spacy
 import altair as alt
@@ -100,7 +101,7 @@ except ImportError:
 # --- 2. (★) 定数定義 ---
 
 # (★) 要件に基づき、使用するAIモデルを定数として定義
-MODEL_FLASH_LITE = "gemini-2.5-flash" # Step A, B (高速・効率的)
+MODEL_FLASH_LITE = "gemini-2.5-flash-lite" # Step A, B (高速・効率的)
 MODEL_FLASH = "gemini-2.5-flash"         # Step D (代替)
 MODEL_PRO = "gemini-2.5-pro"             # Step C, D (高品質)
 
@@ -493,175 +494,135 @@ def get_location_normalization_maps(
     # (★ NameError 修正) 3つの値を返す
     return alias_to_city_map, final_ambiguous_set, all_cities_wards
 
+@st.cache_data(ttl=3600)
+def get_dynamic_exclusion_list(analysis_prompt: str) -> List[str]:
+    """
+    分析指針に基づき、特性抽出のノイズとなる「品目・部位・料理名」を
+    AI (Flash Lite) で動的にリストアップする。
+    """
+    llm = get_llm(model_name=MODEL_FLASH_LITE, temperature=0.0)
+    if llm is None:
+        # フォールバック用のデフォルトリスト
+        return ["肉", "牛肉", "和牛", "牛", "ビーフ", "ステーキ", "ハンバーグ", "丼", "定食", "膳", "ローストビーフ"]
+
+    prompt = PromptTemplate.from_template(
+        """
+        あなたはデータ分析のノイズ除去担当です。
+        以下の「分析指針」で扱われる食材に関連する、**「特性（形容詞）」として抽出してはいけない「名詞」**をリストアップしてください。
+
+        # 分析指針:
+        {analysis_prompt}
+
+        # リストアップすべき3つのカテゴリ:
+        1. **品目名・品種名**: (例: 和牛, とちおとめ, 牛肉, ビーフ, 黒毛和牛)
+        2. **部位名 (Parts)**: (例: タン, ハラミ, ロース, ヒレ, サーロイン, モモ, バラ, シャトーブリアン)
+        3. **料理名・加工形態**: (例: ステーキ, ハンバーグ, カレー, 丼, 刺身, パフェ, ジュース, 焼肉, すき焼き)
+        
+        # 指示:
+        - 分析指針から対象品目を特定し、上記3カテゴリに当てはまる単語を20〜30個程度挙げてください。
+        - 出力は純粋な **JSONの文字列リスト形式** `["単語1", "単語2", ...]` のみにしてください。
+
+        # 回答 (JSONリストのみ):
+        """
+    )
+    
+    chain = prompt | llm | StrOutputParser()
+    
+    try:
+        response_str = chain.invoke({"analysis_prompt": analysis_prompt})
+        match = re.search(r'\[.*\]', response_str, re.DOTALL)
+        if match:
+            json_str = match.group(0)
+            exclusion_list = json.loads(json_str)
+            # 基本的なNGワードも追加
+            defaults = ["料理", "ごはん", "ご飯", "ランチ", "ディナー", "食事", "メニュー", "言及なし", "該当なし"]
+            return list(set(exclusion_list + defaults))
+        else:
+            return ["肉", "牛", "和牛", "料理", "ステーキ", "丼"] # 失敗時
+            
+    except Exception as e:
+        logger.error(f"動的除外リスト生成エラー: {e}")
+        return ["肉", "牛", "和牛", "料理"]
+
+import re
+
 def perform_ai_tagging(
     df_batch: pd.DataFrame,
     categories_to_tag: Dict[str, str],
     analysis_prompt: str = ""
 ) -> pd.DataFrame:
     """
-    (Step A) テキストのバッチを受け取り、AIが【指定されたカテゴリ定義】に基づいて直接タグ付けを行う
-    (★) モデル: MODEL_FLASH_LITE
+    (Step A) AIタグ付け (Flash Lite)
+    (★) 改善 v7: 部位・料理名・調理評価の徹底排除と、形容詞フレーズへの純化
     """
     llm = get_llm(model_name=MODEL_FLASH_LITE, temperature=0.0)
     if llm is None:
         logger.error("perform_ai_tagging: LLM (Flash Lite) が利用できません。")
-        st.error("AIモデル(Flash Lite)が利用できません。APIキーを確認してください。")
         return pd.DataFrame()
 
-    # spaCyモデルをロード
     nlp = load_spacy_model()
     
-    logger.info(f"{len(df_batch)}件 AIタグ付け (Flash Lite) 開始 (カテゴリ: {list(categories_to_tag.keys())})")
-
-    geo_context_str = "{}"
-    alias_map, ambiguous_set, all_cities_wards = {}, set(), set()
+    # (1) 動的除外リストの取得 (品目・部位・料理名)
+    dynamic_targets = get_dynamic_exclusion_list(analysis_prompt)
     
-    # (★) 地名辞書のロード
-    if JAPAN_GEOGRAPHY_DB:
-        try:
-            relevant_geo_db = {}
-            prompt_lower = analysis_prompt.lower()
-            # 全国対応: 全キーをスキャン
-            for key in JAPAN_GEOGRAPHY_DB.keys():
-                simple_name = key.replace("都", "").replace("府", "").replace("県", "").replace("市", "")
-                if key in prompt_lower or simple_name in prompt_lower:
-                    relevant_geo_db[key] = JAPAN_GEOGRAPHY_DB[key]
-            
-            if not relevant_geo_db:
-                default_keys = ["東京都", "大阪府", "愛知県", "福岡県", "北海道"]
-                for d_key in default_keys:
-                    if d_key in JAPAN_GEOGRAPHY_DB:
-                        relevant_geo_db[d_key] = JAPAN_GEOGRAPHY_DB[d_key]
-            
-            geo_context_str = json.dumps(relevant_geo_db, ensure_ascii=False, indent=2)
-            if len(geo_context_str) > 5000:
-                geo_context_str = json.dumps(list(relevant_geo_db.keys()), ensure_ascii=False)
-            
-            alias_map, ambiguous_set, all_cities_wards = get_location_normalization_maps(JAPAN_GEOGRAPHY_DB, analysis_prompt)
-        except Exception as e:
-            logger.error(f"地名辞書の準備中にエラー: {e}", exc_info=True)
-            geo_context_str = "{}" 
-            alias_map, ambiguous_set, all_cities_wards = {}, set(), set()
+    # (2) 静的な除外リスト (感情・メタ記述)
+    static_exclusion = set([
+        "美味しい", "おいしい", "最高", "絶品", "うまい", "美味", "幸せ", "感動", "好き", "大好き", "満足",
+        "言及なし", "該当なし", "不明", "特になし", "記述なし"
+    ])
 
-    # (★) 除外リストの生成
-    exclusion_patterns = set() 
-    exclusion_exact = set()
-
-    # 1. 静的パターン (料理・感情・一般名詞・部位)
-    static_patterns = {
-        # 料理・メニュー・部位・形状 (NGワード強化)
-        "焼き加減", "ステーキ", "カレー", "ハンバーグ", "タルタル", "ポワレ", "ロティ", "ソテー", "グリル", "ロースト",
-        "ロール", "握り", "メンチ", "すき焼", "しゃぶしゃぶ", "牛丼", "バーガー", "サンド", "パフェ", "ケーキ",
-        "テンダーロイン", "ヒレ", "ロース", "肩肉", "タン", "ハラミ", "ミノ", "レバー", "モモ", "サーロイン",
-        "丼", "膳", "コース", "弁当", "定食", "ランチ", "ディナー", "ビュッフェ", "食べ放題",
-        "缶", "パック", "箱", "ギフト", "贈答", "お土産", "サイズ", "入り", "個", "セット", "ジャム",
-        "栽培", "収穫", "農家", "直売", "入荷", "販売", "ドレッシング", "ソース",
-        # 主観・感情
-        "優勝", "神", "レベチ", "感動", "感激", "大好き", "幸せ", "最高", "絶品", "至福",
-        "美味しい", "おいしい", "美味しかった", "おいしかった", "美味い", "うまい", "旨い", "ウマい", "激ウマ",
-        "うまうま", "うめぇ", "すんごい", "一番", "サイコー", "良質", "優秀", "完璧",
-        "嬉しい", "たのしい", "楽しい", "満喫", "ビビった", "やばい", "すごい", "素晴らしい",
-        "狩り", "季節", "冬", "春", "夏", "秋", "名前", "品種", "ちゃん", "さん", "くん",
-        # 製品名 (バリエーション)
-        "とちぎ和牛", "和牛", "黒毛和牛", "黒毛", "牛肉", "ビーフ", "肉用牛", 
-        "雄牛", "雌牛", "子牛", "ホルモン", "国産", "県産", "とちぎ", "栃木", "那須",
-        "とちおとめ", "スカイベリー", "とちあいか", "ミルキーベリー", "とちひめ", "いちご", "イチゴ", "苺"
-    }
-    exclusion_patterns.update(static_patterns)
-    
-    exclusion_patterns.update(ambiguous_set) 
-    exclusion_patterns.update(all_cities_wards)
-
-    # 2. 単体NGワード
-    static_exact = {
-        "肉", "牛", "豚", "鶏", "魚", "野菜", "果物",
-        "美味", "幸", "好", "良", "美", "優"
-    }
-    exclusion_exact.update(static_exact)
-
-    try:
-        matches = re.findall(r'「([^」]+)」', analysis_prompt)
-        if matches:
-            for match in matches:
-                items = re.split(r'[,、\s]+', match)
-                for item in items:
-                    if item.strip() and len(item.strip()) > 1: 
-                        exclusion_patterns.add(item.strip().lower())
-        
-        for cat_name in categories_to_tag.keys():
-             if cat_name != "市区町村キーワード":
-                 exclusion_patterns.add(cat_name.lower())
-                 exclusion_patterns.add(cat_name.replace("カテゴリ", "").replace("特性", "").strip().lower())
-    except Exception as e:
-        logger.warning(f"除外キーワードセットの生成に失敗: {e}")
-
-    # (★) 3. 食の重視価値の定義リスト
-    valid_orientations = [
-        "経済性志向", "健康志向", "簡便化志向", "安全志向", "美食志向", "手作り志向",
-        "国産志向", "ダイエット志向", "地元産志向", "外食志向", "高級志向", "環境志向"
-    ]
-    
-    # (★) 4. 特性として許可する「安全な名詞（属性）」リスト
-    safe_attribute_nouns = {
-        "甘み", "旨み", "辛み", "酸味", "苦味", "塩味", 
-        "香り", "匂い", "風味", "コク", "キレ", 
-        "食感", "舌触り", "喉越し", "歯ごたえ", "弾力",
-        "見た目", "色", "形", "大きさ", "サイズ", "鮮度", 
-        "脂", "サシ", "霜降り", "赤身", "肉質", "肉汁",
-        "バランス", "相性", "アクセント", "余韻"
-    }
+    # (3) 末尾一致で削除するNGパターン (料理名・セット名など)
+    # Regex: 〜丼, 〜膳, 〜定食, 〜コース, 〜のせ, 〜入り, 〜添え, 〜風, 〜味
+    suffix_ng_pattern = re.compile(r'(丼|膳|定食|コース|のせ|入り|添え|風|味|ランチ|ディナー|セット)$')
 
     input_texts_jsonl = df_batch.apply(
         lambda row: json.dumps(
-            {"id": row['id'], "text": str(row['ANALYSIS_TEXT_COLUMN'])[:500]},
+            {"id": row['id'], "text": str(row['ANALYSIS_TEXT_COLUMN'])[:800]},
             ensure_ascii=False
         ),
         axis=1
     ).tolist()
 
-    # (★) --- プロンプトの全面修正 ---
+    # (★) プロンプトテンプレート
     prompt = PromptTemplate.from_template(
         """
-        あなたは高精度データ分析アシスタントです。
-        「カテゴリ定義」に基づき、「テキストデータ(JSONL)」の各行を処理し、指定された全カテゴリの値をJSONL形式で返してください。
+        あなたは厳格なデータ抽出AIです。
+        「分析指針」と「カテゴリ定義」に基づき、食材の**「状態・性質（Attributes）」**のみを抽出してください。
 
-        # カテゴリ定義 (JSON形式): {categories}
-        # 除外キーワード: {exclusion_list}
-        # テキストデータ (JSONL): {text_data_jsonl}
+        # 分析指針:
+        {analysis_prompt}
 
-        # 指示:
-        1. 「テキストデータ(JSONL)」の各行を処理します。
-        2. 「カテゴリ定義」のキー名を厳格に使用します。
+        # カテゴリ定義:
+        {categories}
 
-        3. **【最重要】特別ルール (「特性」や「イメージ」を求めるカテゴリ (例: "農産品特性")): **
-           テキストから、対象品目の**「状態・性質（形容詞・形容動詞）」**のみを抽出してください。
-           **「物体・メニュー名（名詞）」は絶対に出力しないでください。**
+        # 【最重要】「農産物特性」の抽出ルール:
+        食材（肉、野菜など）の**「テクスチャ（食感）」「味覚」「見た目」「品質評価」を表す形容詞的フレーズ**のみを抽出してください。
 
-           * **【許可 (OK)】: 状態・性質の描写**
-             * `柔らかい`, `甘い`, `濃厚`, `ジューシー`, `脂が乗っている`, `サシが入っている`, `香りが良い`, `新鮮`
-           
-           * **【禁止 (NG)】: 物体・料理・事実**
-             * `ロール`, `握り`, `ステーキ`, `カレー` (料理名)
-             * `ロース`, `黒毛`, `雌`, `雄`, `A5` (部位・事実)
-             * `焼き加減`, `揚げたて` (調理)
-             * `感動`, `最高` (感想)
+        **1. 思考プロセス（Thinking Process）:**
+           - 抽出候補が「メニュー名（～丼、～カレー）」や「部位名（タン、ヒレ）」などの**「名詞（物体）」**である場合は、特性ではないので**破棄**する。
+           - 「焼き加減」や「揚げたて」などの**「調理技術・状態」**である場合も、素材の特性ではないので**破棄**する。
+           - 残った**「柔らかい」「甘い」「香り高い」「サシが凄い」**のような、**状態を表す言葉**だけを残す。
+        
+        **2. NGルール（抽出禁止）:**
+           - × 料理名：ハンバーグ、ステーキ、ローストビーフ丼、カレー
+           - × 部位名：タン、ハラミ、ロース、ヒレ、モモ
+           - × 調理評価：焼き加減、レア、ウェルダン、熱々
+           - × 単なる主語：和牛、お肉、ビーフ
 
-           * **(回答例):**
-             * `「焼き加減が最高のステーキ」` -> `""` (※焼き加減もステーキもNG)
-             * `「口の中でとろける」` -> `「とろけるような食感」` (※状態描写なのでOK)
-             * `「サシが入った黒毛和牛」` -> `「サシが入っている」` (※黒毛和牛はNGだがサシはOK)
+        # 出力例 (Few-Shot):
+        - テキスト: "焼き加減最高で、国産のローストビーフ丼。赤身の旨味が強くて丁度良い。"
+          -> {{ "categories": {{ "農産物特性": "赤身の旨味が強い" }} }}
+             (※「焼き加減」「ローストビーフ丼」は除外。「丁度良い」も具体性がないため除外推奨)
 
-        4. **特別ルール (「食の重視価値」など選択肢があるカテゴリ): **
-           * 必ず以下のリストから、最も適切なものを【完全な名称で】1つだけ選んでください。
-           * リスト: [経済性志向, 健康志向, 簡便化志向, 安全志向, 美食志向, 手作り志向, 国産志向, ダイエット志向, 地元産志向, 外食志向, 高級志向, 環境志向]
-           * 該当しない場合は `その他` としてください。「志向」という単語単体での出力は禁止です。
+        - テキスト: "柔らかいヒレ肉で感動した。"
+          -> {{ "categories": {{ "農産物特性": "柔らかい" }} }}
+             (※「ヒレ肉」という部位名は除外)
 
-        5. **特別ルール (例: "市区町村キーワード"): **
-           * テキストに含まれる地名キーワードをそのまま抽出します。
+        # 対象テキストデータ (JSONL):
+        {text_data_jsonl}
 
-        6. 出力は【JSONL形式のみ】（id と、"カテゴリ定義" の全キーを含む辞書）。
-
-        # 回答 (JSONL形式のみ):
+        # 回答フォーマット (JSONL):
+        {{ "id": 123, "categories": {{ "カテゴリ名": "値" }} }}
         """
     )
     
@@ -669,14 +630,11 @@ def perform_ai_tagging(
     
     try:
         invoke_params = {
+            "analysis_prompt": analysis_prompt,
             "categories": json.dumps(categories_to_tag, ensure_ascii=False),
-            "geo_context": geo_context_str,
-            "exclusion_list": json.dumps(list(exclusion_patterns)[:50], ensure_ascii=False), 
-            "text_data_jsonl": "\n".join(input_texts_jsonl),
-            "analysis_prompt": analysis_prompt 
+            "text_data_jsonl": "\n".join(input_texts_jsonl)
         }
         response_str = chain.invoke(invoke_params)
-        logger.debug(f"AI Tagging - Raw response received.")
 
         results = []
         expected_keys = list(categories_to_tag.keys())
@@ -689,144 +647,76 @@ def perform_ai_tagging(
             if not cleaned_line: continue
             try:
                 data = json.loads(cleaned_line)
-                row_result = {"id": data.get("id")}
-                tag_source = data.get('categories', data)
+                row_id = data.get("id")
+                extracted_categories = data.get("categories", {})
+                row_result = {"id": row_id}
                 
-                if not isinstance(tag_source, dict):
-                    raise json.JSONDecodeError(f"tag_source is not a dict: {tag_source}", "", 0)
-
                 for key in expected_keys:
-                    found_key = None
-                    for resp_key in tag_source.keys():
-                        if str(resp_key).strip() == key:
-                            found_key = resp_key
-                            break
-                    
-                    raw_value = tag_source.get(found_key) if found_key else None
+                    raw_value = extracted_categories.get(key, "")
                     processed_value = ""
-                    
-                    if isinstance(raw_value, list) and raw_value:
+
+                    if isinstance(raw_value, list):
                         processed_value = ", ".join(str(v).strip() for v in raw_value if str(v).strip())
-                    elif raw_value is not None and str(raw_value).strip():
+                    elif raw_value:
                         processed_value = str(raw_value).strip()
                     
-                    if processed_value.lower() in ["該当なし", "none", "null", "", "n/a"]:
+                    # 1. メタ記述クリーニング
+                    if processed_value.lower() in ["該当なし", "none", "null", "", "不明"]:
                         processed_value = ""
                     
-                    # (★) --- 最終フィルタリング & 補正 ---
-                    
-                    # 1. 【重視価値】の完全一致チェック
-                    if "重視価値" in key or "志向" in key:
-                        # ユーザー定義のリストに完全一致するかチェック
-                        if processed_value not in valid_orientations:
-                            # 部分一致で救済 (例: "食の安全志向" -> "安全志向")
-                            found = False
-                            for v in valid_orientations:
-                                if v in processed_value:
-                                    processed_value = v
-                                    found = True
-                                    break
-                            if not found:
-                                processed_value = "その他" if processed_value else ""
-                                
-                    # 2. 【農産品特性】などの除外・品詞チェック
-                    elif key != "市区町村キーワード" and "カテゴリ" not in key and processed_value:
-                        
-                        # A. NGワード削除 (Pattern)
-                        temp_processed_value = processed_value
-                        for word_to_remove in exclusion_patterns:
-                            if word_to_remove in temp_processed_value.lower():
-                                temp_processed_value = re.sub(f"(?i){re.escape(word_to_remove)}", "", temp_processed_value).strip()
-                        
-                        # B. NGワード削除 (Exact)
-                        if temp_processed_value.strip() in exclusion_exact:
-                            temp_processed_value = ""
-                            
-                        processed_value = temp_processed_value.strip(" ,")
-
-                        # C. (★) spaCyによる「名詞単体」の破棄
-                        if processed_value and nlp:
-                            doc = nlp(processed_value)
-                            
-                            # 全てのトークンが「名詞(NOUN/PROPN)」かつ「安全リスト」に含まれない場合、破棄
-                            # (例: "ロール" -> NOUN -> 破棄)
-                            # (例: "甘み" -> NOUN -> 安全リストにある -> 保持)
-                            # (例: "柔らかい" -> ADJ -> 保持)
-                            # (例: "脂が乗る" -> NOUN+ADP+VERB -> 保持)
-                            
-                            is_all_unsafe_nouns = True
-                            has_valid_content = False
-                            
-                            for token in doc:
-                                if token.pos_ in ["ADJ", "VERB", "AUX"]: # 形容詞、動詞があればOK
-                                    is_all_unsafe_nouns = False
-                                    has_valid_content = True
-                                    break
-                                if token.text in safe_attribute_nouns: # 安全な名詞ならOK
-                                    is_all_unsafe_nouns = False
-                                    has_valid_content = True
-                                    break
-                                if token.pos_ not in ["NOUN", "PROPN", "PUNCT", "SPACE"]:
-                                    # 名詞・記号以外が含まれていればとりあえずOKとする（助詞など）
-                                    is_all_unsafe_nouns = False
-                            
-                            if is_all_unsafe_nouns:
-                                logger.debug(f"名詞単体のため破棄: {processed_value}")
-                                processed_value = ""
-
-                            # D. 文頭・文末のゴミ取り
-                            if processed_value:
-                                # 再解析
-                                doc = nlp(processed_value)
-                                start_idx = 0
-                                end_idx = len(doc)
-
-                                for token in doc:
-                                    if token.pos_ in ["ADP", "AUX", "PUNCT", "SYM", "SPACE", "SCONJ", "CCONJ", "PRON"]:
-                                        start_idx = token.i + 1
-                                    else:
-                                        break
-                                for i in range(len(doc) - 1, start_idx - 1, -1):
-                                    token = doc[i]
-                                    if token.pos_ in ["ADP", "SCONJ", "PUNCT", "SYM", "SPACE", "CCONJ"]:
-                                        end_idx = token.i
-                                    else:
-                                        break
-
-                                if start_idx < end_idx:
-                                    processed_value = doc[start_idx:end_idx].text
-                                else:
-                                    processed_value = ""
-
-                    # (★) --- 地名正規化 ---
+                    # 2. 地名正規化 (既存)
                     if key == "市区町村キーワード" and processed_value:
-                        if processed_value in alias_map:
+                         if processed_value in alias_map:
                             processed_value = alias_map[processed_value]
-                        elif processed_value in ambiguous_set:
-                            processed_value = ""
-                        elif processed_value in all_cities_wards:
-                            pass 
-                        else:
-                            if " " in processed_value and any(s in processed_value for s in ["市", "区"]):
-                                pass
-                            else:
-                                processed_value = ""
+                    
+                    # 3. 【強化】特性カテゴリの強力クリーニング
+                    if key != "市区町村キーワード" and "カテゴリ" not in key and processed_value:
+                        phrases = re.split(r'[,、\s]+', processed_value) # スペースでも分割
+                        clean_phrases = []
+                        
+                        for phrase in phrases:
+                            phrase = phrase.strip()
+                            if not phrase: continue
+                            
+                            # A. 完全一致NG (感情など)
+                            if phrase in static_exclusion: continue
+
+                            # B. 末尾NGチェック (〜丼、〜膳など)
+                            if suffix_ng_pattern.search(phrase): continue
+                            
+                            # C. 焼き加減・調理法チェック
+                            if "焼き加減" in phrase or "揚げ" in phrase: continue
+
+                            # D. 動的NGワードの除去処理
+                            # フレーズ内に「NGワード(和牛など)」が含まれている場合、その単語だけを消す
+                            # 例: "柔らかいヒレ肉" -> "柔らかい"
+                            temp_phrase = phrase
+                            for target in dynamic_targets:
+                                temp_phrase = temp_phrase.replace(target, "")
+                            
+                            # E. 助詞・記号のクリーニング (re.sub)
+                            # 先頭の「の」「な」「が」「は」などを削除
+                            temp_phrase = re.sub(r'^[のにはがをな]+', '', temp_phrase).strip()
+                            # 末尾の「の」「な」などを削除
+                            temp_phrase = re.sub(r'[のにはがをな]$', '', temp_phrase).strip()
+
+                            # F. 残った文字列が意味を成すかチェック
+                            if len(temp_phrase) > 1:
+                                clean_phrases.append(temp_phrase)
+                        
+                        processed_value = ", ".join(clean_phrases)
 
                     row_result[key] = processed_value
                 
                 results.append(row_result)
                 
-            except (json.JSONDecodeError, AttributeError) as json_e:
-                logger.warning(f"AIタグ付け回答パース失敗: {cleaned_line} - Error: {json_e}")
-                id_match = re.search(r'"id":\s*(\d+)', cleaned_line)
-                if id_match:
-                    results.append({"id": int(id_match.group(1))})
-                    
-        return pd.DataFrame(results) if results else pd.DataFrame(columns=['id'] + list(expected_keys))
+            except json.JSONDecodeError:
+                continue
+
+        return pd.DataFrame(results) if results else pd.DataFrame(columns=['id'] + expected_keys)
 
     except Exception as e:
-        logger.error(f"AIタグ付けバッチ処理中エラー: {e}", exc_info=True)
-        st.error(f"AIタグ付け処理エラー: {e}")
+        logger.error(f"AIタグ付け処理エラー: {e}", exc_info=True)
         return pd.DataFrame()
 
 def perform_ai_location_inference(
