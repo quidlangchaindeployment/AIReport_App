@@ -100,15 +100,15 @@ except ImportError:
 # --- 2. (★) 定数定義 ---
 
 # (★) 要件に基づき、使用するAIモデルを定数として定義
-MODEL_FLASH_LITE = "gemini-2.5-flash-lite" # Step A, B (高速・効率的)
+MODEL_FLASH_LITE = "gemini-2.5-flash" # Step A, B (高速・効率的)
 MODEL_FLASH = "gemini-2.5-flash"         # Step D (代替)
 MODEL_PRO = "gemini-2.5-pro"             # Step C, D (高品質)
 
 # バッチサイズと待機時間 (KISS)
 FILTER_BATCH_SIZE = 50
-FILTER_SLEEP_TIME = 6.1  # Rate Limit 対策 (10 requests per 60 seconds)
+FILTER_SLEEP_TIME = 7.6# Rate Limit 対策 (10 requests per 60 seconds)
 TAGGING_BATCH_SIZE = 50  
-TAGGING_SLEEP_TIME = 6.1  # Rate Limit 対策
+TAGGING_SLEEP_TIME = 7.6# Rate Limit 対策
 
 # 地名辞書
 try:
@@ -289,6 +289,7 @@ def get_dynamic_categories(analysis_prompt: str) -> Optional[Dict[str, str]]:
 
     logger.info("動的カテゴリ生成AI (Flash Lite) を呼び出し...")
     
+    # (★ 改善 A-1: ユーザーの明示的な指示をAIが尊重するようにプロンプトを修正)
     prompt = PromptTemplate.from_template(
         """
         あなたはデータ分析のスキーマ設計者です。「分析指針」を読み、テキストから抽出するべき「カテゴリ」を考案してください。
@@ -298,7 +299,7 @@ def get_dynamic_categories(analysis_prompt: str) -> Optional[Dict[str, str]]:
 
         # 指示:
         1.  「分析指針」を注意深く読みます。
-        2.  もし「分析指針」が【ユーザー定義のカテゴリ名と説明】（例: 「①話題カテゴリ：...」や「②観光地：...」）を明示的に指定している場合、**その指示に厳密に従い**、指定されたカテゴリ名（例: "話題カテゴリ"）と説明（例: "どの話題に関する言及か..."）を抽出してください。
+        2.  もし「分析指針」が【ユーザー定義のカテゴリ名と説明】（例: 「①話題カテゴリ：...」や「②農産品特性：...」）を明示的に指定している場合、**その指示に厳密に従い**、指定されたカテゴリ名（例: "話題カテゴリ"）と説明（例: "どの話題に関する言及か..."）を抽出してください。
         3.  もし「分析指針」がカテゴリを明示的に指定していない場合（例: 「広島の観光について分析したい」）、分析指針のトピックを元に、抽出するべきカテゴリ（キー）とそ
             の説明（値）を【あなた自身で考案】してください。
         4.  「市区町村」や「地名」に関するカテゴリは、必須カテゴリとして自動で追加されるため、**絶対に考案・抽出しないでください**。
@@ -314,7 +315,6 @@ def get_dynamic_categories(analysis_prompt: str) -> Optional[Dict[str, str]]:
         response_str = chain.invoke({"user_prompt": analysis_prompt})
         logger.debug(f"AIカテゴリ定義(生): {response_str}")
 
-        # マークダウンや不要なテキストを除去し、JSONのみを抽出
         match = re.search(r'\{.*\}', response_str, re.DOTALL)
         if not match:
             logger.warning("AIがJSON形式で応答しませんでした。")
@@ -336,11 +336,9 @@ def get_dynamic_categories(analysis_prompt: str) -> Optional[Dict[str, str]]:
 def filter_relevant_data_by_ai(df_batch: pd.DataFrame, analysis_prompt: str) -> pd.DataFrame:
     """
     (Step A) AIを使い、分析指針と無関係な行をフィルタリングする (relevant: true/false)。
-    (★) モデル: MODEL_FLASH_LITE (gemini-2.5-flash-lite)
-    (★) 要件: 進捗表示 (この関数はバッチ処理の一部として呼ばれ、呼び出し元の
-          `render_step_a` 内の `update_progress_ui` で進捗が表示される)
+    (★) モデル: MODEL_FLASH_LITE
+    (★ 改善 A-8: キュレーションのAIプロンプトを修正し、分析指針の「目的」を正しく読み取らせる)
     """
-    # (★) Step A の要件に基づき、FLASH_LITE モデルを明示的に指定
     llm = get_llm(model_name=MODEL_FLASH_LITE, temperature=0.0)
     if llm is None:
         logger.error("filter_relevant_data_by_ai: LLM (Flash Lite) が利用できません。")
@@ -349,7 +347,6 @@ def filter_relevant_data_by_ai(df_batch: pd.DataFrame, analysis_prompt: str) -> 
 
     logger.debug(f"{len(df_batch)}件 AI関連性フィルタリング (Flash Lite) 開始...")
 
-    # テキストが長すぎる場合、先頭500文字に切り詰める
     input_texts_jsonl = df_batch.apply(
         lambda row: json.dumps(
             {"id": row['id'], "text": str(row['ANALYSIS_TEXT_COLUMN'])[:500]},
@@ -358,20 +355,30 @@ def filter_relevant_data_by_ai(df_batch: pd.DataFrame, analysis_prompt: str) -> 
         axis=1
     ).tolist()
 
+    # (★) --- [改善 A-8] プロンプトの指示を全面的に変更 ---
     prompt = PromptTemplate.from_template(
         """
-        あなたはデータ分析のキュレーターです。「分析指針」に基づき、「テキストデータ(JSONL)」の各行が分析対象として【関連しているか (relevant: true)】、【無関係か (relevant: false)】を判定してください。
-        # 分析指針 (Analysis Scope):
+        あなたはデータ分析のキュレーターです。
+        「分析指針」には、これから行う分析の「目的」と「AIへの指示」が書かれています。
+        「分析指針」の【目的】（例：栃木県の農産物、広島の観光）を読み取り、それに基づいて「テキストデータ(JSONL)」の各行が分析対象として【関連しているか (relevant: true)】、【無関係か (relevant: false)】を判定してください。
+
+        # 分析指針 (Analysis Scope and Rules):
         {analysis_prompt}
+
         # 指示:
-        1. 「分析指針」と【強く関連】する投稿のみを `true` とする。
-        2. 単なる宣伝、挨拶のみ、指針と無関係な地域の言及は `false` とする。
-        3. 出力は【JSONL形式のみ】（id と relevant (boolean) を含む辞書）。
+        1.  「分析指針」の【目的】（例：〇〇県の××について）と【強く関連】する投稿のみを `true` とします。
+            (例：指針が「栃木の農産物」なら、「桃狩り」や「いちご」の投稿は `true` です)
+        2.  「分析指針」が「〇〇を除外」と指示している場合は `false` とします。
+        3.  単なる宣伝、挨拶のみ、指針の目的と無関係な地域の言及は `false` とします。
+        4.  出力は【JSONL形式のみ】（id と relevant (boolean) を含む辞書）。
+
         # テキストデータ (JSONL):
         {text_data_jsonl}
+        
         # 回答 (JSONL形式のみ):
         """
     )
+    
     chain = prompt | llm | StrOutputParser()
     
     try:
@@ -382,7 +389,6 @@ def filter_relevant_data_by_ai(df_batch: pd.DataFrame, analysis_prompt: str) -> 
         response_str = chain.invoke(invoke_params)
         
         results = []
-        # マークダウン ````jsonl ... ``` を除去
         match = re.search(r'```(?:jsonl|json)?\s*([\s\S]*?)\s*```', response_str, re.DOTALL)
         jsonl_content = match.group(1).strip() if match else response_str.strip()
 
@@ -391,7 +397,6 @@ def filter_relevant_data_by_ai(df_batch: pd.DataFrame, analysis_prompt: str) -> 
             if not cleaned_line: continue
             try:
                 data = json.loads(cleaned_line)
-                # relevant が "true" (str) や true (bool) など揺らぎがあるため堅牢に処理
                 is_relevant = False
                 if isinstance(data.get("relevant"), bool):
                     is_relevant = data.get("relevant")
@@ -401,7 +406,6 @@ def filter_relevant_data_by_ai(df_batch: pd.DataFrame, analysis_prompt: str) -> 
                 results.append({"id": data.get("id"), "relevant": is_relevant})
             except (json.JSONDecodeError, AttributeError) as json_e:
                 logger.warning(f"AIフィルタリング回答パース失敗: {cleaned_line} - Error: {json_e}")
-                # パース失敗時は、IDが特定できれば関連あり(True)としてフォールバック
                 id_match = re.search(r'"id":\s*(\d+)', cleaned_line)
                 if id_match:
                     results.append({"id": int(id_match.group(1)), "relevant": True})
@@ -411,19 +415,20 @@ def filter_relevant_data_by_ai(df_batch: pd.DataFrame, analysis_prompt: str) -> 
     except Exception as e:
         logger.error(f"AIフィルタリングバッチ処理中エラー: {e}", exc_info=True)
         st.error(f"AIフィルタリング処理エラー: {e}")
-        # エラー時は安全側に倒し、すべて関連あり(True)として返す
         return df_batch[['id']].copy().assign(relevant=True)
+
+# (★) [NameError: 'Set' 修正] L42 で `from typing import Set` がインポートされている前提
 @st.cache_data(ttl=3600)
 def get_location_normalization_maps(
     db: Dict[str, List[str]], 
     analysis_prompt_str: str
-) -> (Dict[str, str], Set[str], Set[str]): # (★) 型ヒントに Set[str] を追加
+) -> (Dict[str, str], Set[str], Set[str]): # (★ NameError 修正)
     """
     (★) Step A 改善: 地名正規化用の辞書を動的生成する
     JAPAN_GEOGRAPHY_DB 全体をスキャンし、エイリアス辞書と曖昧な単語セットを作成する
     """
     if not db:
-        return {}, set(), set() # (★) 3つの値を返す
+        return {}, set(), set() # (★ NameError 修正)
 
     logger.info("地名正規化マップの動的生成開始...")
     alias_to_city_map = {} # {"日光": "日光市", "尾道": "尾道市"}
@@ -449,19 +454,15 @@ def get_location_normalization_maps(
         for city_or_ward in values:
             all_cities_wards.add(city_or_ward) # "函館市", "中央区"
             
-            # (★) "日光市" -> "日光" のようなエイリアスを動的生成
             alias = city_or_ward.replace("市", "").replace("区", "").replace("町", "").replace("村", "")
             
             if alias != city_or_ward:
-                # "中央" や "南" のような汎用的な区名は、曖昧キーとして処理
                 if "区" in city_or_ward and len(alias) <= 2: 
                      ambiguous_keys.add(alias)
-                # "日光" -> "日光市" のマッピング
                 elif alias not in alias_to_city_map:
                     alias_to_city_map[alias] = city_or_ward
                 else:
-                    # (★) "府中" (東京都/広島県) のような重複エイリアスは曖昧キーに
-                    if alias in alias_to_city_map: # (★) 修正: del の前に存在確認
+                    if alias in alias_to_city_map:
                         del alias_to_city_map[alias]
                     ambiguous_keys.add(alias)
 
@@ -478,10 +479,8 @@ def get_location_normalization_maps(
         logger.info(f"分析指針から関連都市を特定: {relevant_cities}")
         for city in relevant_cities:
             for ward in db[city]: # "中区", "南区" ...
-                # (★) "中区" -> "広島市 中区" というマッピングを作成
                 alias_to_city_map[ward] = f"{city} {ward}"
                 
-                # "中" のようなエイリアスも "広島市 中区" に
                 ward_alias = ward.replace("区", "")
                 if ward_alias in ambiguous_keys:
                     alias_to_city_map[ward_alias] = f"{city} {ward}"
@@ -491,7 +490,7 @@ def get_location_normalization_maps(
     
     logger.info(f"地名正規化マップ動的生成完了。エイリアス: {len(alias_to_city_map)}件, 曖昧キー: {len(final_ambiguous_set)}件")
     
-    # (★) --- [修正] 3つの値を返す ---
+    # (★ NameError 修正) 3つの値を返す
     return alias_to_city_map, final_ambiguous_set, all_cities_wards
 
 def perform_ai_tagging(
@@ -502,7 +501,6 @@ def perform_ai_tagging(
     """
     (Step A) テキストのバッチを受け取り、AIが【指定されたカテゴリ定義】に基づいて直接タグ付けを行う
     (★) モデル: MODEL_FLASH_LITE
-    (★) 改善: AIはキーワード抽出に専念し、Python側で地名を正規化する
     """
     llm = get_llm(model_name=MODEL_FLASH_LITE, temperature=0.0)
     if llm is None:
@@ -510,58 +508,109 @@ def perform_ai_tagging(
         st.error("AIモデル(Flash Lite)が利用できません。APIキーを確認してください。")
         return pd.DataFrame()
 
+    # spaCyモデルをロード
+    nlp = load_spacy_model()
+    
     logger.info(f"{len(df_batch)}件 AIタグ付け (Flash Lite) 開始 (カテゴリ: {list(categories_to_tag.keys())})")
 
-    # 地名辞書のコンテキストを準備 (分析指針に関連する地名のみをAIに渡す)
     geo_context_str = "{}"
-    if JAPAN_GEOGRAPHY_DB and "市区町村キーワード" in categories_to_tag:
+    alias_map, ambiguous_set, all_cities_wards = {}, set(), set()
+    
+    # (★) 地名辞書のロード
+    if JAPAN_GEOGRAPHY_DB:
         try:
             relevant_geo_db = {}
             prompt_lower = analysis_prompt.lower()
-            
-            hints = ["広島", "福岡", "大阪", "東京", "北海道", "愛知", "宮城", "札幌", "横浜", "名古屋", "京都", "神戸", "仙台"]
-            keys_found = [
-                key for key in JAPAN_GEOGRAPHY_DB.keys()
-                if any(h in key.lower() for h in hints) and any(h in prompt_lower for h in hints)
-            ]
-            if "広島" in prompt_lower: keys_found.extend(["広島県", "広島市"])
-            if "東京" in prompt_lower: keys_found.extend(["東京都", "東京23区"])
-            if "大阪" in prompt_lower: keys_found.extend(["大阪府", "大阪市"])
-
-            for key in set(keys_found): 
-                if key in JAPAN_GEOGRAPHY_DB:
+            # 全国対応: 全キーをスキャン
+            for key in JAPAN_GEOGRAPHY_DB.keys():
+                simple_name = key.replace("都", "").replace("府", "").replace("県", "").replace("市", "")
+                if key in prompt_lower or simple_name in prompt_lower:
                     relevant_geo_db[key] = JAPAN_GEOGRAPHY_DB[key]
             
             if not relevant_geo_db:
-                logger.warning("地名辞書の絞り込みヒントなし。主要都市のみ渡します。")
-                default_keys = ["東京都", "東京23区", "大阪府", "大阪市", "広島県", "広島市", "福岡県", "福岡市"]
-                for key in default_keys:
-                    if key in JAPAN_GEOGRAPHY_DB:
-                        relevant_geo_db[key] = JAPAN_GEOGRAPHY_DB[key]
-
+                default_keys = ["東京都", "大阪府", "愛知県", "福岡県", "北海道"]
+                for d_key in default_keys:
+                    if d_key in JAPAN_GEOGRAPHY_DB:
+                        relevant_geo_db[d_key] = JAPAN_GEOGRAPHY_DB[d_key]
+            
             geo_context_str = json.dumps(relevant_geo_db, ensure_ascii=False, indent=2)
-            
             if len(geo_context_str) > 5000:
-                logger.warning(f"地名辞書が大きすぎ ({len(geo_context_str)}B)。キーのみに縮小。")
                 geo_context_str = json.dumps(list(relevant_geo_db.keys()), ensure_ascii=False)
-                
-            logger.info(f"AIに渡す地名辞書(絞込済): {list(relevant_geo_db.keys())}")
             
-            # (★) --- [修正] 3つの値を受け取る ---
             alias_map, ambiguous_set, all_cities_wards = get_location_normalization_maps(JAPAN_GEOGRAPHY_DB, analysis_prompt)
-            # (★) --- ここまで ---
-
         except Exception as e:
             logger.error(f"地名辞書の準備中にエラー: {e}", exc_info=True)
             geo_context_str = "{}" 
-            # (★) --- [修正] 3つの変数を初期化 ---
             alias_map, ambiguous_set, all_cities_wards = {}, set(), set()
-            
-    else:
-        # (★) --- [修正] 3つの変数を初期化 ---
-        alias_map, ambiguous_set, all_cities_wards = {}, set(), set() 
 
-    # テキストが長すぎる場合、先頭500文字に切り詰める
+    # (★) 除外リストの生成
+    exclusion_patterns = set() 
+    exclusion_exact = set()
+
+    # 1. 静的パターン (料理・感情・一般名詞・部位)
+    static_patterns = {
+        # 料理・メニュー・部位・形状 (NGワード強化)
+        "焼き加減", "ステーキ", "カレー", "ハンバーグ", "タルタル", "ポワレ", "ロティ", "ソテー", "グリル", "ロースト",
+        "ロール", "握り", "メンチ", "すき焼", "しゃぶしゃぶ", "牛丼", "バーガー", "サンド", "パフェ", "ケーキ",
+        "テンダーロイン", "ヒレ", "ロース", "肩肉", "タン", "ハラミ", "ミノ", "レバー", "モモ", "サーロイン",
+        "丼", "膳", "コース", "弁当", "定食", "ランチ", "ディナー", "ビュッフェ", "食べ放題",
+        "缶", "パック", "箱", "ギフト", "贈答", "お土産", "サイズ", "入り", "個", "セット", "ジャム",
+        "栽培", "収穫", "農家", "直売", "入荷", "販売", "ドレッシング", "ソース",
+        # 主観・感情
+        "優勝", "神", "レベチ", "感動", "感激", "大好き", "幸せ", "最高", "絶品", "至福",
+        "美味しい", "おいしい", "美味しかった", "おいしかった", "美味い", "うまい", "旨い", "ウマい", "激ウマ",
+        "うまうま", "うめぇ", "すんごい", "一番", "サイコー", "良質", "優秀", "完璧",
+        "嬉しい", "たのしい", "楽しい", "満喫", "ビビった", "やばい", "すごい", "素晴らしい",
+        "狩り", "季節", "冬", "春", "夏", "秋", "名前", "品種", "ちゃん", "さん", "くん",
+        # 製品名 (バリエーション)
+        "とちぎ和牛", "和牛", "黒毛和牛", "黒毛", "牛肉", "ビーフ", "肉用牛", 
+        "雄牛", "雌牛", "子牛", "ホルモン", "国産", "県産", "とちぎ", "栃木", "那須",
+        "とちおとめ", "スカイベリー", "とちあいか", "ミルキーベリー", "とちひめ", "いちご", "イチゴ", "苺"
+    }
+    exclusion_patterns.update(static_patterns)
+    
+    exclusion_patterns.update(ambiguous_set) 
+    exclusion_patterns.update(all_cities_wards)
+
+    # 2. 単体NGワード
+    static_exact = {
+        "肉", "牛", "豚", "鶏", "魚", "野菜", "果物",
+        "美味", "幸", "好", "良", "美", "優"
+    }
+    exclusion_exact.update(static_exact)
+
+    try:
+        matches = re.findall(r'「([^」]+)」', analysis_prompt)
+        if matches:
+            for match in matches:
+                items = re.split(r'[,、\s]+', match)
+                for item in items:
+                    if item.strip() and len(item.strip()) > 1: 
+                        exclusion_patterns.add(item.strip().lower())
+        
+        for cat_name in categories_to_tag.keys():
+             if cat_name != "市区町村キーワード":
+                 exclusion_patterns.add(cat_name.lower())
+                 exclusion_patterns.add(cat_name.replace("カテゴリ", "").replace("特性", "").strip().lower())
+    except Exception as e:
+        logger.warning(f"除外キーワードセットの生成に失敗: {e}")
+
+    # (★) 3. 食の重視価値の定義リスト
+    valid_orientations = [
+        "経済性志向", "健康志向", "簡便化志向", "安全志向", "美食志向", "手作り志向",
+        "国産志向", "ダイエット志向", "地元産志向", "外食志向", "高級志向", "環境志向"
+    ]
+    
+    # (★) 4. 特性として許可する「安全な名詞（属性）」リスト
+    safe_attribute_nouns = {
+        "甘み", "旨み", "辛み", "酸味", "苦味", "塩味", 
+        "香り", "匂い", "風味", "コク", "キレ", 
+        "食感", "舌触り", "喉越し", "歯ごたえ", "弾力",
+        "見た目", "色", "形", "大きさ", "サイズ", "鮮度", 
+        "脂", "サシ", "霜降り", "赤身", "肉質", "肉汁",
+        "バランス", "相性", "アクセント", "余韻"
+    }
+
     input_texts_jsonl = df_batch.apply(
         lambda row: json.dumps(
             {"id": row['id'], "text": str(row['ANALYSIS_TEXT_COLUMN'])[:500]},
@@ -570,41 +619,61 @@ def perform_ai_tagging(
         axis=1
     ).tolist()
 
-    # (★) プロンプトは変更なし (AIはキーワードを抽出するだけ)
+    # (★) --- プロンプトの全面修正 ---
     prompt = PromptTemplate.from_template(
         """
-        あなたは高精度データ分析アシスタントです。「カテゴリ定義」「地名辞書」「分析指針」に基づき、キーワードを抽出します。
-        # 分析指針 (Analysis Scope): {analysis_prompt}
-        # 地名辞書 (JAPAN_GEOGRAPHY_DB): {geo_context}
-        # カテゴリ定義 (categories): {categories}
+        あなたは高精度データ分析アシスタントです。
+        「カテゴリ定義」に基づき、「テキストデータ(JSONL)」の各行を処理し、指定された全カテゴリの値をJSONL形式で返してください。
+
+        # カテゴリ定義 (JSON形式): {categories}
+        # 除外キーワード: {exclusion_list}
         # テキストデータ (JSONL): {text_data_jsonl}
 
         # 指示:
-        1. 「テキストデータ(JSONL)」の各行を処理する。
-        2. 「カテゴリ定義」のキー名を【厳格に】使用し、全カテゴリを抽出する。
-        3. 【すべてのカテゴリ】 ( "市区町村キーワード" を含む ):
-           - 値は【単一の文字列】で出力する (該当なければ空文字列 "")。リスト形式は【厳禁】。
-           - 文脈から最も関連性の高いものを【1つだけ】選ぶ。
-           - 分析指針でカテゴリとその内容の選択肢が提示されている場合は、それに従いラベル付けを行う。
-        4. 【"市区町村キーワード" の特別ルール】(★ 変更点):
-           - テキストから、最も関連性が高い地名キーワード（例：「宮島」「日光」「尾道」「中区」「広島市」）を【1つだけそのまま】抽出する。
-           - 【変換処理は不要】です（例：「宮島」を「廿日市市」に変換しないでください）。
-           - 曖昧な表現（例：「広島」）や都道府県名（例：「広島県」）も、もしそれが最も関連性が高いと判断した場合は、そのまま抽出してください。
-           - 「分析指針」と無関係な地域の地名は【抽出しない】。
-        5. ハルシネーション（情報の捏造）禁止。
-        6. 出力は【JSONL形式のみ】（id と categories を含む辞書）。
+        1. 「テキストデータ(JSONL)」の各行を処理します。
+        2. 「カテゴリ定義」のキー名を厳格に使用します。
+
+        3. **【最重要】特別ルール (「特性」や「イメージ」を求めるカテゴリ (例: "農産品特性")): **
+           テキストから、対象品目の**「状態・性質（形容詞・形容動詞）」**のみを抽出してください。
+           **「物体・メニュー名（名詞）」は絶対に出力しないでください。**
+
+           * **【許可 (OK)】: 状態・性質の描写**
+             * `柔らかい`, `甘い`, `濃厚`, `ジューシー`, `脂が乗っている`, `サシが入っている`, `香りが良い`, `新鮮`
+           
+           * **【禁止 (NG)】: 物体・料理・事実**
+             * `ロール`, `握り`, `ステーキ`, `カレー` (料理名)
+             * `ロース`, `黒毛`, `雌`, `雄`, `A5` (部位・事実)
+             * `焼き加減`, `揚げたて` (調理)
+             * `感動`, `最高` (感想)
+
+           * **(回答例):**
+             * `「焼き加減が最高のステーキ」` -> `""` (※焼き加減もステーキもNG)
+             * `「口の中でとろける」` -> `「とろけるような食感」` (※状態描写なのでOK)
+             * `「サシが入った黒毛和牛」` -> `「サシが入っている」` (※黒毛和牛はNGだがサシはOK)
+
+        4. **特別ルール (「食の重視価値」など選択肢があるカテゴリ): **
+           * 必ず以下のリストから、最も適切なものを【完全な名称で】1つだけ選んでください。
+           * リスト: [経済性志向, 健康志向, 簡便化志向, 安全志向, 美食志向, 手作り志向, 国産志向, ダイエット志向, 地元産志向, 外食志向, 高級志向, 環境志向]
+           * 該当しない場合は `その他` としてください。「志向」という単語単体での出力は禁止です。
+
+        5. **特別ルール (例: "市区町村キーワード"): **
+           * テキストに含まれる地名キーワードをそのまま抽出します。
+
+        6. 出力は【JSONL形式のみ】（id と、"カテゴリ定義" の全キーを含む辞書）。
 
         # 回答 (JSONL形式のみ):
         """
     )
+    
     chain = prompt | llm | StrOutputParser()
     
     try:
         invoke_params = {
             "categories": json.dumps(categories_to_tag, ensure_ascii=False),
             "geo_context": geo_context_str,
+            "exclusion_list": json.dumps(list(exclusion_patterns)[:50], ensure_ascii=False), 
             "text_data_jsonl": "\n".join(input_texts_jsonl),
-            "analysis_prompt": analysis_prompt
+            "analysis_prompt": analysis_prompt 
         }
         response_str = chain.invoke(invoke_params)
         logger.debug(f"AI Tagging - Raw response received.")
@@ -635,41 +704,113 @@ def perform_ai_tagging(
                     
                     raw_value = tag_source.get(found_key) if found_key else None
                     processed_value = ""
+                    
                     if isinstance(raw_value, list) and raw_value:
-                        processed_value = str(raw_value[0]).strip()
+                        processed_value = ", ".join(str(v).strip() for v in raw_value if str(v).strip())
                     elif raw_value is not None and str(raw_value).strip():
                         processed_value = str(raw_value).strip()
                     
                     if processed_value.lower() in ["該当なし", "none", "null", "", "n/a"]:
                         processed_value = ""
                     
-                    # (★) --- [修正] Python 地名正規化ロジック (all_cities_wards が使える) ---
-                    if key == "市区町村キーワード" and processed_value:
+                    # (★) --- 最終フィルタリング & 補正 ---
+                    
+                    # 1. 【重視価値】の完全一致チェック
+                    if "重視価値" in key or "志向" in key:
+                        # ユーザー定義のリストに完全一致するかチェック
+                        if processed_value not in valid_orientations:
+                            # 部分一致で救済 (例: "食の安全志向" -> "安全志向")
+                            found = False
+                            for v in valid_orientations:
+                                if v in processed_value:
+                                    processed_value = v
+                                    found = True
+                                    break
+                            if not found:
+                                processed_value = "その他" if processed_value else ""
+                                
+                    # 2. 【農産品特性】などの除外・品詞チェック
+                    elif key != "市区町村キーワード" and "カテゴリ" not in key and processed_value:
                         
-                        # 1. エイリアスマップで変換 (例: "日光" -> "日光市", "中区" -> "広島市 中区")
+                        # A. NGワード削除 (Pattern)
+                        temp_processed_value = processed_value
+                        for word_to_remove in exclusion_patterns:
+                            if word_to_remove in temp_processed_value.lower():
+                                temp_processed_value = re.sub(f"(?i){re.escape(word_to_remove)}", "", temp_processed_value).strip()
+                        
+                        # B. NGワード削除 (Exact)
+                        if temp_processed_value.strip() in exclusion_exact:
+                            temp_processed_value = ""
+                            
+                        processed_value = temp_processed_value.strip(" ,")
+
+                        # C. (★) spaCyによる「名詞単体」の破棄
+                        if processed_value and nlp:
+                            doc = nlp(processed_value)
+                            
+                            # 全てのトークンが「名詞(NOUN/PROPN)」かつ「安全リスト」に含まれない場合、破棄
+                            # (例: "ロール" -> NOUN -> 破棄)
+                            # (例: "甘み" -> NOUN -> 安全リストにある -> 保持)
+                            # (例: "柔らかい" -> ADJ -> 保持)
+                            # (例: "脂が乗る" -> NOUN+ADP+VERB -> 保持)
+                            
+                            is_all_unsafe_nouns = True
+                            has_valid_content = False
+                            
+                            for token in doc:
+                                if token.pos_ in ["ADJ", "VERB", "AUX"]: # 形容詞、動詞があればOK
+                                    is_all_unsafe_nouns = False
+                                    has_valid_content = True
+                                    break
+                                if token.text in safe_attribute_nouns: # 安全な名詞ならOK
+                                    is_all_unsafe_nouns = False
+                                    has_valid_content = True
+                                    break
+                                if token.pos_ not in ["NOUN", "PROPN", "PUNCT", "SPACE"]:
+                                    # 名詞・記号以外が含まれていればとりあえずOKとする（助詞など）
+                                    is_all_unsafe_nouns = False
+                            
+                            if is_all_unsafe_nouns:
+                                logger.debug(f"名詞単体のため破棄: {processed_value}")
+                                processed_value = ""
+
+                            # D. 文頭・文末のゴミ取り
+                            if processed_value:
+                                # 再解析
+                                doc = nlp(processed_value)
+                                start_idx = 0
+                                end_idx = len(doc)
+
+                                for token in doc:
+                                    if token.pos_ in ["ADP", "AUX", "PUNCT", "SYM", "SPACE", "SCONJ", "CCONJ", "PRON"]:
+                                        start_idx = token.i + 1
+                                    else:
+                                        break
+                                for i in range(len(doc) - 1, start_idx - 1, -1):
+                                    token = doc[i]
+                                    if token.pos_ in ["ADP", "SCONJ", "PUNCT", "SYM", "SPACE", "CCONJ"]:
+                                        end_idx = token.i
+                                    else:
+                                        break
+
+                                if start_idx < end_idx:
+                                    processed_value = doc[start_idx:end_idx].text
+                                else:
+                                    processed_value = ""
+
+                    # (★) --- 地名正規化 ---
+                    if key == "市区町村キーワード" and processed_value:
                         if processed_value in alias_map:
                             processed_value = alias_map[processed_value]
-                        
-                        # 2. 曖昧なキー (例: "広島", "東京", "札幌") は破棄
                         elif processed_value in ambiguous_set:
-                            logger.debug(f"地名正規化: 曖昧なキー '{processed_value}' を破棄しました。")
                             processed_value = ""
-                        
-                        # 3. 都道府県名 (例: "広島県") は破棄 (ambiguous_set に含まれる)
-                        
-                        # 4. DBに存在する正式名称 (例: "広島市") か確認
                         elif processed_value in all_cities_wards:
-                            pass # (例: "広島市" はそのまま通す)
-                        
-                        # 5. それ以外 (例: "アメリカ") は破棄
+                            pass 
                         else:
-                            # (★) ただし、"広島市 中区" のような「市 区」形式は許可
                             if " " in processed_value and any(s in processed_value for s in ["市", "区"]):
                                 pass
                             else:
-                                logger.debug(f"地名正規化: 不明なキー '{processed_value}' を破棄しました。")
                                 processed_value = ""
-                    # (★) --- 正規化ロジックここまで ---
 
                     row_result[key] = processed_value
                 
@@ -704,17 +845,13 @@ def perform_ai_location_inference(
 
     logger.info(f"{len(df_batch)}件 AI地名推論 (Flash Lite) 開始...")
     
-    # (★) 正規化マップをアンパック (AIの回答を検証するため)
     alias_map, ambiguous_set, all_cities_wards = normalization_maps
 
-    # AIに渡すコンテキストをJSONL形式で作成
-    # (★) 投稿本文 + Pass 1 でタグ付けされた全カテゴリ をコンテキストにする
     def create_context(row):
         context_data = {
             "id": row['id'],
             "text": str(row['ANALYSIS_TEXT_COLUMN'])[:500]
         }
-        # 他のカテゴリ（観光地、農産品など）をヒントとして追加
         other_tags = {
             k: v for k, v in row.items() 
             if k not in ['id', 'ANALYSIS_TEXT_COLUMN', '市区町村キーワード'] and pd.notna(v) and str(v).strip()
@@ -777,27 +914,21 @@ def perform_ai_location_inference(
                 if processed_value.lower() in ["該当なし", "none", "null", "", "n/a"]:
                     processed_value = ""
                 
-                # (★) --- 推論結果もPython側で厳密に正規化・検証 ---
                 if processed_value:
-                    # 1. エイリアスマップで変換 (例: AIが "日光" と返した場合)
                     if processed_value in alias_map:
                         processed_value = alias_map[processed_value]
                     
-                    # 2. 曖昧なキー (例: "広島") は破棄
                     elif processed_value in ambiguous_set:
                         processed_value = ""
                     
-                    # 3. DBに存在する正式名称 (例: "廿日市市") か確認
                     elif processed_value in all_cities_wards:
-                        pass # OK
+                        pass
                     
-                    # 4. それ以外 (例: "アメリカ") は破棄
                     else:
                         if " " in processed_value and any(s in processed_value for s in ["市", "区"]):
-                            pass # "札幌市 中央区" は OK
+                            pass 
                         else:
-                            processed_value = "" # 不明な地名として破棄
-                # (★) --- 正規化ロジックここまで ---
+                            processed_value = ""
                 
                 results.append({
                     "id": data.get("id"),
@@ -815,25 +946,20 @@ def perform_ai_location_inference(
     except Exception as e:
         logger.error(f"AI地名推論 バッチ処理中エラー: {e}", exc_info=True)
         st.error(f"AI地名推論処理エラー: {e}")
-        return pd.DataFrame() # 失敗時は空のDF
-
-# --- 7. (★) Step A: UI描画関数 ---
+        return pd.DataFrame() 
 
 def update_progress_ui(
     progress_placeholder: st.delta_generator.DeltaGenerator,
     log_placeholder: st.delta_generator.DeltaGenerator,
-    tip_placeholder: st.delta_generator.DeltaGenerator,  # (★) Tips用プレースホルダ
+    tip_placeholder: st.delta_generator.DeltaGenerator, 
     processed_rows: int,
     total_rows: int,
     message_prefix: str
 ):
     """
     (Step A) の進捗バーとログエリアを更新する (DRY)
-    (★) 要件: AI読み込み時間の進捗を0～100％で表示
-    (★) 要件: AI Tipsをローテーション表示
     """
     try:
-        # total_rows が 0 の場合 DivisionByZero を防ぐ
         if total_rows == 0:
             progress_percent = 1.0
         else:
@@ -842,37 +968,31 @@ def update_progress_ui(
         progress_text = f"[{message_prefix}] 処理中: {processed_rows}/{total_rows} 件 ({progress_percent:.0%})"
         progress_placeholder.progress(progress_percent, text=progress_text)
 
-        # ログ表示 (最新50件)
         log_text_for_ui = "\n".join(st.session_state.log_messages[-50:])
         log_placeholder.text_area(
             "実行ログ (最新50件):",
             log_text_for_ui,
             height=200,
-            key=f"log_update_{message_prefix}_{processed_rows}", # 重複キーを避ける
+            key=f"log_update_{message_prefix}_{processed_rows}", 
             disabled=True
         )
         
-        # (★) --- AI Tips のローテーション表示 ---
         if 'tips_list' not in st.session_state or not st.session_state.tips_list:
-             # 万が一Tipsが空の場合はAI Tips関数を呼び出す
              st.session_state.tips_list = get_analysis_tips_list_from_ai()
              st.session_state.current_tip_index = 0
              st.session_state.last_tip_time = time.time()
 
         now = time.time()
-        # 60秒ごと（またはTIPSが1件しかない場合）にTIPSを更新
         if (now - st.session_state.last_tip_time > 60) or (len(st.session_state.tips_list) == 1):
             if len(st.session_state.tips_list) > 1:
                 st.session_state.current_tip_index = (st.session_state.current_tip_index + 1) % len(st.session_state.tips_list)
             st.session_state.last_tip_time = now
         
-        # (★) リストが空でないかチェック
         if st.session_state.tips_list:
             current_tip = st.session_state.tips_list[st.session_state.current_tip_index]
             tip_placeholder.info(f"💡 データ分析TIPS: {current_tip}")
 
     except Exception as e:
-        # UIの更新エラーはログに警告のみ残し、処理は続行
         logger.warning(f"UI update failed: {e}")
 
 def render_step_a():
@@ -926,7 +1046,7 @@ def render_step_a():
         "AIがタグ付けとキュレーションを行う際の指針を入力してください（必須）:",
         value=st.session_state.analysis_prompt_A,
         height=100,
-        placeholder="例: 広島県の観光に関するInstagramの投稿。無関係な地域の投稿や、単なる挨拶・宣伝は除外したい。\n例: ①農産品カテゴリ（牛乳,チーズ,米） ②農産品のイメージ（濃厚,新鮮）",
+        placeholder="例: 広島県の観光に関するInstagramの投稿。無関係な地域の投稿や、単なる挨拶・宣伝は除外したい。\n例: ①農産品カテゴリ（牛乳,チーズ,米） ②農産品特性（味、見た目、用途のサマリ）",
         key="analysis_prompt_input_A"
     )
     st.session_state.analysis_prompt_A = analysis_prompt
@@ -968,10 +1088,11 @@ def render_step_a():
     
     for i, (cat, desc) in enumerate(categories_to_show):
         with cols[i % 3]:
+            # (★ TypeError 修正)
             is_checked = st.checkbox(
                 cat,
                 value=(cat == "市区町村キーワード" or cat in st.session_state.selected_categories),
-                help=str(desc), # (★ TypeError 修正)
+                help=str(desc), 
                 key=f"cat_cb_{cat}",
                 disabled=(cat == "市区町村キーワード")
             )
@@ -1020,7 +1141,7 @@ def render_step_a():
                     if 'tips_list' not in st.session_state or not st.session_state.tips_list:
                         st.session_state.tips_list = get_analysis_tips_list_from_ai()
                 
-                if not st.session_state.tips_list: # フォールバック
+                if not st.session_state.tips_list: 
                     st.session_state.tips_list = ["データ分析TIPSの取得に失敗しました。"]
 
                 st.session_state.current_tip_index = random.randint(0, len(st.session_state.tips_list) - 1)
@@ -1076,7 +1197,7 @@ def render_step_a():
                         if filtered_df is not None and not filtered_df.empty:
                             all_filtered_results.append(filtered_df)
                         
-                        time.sleep(FILTER_SLEEP_TIME)
+                        time.sleep(FILTER_SLEEP_TIME) 
                     
                     if not all_filtered_results:
                         raise Exception("AIフィルタリング処理に失敗しました。")
@@ -1121,19 +1242,17 @@ def render_step_a():
                         if tagged_df is not None and not tagged_df.empty:
                             all_tagged_results.append(tagged_df)
                         
-                        time.sleep(TAGGING_SLEEP_TIME)
+                        time.sleep(TAGGING_SLEEP_TIME) 
 
                     if not all_tagged_results:
                         raise Exception("AIタグ付け処理(Pass 1)に失敗しました。")
                     
                     tagged_results_df = pd.concat(all_tagged_results, ignore_index=True)
 
-                    # --- (★) [改善 A-2] 5. AI地名推論 (Pass 2) ---
+                    # --- (★) 5. AI地名推論 (Pass 2) ---
                     
-                    # (★) Pass 1 の結果を一時的にマージ
                     temp_merged_df = pd.merge(master_df_for_tagging, tagged_results_df, on='id', how='left')
                     
-                    # (★) 「市区町村キーワード」が空の行を抽出
                     rows_needing_inference = temp_merged_df[
                         temp_merged_df['市区町村キーワード'].isnull() | (temp_merged_df['市区町村キーワード'] == '')
                     ]
@@ -1143,7 +1262,6 @@ def render_step_a():
                     
                     if total_inference_rows > 0:
                         logger.info(f"AI地名推論(Pass 2) 開始。対象: {total_inference_rows}件")
-                        # (★) 地名正規化マップを（キャッシュから）取得
                         norm_maps = get_location_normalization_maps(JAPAN_GEOGRAPHY_DB, analysis_prompt)
                         
                         total_inf_batches = (total_inference_rows + TAGGING_BATCH_SIZE - 1) // TAGGING_BATCH_SIZE
@@ -1165,16 +1283,25 @@ def render_step_a():
                             if inferred_df is not None and not inferred_df.empty:
                                 all_inferred_results.append(inferred_df)
                             
-                            time.sleep(TAGGING_SLEEP_TIME)
+                            time.sleep(TAGGING_SLEEP_TIME) 
                         
                         if all_inferred_results:
                             inferred_results_df = pd.concat(all_inferred_results, ignore_index=True)
                             
-                            # (★) Pass 2 の結果を Pass 1 の結果にマージ
+                            # (★) --- [修正] 重複ラベルエラー対策 ---
+                            # set_index('id') の前に、id 列で重複を削除する
+                            logger.info(f"Pass 1 (Tagging) 重複チェック前: {len(tagged_results_df)}件")
+                            tagged_results_df.drop_duplicates(subset=['id'], keep='first', inplace=True)
+                            logger.info(f"Pass 1 (Tagging) 重複チェック後: {len(tagged_results_df)}件")
+                            
+                            logger.info(f"Pass 2 (Inference) 重複チェック前: {len(inferred_results_df)}件")
+                            inferred_results_df.drop_duplicates(subset=['id'], keep='first', inplace=True)
+                            logger.info(f"Pass 2 (Inference) 重複チェック後: {len(inferred_results_df)}件")
+                            # (★) --- 修正ここまで ---
+                            
                             tagged_results_df = tagged_results_df.set_index('id')
                             inferred_results_df = inferred_results_df.set_index('id')
                             
-                            # (★) inferred_location の値で、'市区町村キーワード' の null/空 を埋める
                             tagged_results_df['市区町村キーワード'].fillna(inferred_results_df['inferred_location'], inplace=True)
                             tagged_results_df.loc[tagged_results_df['市区町村キーワード'] == '', '市区町村キーワード'] = inferred_results_df['inferred_location']
                             
@@ -1200,7 +1327,7 @@ def render_step_a():
                         total_rows, total_rows, "処理完了"
                     )
                     
-                    tip_placeholder.empty() # 処理完了後、Tipsを消す
+                    tip_placeholder.empty()
 
             except Exception as e:
                 logger.error(f"Step A 分析実行中にエラー: {e}", exc_info=True)
@@ -1208,9 +1335,8 @@ def render_step_a():
                 if 'progress_placeholder' in locals():
                     progress_placeholder.progress(1.0, text="エラーにより処理中断")
                 if 'tip_placeholder' in locals():
-                    tip_placeholder.empty() # エラー時もTipsを消す
+                    tip_placeholder.empty()
 
-    # (★) 要件④: エクスポートリンクを表示
     if not st.session_state.tagged_df_A.empty:
         st.header("Step 6: 分析結果の確認とエクスポート")
         st.dataframe(st.session_state.tagged_df_A.head(50))
@@ -3552,194 +3678,324 @@ def render_step_b():
 
 def run_step_c_analysis(
     jsonl_data_string: str,
-    model_name: str, # (★) 引数は残すが、Proに固定
+    model_name: str, 
     progress_bar: st.delta_generator.DeltaGenerator,
     log_placeholder: st.delta_generator.DeltaGenerator,
     custom_instruction: str = "" 
 ) -> str:
     """
-    (★) Step C: AIレポート生成 (単一リクエスト・ハイブリッド版)
+    (★) Step C: AIレポート生成 (逐次・ハイブリッド版)
     
-    [新ロジック] gemini-2.5-pro の RPD 50回制限を回避するため、
-    AIへのリクエストを「1回」に限定する。
-    1. Python側で Base64画像 と テキストデータ を分離する。
-    2. AI(Pro)に全テキストデータを渡し、レポート全体のJSON配列を「1回」で生成させる。
-    3. Python側で AIの回答(テキスト) と 元の画像 をマージ（再結合）する。
+    [新ロジック] ハングアップ (504 Timeout) を回避するため、スライド1枚ごとに
+    AIを呼び出し、RPM制限に応じてスリープする。
     """
-    logger.info(f"Step C AIレポート生成 (単一リクエスト処理) 開始... (Model: {MODEL_PRO})")
-    log_messages_ui = []
-    
-    # --- (★) 1. Python側での前処理 (画像とテキストの分離) ---
-    image_map: Dict[str, Optional[str]] = {}
-    text_data_for_ai: List[str] = []
-    original_tasks: List[Dict[str, Any]] = []
-    
-    try:
-        if not jsonl_data_string:
-            raise ValueError("アップロードされたJSONLデータが空です。")
-            
-        for line in jsonl_data_string.strip().splitlines():
-            if not line.strip(): continue
-            
-            task_json = json.loads(line)
-            original_tasks.append(task_json) # (★) マージ用の元データを保持
-            
-            task_name = task_json.get("analysis_task")
-            if not task_name:
-                continue
-                
-            # (★) 1a. 画像をPython側(image_map)に退避
-            image_base64 = task_json.pop("image_base64", None)
-            if task_name not in image_map:
-                 image_map[task_name] = image_base64
-            
-            # (★) 1b. AIに渡すためのテキスト・数値データのみにする
-            task_json["image_base64"] = None
-            
-            # (★) トークン数節約のため、巨大なデータはサマリのみにする
-            if "data" in task_json and len(json.dumps(task_json["data"])) > 1000:
-                task_json["data"] = f"（データプレビュー: {str(task_json['data'])[:1000]}...）"
-            
-            text_data_for_ai.append(json.dumps(task_json, ensure_ascii=False))
+    logger.info(f"Step C AIレポート生成 (逐次処理) 開始... (Model: {model_name})")
 
-        if not text_data_for_ai:
-            raise ValueError("分析対象のタスクデータが0件です。")
-            
-        text_data_input_str = "\n".join(text_data_for_ai)
-        logger.info(f"AIへの入力データ準備完了。{len(text_data_for_ai)}件のタスクを1回のリクエストに統合。")
+    # (★) --- 1. モデルのRPM制限とスリープ時間を定義 ---
+    if model_name == MODEL_PRO:
+        rpm_limit = 2 # (★) Pro = 2 RPM
+        tpm_limit = 125000
+        sleep_time = (60 / rpm_limit) + 0.5 # (★) 30.5秒
+    else: 
+        model_name = MODEL_FLASH # (★) Flash (Lite) = 10 RPM
+        rpm_limit = 10
+        tpm_limit = 250000
+        # (★) 10 RPM のため 7.6 秒 (毎分 7.8 リクエスト) に設定
+        sleep_time = 7.6 
         
-    except Exception as e:
-        logger.error(f"Step C: AIへの入力データ前処理中にエラー: {e}", exc_info=True)
-        st.error(f"Step C 入力データ処理エラー: {e}")
-        return "[]"
+    logger.info(f"モデル: {model_name}, RPM: {rpm_limit}, 待機: {sleep_time:.1f}秒")
 
-    # --- (★) 2. AIプロンプトの構築 (単一リクエスト用) ---
+    # (★) --- 2. チャンク生成用のAIプロンプトテンプレートを定義 ---
     
-    # (★) ユーザー指示ブロック
     custom_instruction_block = ""
     if custom_instruction and custom_instruction.strip():
         custom_instruction_block = f"""
-        # (重要) ユーザーからの全体方針:
+        # (重要) ユーザーからの追加指示:
         * {custom_instruction.strip()}
-        * この指示を最優先で考慮し、レポート全体のトーンと考察に反映してください。
+        * この指示を最優先で考慮してください。
         """
 
-    # (★) ご提示いただいたプロンプト方針を反映
-    ONE_SHOT_PROMPT_TEMPLATE = """
-    あなたは、シニアデータアナリスト兼PowerPoint構成作家です。
-    以下の「分析データ（JSONL形式）」と「資料作成の指針」に基づき、
-    クライアント向けPowerPointレポートの全スライドを構成する
-    【単一のJSON配列（`[...]`）】を生成してください。
+    ITERATIVE_SLIDE_PROMPT_TEMPLATE = """
+    あなたはシニアデータアナリストであり、クライアント向けレポートの「スライド1枚」の
+    【テキスト部分】を作成しています。
+    提供される「分析タスクデータ」を読み、このタスク専用の
+    スライドタイトルと考察（slide_content）を生成してください。
 
-    # 分析データ (Input: JSONL形式):
-    {text_data_jsonl}
+    # 分析タスクデータ (テキスト・数値データのみ):
+    {task_data_text_only}
     
-    # ユーザーの全体方針 (User Instruction):
+    # 画像コンテキスト:
+    {image_context}
+    
+    # ユーザーの全体方針:
     {custom_instruction}
 
-    # 資料作成の指針 (Rules):
-    1.  **ストーリー構築:** 「分析データ」全体を俯瞰し、「背景→課題→解決策→効果」や「結論ファースト」など、一貫性のあるストーリーを構築してください。
-        
-    2.  **スライド構成:**
-        「表紙」「目次（アジェンダ）」「各分析スライド」「結論と戦略的提言」を必ず含めてください。
-        
-    3.  **グラフ・表の解釈:** `image_note: "Base64 encoded..."` や `image_note: "No image (pyvis HTML)"` と書かれたタスクは「グラフ」や「ネットワーク図」です。
-        あなたに画像は見えませんが、付随する `data`（JSON文字列）や `summary` を読み解き、そのグラフが「何を意味するのか」の**考察（インサイト）**を生成してください。
-        
-    4.  **考察の品質 (最重要):** 各スライドの考察（`slide_content`）は、**「何を（What）」「なぜ（Why）」「だから何（So What）」**の3点を含む、高品質なMarkdownの箇条書き（`**太字**`強調あり）にしてください。
+    # 指示:
+    1.  **タイトル**: `task_data_text_only` の `analysis_task` 名に基づき、 professional な「slide_title」を考案してください。
     
-    5.  **(★) キーの保持:**
-        生成する各スライドオブジェクトには、`slide_title`（AIが考案したタイトル）に加えて、
-        **`"analysis_task_key": "（元の analysis_task 名）"`** というキーを必ず含めてください。（例: `"analysis_task_key": "単純集計: 話題カテゴリ"`）
-        * これにより、Python側で後から画像を正しくマージできます。
-        * 「表紙」「目次」「結論」スライドの `analysis_task_key` は `null` にしてください。
+    2.  **考察 (最重要)**: 
+        `task_data_text_only` の `summary` と `data`（テーブルデータ）を解釈し、クライアントが知るべき【インサイト】を **Markdownの箇条書き** で記述してください。
+        以下の3つの視点（何を・なぜ・だから何）で構成してください。
+        
+        * **何を（What）:** データが示す最も重要な「事実」や「傾向」は何か？ (例: `**〇〇** が **XX%** 増加...`)
+        * **なぜ（Why）:** なぜその傾向が起きているのか？（背景や原因の「仮説」）
+        * **だから何（So What）:** この事実から推測できる「次のアクションのヒント」は何か？
+
+    3.  **書式**:
+        - 回答は【Markdown形式】を使用してください。
+        - 重要なキーワードや数値は `**太字**` で強調してください。
 
     # 出力形式 (厳守):
-    * **JSON以外のテキスト（「承知しました」など）は【絶対に】含めないでください。**
-    * **出力は【単一のJSON配列 `[...]` のみ】** とします。
-    * 各スライドオブジェクトの `image_base64` キーの値は、すべて `null` にしてください。
-    * 構造例:
-      [
-        {{ "slide_title": "SNSデータ分析レポート", "slide_layout": "title_only", "slide_content": ["..."], "analysis_task_key": null, "image_base64": null }},
-        {{ "slide_title": "本日のアジェンダ", "slide_layout": "title_and_content", "slide_content": ["1. ...", "2. ..."], "analysis_task_key": null, "image_base64": null }},
-        {{ "slide_title": "(AI考案のタイトル)", "slide_layout": "title_and_content", "slide_content": ["- **何を**: ...", "- **なぜ**: ..."], "analysis_task_key": "(元の analysis_task 名)", "image_base64": null }},
-        {{ "slide_title": "結論と戦略的提言", "slide_layout": "title_and_content", "slide_content": ["- **結論**: ...", "- **提言**: ..."], "analysis_task_key": null, "image_base64": null }}
-      ]
+    * JSON以外のテキストは絶対に含めず、【単一のJSONオブジェクト】`{{ ... }}` のみを出力してください。
+    * 以下の構造を厳格に守ってください。
+        {{
+          "slide_title": "（指示1で考案したタイトル）",
+          "slide_content": [
+            "（指示2, 3 に基づく Markdown 形式のインサイト1: **何を**...）",
+            "（指示2, 3 に基づく Markdown 形式のインサイト2: **なぜ**...）",
+            "（指示2, 3 に基づく Markdown 形式のインサイト3: **だから何**...）"
+          ]
+        }}
 
-    # 回答 (単一のJSON配列のみ):
+    # 回答 (単一のJSONオブジェクトのみ):
     """
     
-    prompt = PromptTemplate.from_template(ONE_SHOT_PROMPT_TEMPLATE)
+    prompt = PromptTemplate.from_template(ITERATIVE_SLIDE_PROMPT_TEMPLATE)
 
-    # (★) Proモデル(RPD 50)に固定。タイムアウトを 300秒 (5分) に延長
-    llm = get_llm(model_name=MODEL_PRO, temperature=0.2, timeout_seconds=300)
+    # (★) タイムアウトを 120秒 (2分) に設定
+    # (★) Flash (10 RPM) の場合は 7.6 秒スリープを使うため、Pro (2 RPM) より短いタイムアウトでも可
+    llm = get_llm(model_name=model_name, temperature=0.2, timeout_seconds=120)
     if llm is None:
-        st.error(f"AIモデル({MODEL_PRO})が利用できません。")
+        st.error(f"AIモデル({model_name})が利用できません。")
         return "[]" # 空のJSONリスト
     
     chain = prompt | llm | StrOutputParser()
 
-    # --- (★) 3. AIへのリクエスト (RPD 1回) ---
-    try:
-        progress_bar.progress(0.1, text=f"Step C: AI({MODEL_PRO})へ全データを送信中...")
-        log_messages_ui.append(f"AI({MODEL_PRO})へ全 {len(text_data_for_ai)} タスクを送信...")
-        log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key="step_c_log_sending")
+    # (★) --- 3. 逐次処理ループ (UIフィードバックあり) ---
+    report_slides_list = []
+    log_messages_ui = []
+    
+    tasks_all = jsonl_data_string.strip().splitlines()
+    
+    # 3.1. OverallSummaryを抽出し、残りを処理対象タスクとする
+    summary_line = "{}"
+    tasks_to_process = []
+    for line in tasks_all:
+        if '"analysis_task": "OverallSummary"' in line:
+            summary_line = line
+        else:
+            tasks_to_process.append(line)
+            
+    if not tasks_to_process:
+        logger.warning("処理対象の分析タスクが0件です。")
+        return "[]"
 
-        response_str = chain.invoke({
-            "text_data_jsonl": text_data_input_str,
+    total_tasks = len(tasks_to_process)
+    logger.info(f"全 {total_tasks} タスクを逐次処理します。")
+    
+    # 3.2. 表紙スライドを追加
+    report_slides_list.append({
+        "slide_title": "SNSデータ分析レポート",
+        "slide_layout": "title_only",
+        "slide_content": ["AI-Generated Analysis (Powered by Gemini)"],
+        "image_base64": None
+    })
+    
+    # 3.3. 目次スライドを追加 (この時点ではタスク名のみ)
+    try:
+        agenda_items = []
+        for i, task_line in enumerate(tasks_to_process):
+            try:
+                task_name = json.loads(task_line).get('analysis_task', f'分析タスク {i+1}')
+            except json.JSONDecodeError:
+                task_name = f'分析タスク {i+1} (読み込みエラー)'
+            agenda_items.append(f"{i+1}. {task_name}")
+
+        agenda_items.append(f"{len(tasks_to_process) + 1}. 結論と戦略的提言")
+        report_slides_list.append({
+            "slide_title": "本日のアジェンダ",
+            "slide_layout": "title_and_content",
+            "slide_content": agenda_items,
+            "image_base64": None
+        })
+    except Exception as e:
+        logger.error(f"目次スライドの生成に失敗: {e}")
+
+    # 3.4. メインの分析スライドをループ処理
+    for i, task_line in enumerate(tasks_to_process):
+        
+        task_name = f"Task {i+1}/{total_tasks}"
+        original_task_json = {}
+        
+        try:
+            # 3.4.1. タスクのパースと画像/テキストの分離
+            original_task_json = json.loads(task_line)
+            task_name = original_task_json.get('analysis_task', task_name)
+
+            image_to_pass_through = original_task_json.get("image_base64")
+            
+            image_context_str = "（このスライドには画像は含まれません。）"
+            if image_to_pass_through:
+                image_context_str = (
+                    "（(注) このスライドにはグラフやワードクラウド等の「データ可視化画像」が1枚含まれます。\n"
+                    "   あなたに画像は見えませんが、`data` や `summary` を根拠に、"
+                    "   その画像が「何を意味するのか」を解説する考察を記述してください。）"
+                )
+            
+            text_only_task_json = original_task_json.copy()
+            text_only_task_json["image_base64"] = None
+            if "data" in text_only_task_json and len(json.dumps(text_only_task_json["data"])) > 1000:
+                text_only_task_json["data"] = f"（データプレビュー: {str(text_only_task_json['data'])[:1000]}...）"
+            
+            task_data_text_only_str = json.dumps(text_only_task_json, ensure_ascii=False)
+            
+        except Exception as e:
+            logger.error(f"タスク '{task_name}' のJSONパースに失敗: {e}")
+            log_messages_ui.append(f"  -> ERROR: '{task_name}' のJSONパースに失敗。スキップします。")
+            continue
+
+        # 3.4.2. UI（進捗バー・ログ）の更新
+        progress_percent = (i + 1) / (total_tasks + 1)
+        # (★) ログ更新 (1/4): 処理開始
+        progress_bar.progress(progress_percent, text=f"Step C (スライド生成中): {i+1}/{total_tasks} (モデル: {model_name})")
+        log_messages_ui.append(f"[{i+1}/{total_tasks}] '{task_name}' の処理を開始...")
+        log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key=f"step_c_log_{i}")
+
+        try:
+            # 3.4.3. AIへのリクエスト (テキストのみ)
+            # (★) ログ更新 (2/4): 送信
+            log_messages_ui.append(f"  -> AI ({model_name}) にリクエストを送信... (Timeout: 120s)")
+            log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key=f"step_c_log_{i}_sending")
+            
+            response_str = chain.invoke({
+                "task_data_text_only": task_data_text_only_str,
+                "image_context": image_context_str,
+                "custom_instruction": custom_instruction_block
+            })
+            
+            # (★) ログ更新 (3/4): 受信
+            log_messages_ui.append(f"  -> AI が応答しました。レスポンスを解析中...")
+            log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key=f"step_c_log_{i}_received")
+
+            start = response_str.find('{')
+            end = response_str.rfind('}')
+            
+            if start != -1 and end != -1 and end > start:
+                json_str = response_str[start:end+1]
+                ai_response_json = json.loads(json_str)
+                
+                # 3.4.4. AIの考察と、退避させた画像を「再結合」
+                final_slide_object = {
+                    "slide_title": ai_response_json.get("slide_title", task_name),
+                    "slide_layout": "text_and_image" if image_to_pass_through else "title_and_content",
+                    "slide_content": ai_response_json.get("slide_content", ["AIによる考察の生成に失敗しました。"]),
+                    "image_base64": image_to_pass_through
+                }
+                report_slides_list.append(final_slide_object)
+                log_messages_ui.append(f"  -> SUCCESS: スライド '{final_slide_object.get('slide_title')}' を生成しました。")
+            else:
+                raise Exception("AIがJSONオブジェクト `{{...}}` を返しませんでした。")
+        
+        except Exception as e:
+            logger.error(f"タスク '{task_name}' の処理に失敗: {e}", exc_info=True)
+            log_messages_ui.append(f"  -> ERROR: '{task_name}' の処理に失敗。{e}")
+            report_slides_list.append({
+                "slide_title": f"エラー: {task_name}",
+                "slide_layout": "title_and_content",
+                "slide_content": [f"このスライドの生成に失敗しました。", f"エラー: {e}"],
+                "image_base64": None
+            })
+        
+        # 3.4.5. Rate Limit のための待機
+        if i < total_tasks:
+            # (★) ログ更新 (4/4): 待機
+            log_messages_ui.append(f"  -> Rate Limit (RPM) のため {sleep_time:.1f} 秒待機します...")
+            log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key=f"step_c_log_{i}_sleep")
+            time.sleep(sleep_time)
+
+    # (★) 4. 結論スライドの生成 (RPMを1回消費)
+    try:
+        chunk_name = f"結論スライド"
+        progress_percent = 1.0
+        progress_bar.progress(progress_percent, text=f"Step C (チャンク処理中): {chunk_name} (モデル: {model_name})")
+        log_messages_ui.append(f"[{total_tasks+1}/{total_tasks+1}] {chunk_name} の処理を開始...")
+        log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key="step_c_log_final")
+
+        conclusion_llm = get_llm(model_name=model_name, temperature=0.2, timeout_seconds=120)
+        if conclusion_llm is None:
+            raise Exception("結論スライド用AIモデルの取得に失敗")
+
+        CONCLUSION_PROMPT_TEMPLATE = """
+        あなたはシニアデータアナリストです。
+        以下の「分析サマリー」と「生成したスライドタイトル」に基づき、
+        レポートの締めくくりとなる【結論と戦略的提言】のスライド1枚分のJSONオブジェクトを生成してください。
+
+        # 分析サマリー (OverallSummary):
+        {summary_data_line}
+        
+        # 生成済みスライドタイトル:
+        {slide_titles}
+
+        # ユーザーの全体方針:
+        {custom_instruction}
+
+        # 指示:
+        1.  タイトルは「結論と戦略的提言」とします。
+        2.  レイアウトは「title_and_content」とします。
+        3.  **内容**:
+            分析全体から導かれる「結論（主要な発見）」と、クライアントが次に取るべき「具体的なアクション（提言）」を、Markdownの箇条書きで3〜5点にまとめてください。
+            
+            * **結論 (Key Findings):** （例: `**〇〇** が最も重要な課題であると判明...`）
+            * **提言 (Recommendations):** （例: `**〇〇** にリソースを集中投下し、...`）
+        
+        4.  画像 (image_base64) は null とします。
+
+        # 出力形式 (厳守):
+        * JSON以外のテキストは絶対に含めず、【単一のJSONオブジェクト】`{{ ... }}` のみを出力してください。
+
+        # 回答 (単一のJSONオブジェクトのみ):
+        """
+        
+        conclusion_prompt = PromptTemplate.from_template(CONCLUSION_PROMPT_TEMPLATE)
+        conclusion_chain = conclusion_prompt | conclusion_llm | StrOutputParser()
+        
+        log_messages_ui.append(f"  -> AI ({model_name}) にリクエストを送信... (Timeout: 120s)")
+        log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key="step_c_log_final_sending")
+        
+        response_str = conclusion_chain.invoke({
+            "summary_data_line": summary_line,
+            "slide_titles": json.dumps([s.get('slide_title') for s in report_slides_list], ensure_ascii=False),
             "custom_instruction": custom_instruction_block
         })
         
-        progress_bar.progress(0.8, text=f"Step C: AI({MODEL_PRO})が応答しました。解析中...")
-        log_messages_ui.append("AIが応答。レポート全体のJSONを解析・マージします...")
-        log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key="step_c_log_received")
+        log_messages_ui.append(f"  -> AI が応答しました。レスポンスを解析中...")
+        log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key="step_c_log_final_received")
 
-        # (★) 堅牢なJSON配列パース
-        start = response_str.find('[')
-        end = response_str.rfind(']')
-        
-        if start == -1 or end == -1 or end < start:
-            raise Exception("AIがJSON配列 `[...]` を返しませんでした。")
-        
-        json_array_str = response_str[start:end+1]
-        ai_generated_list = json.loads(json_array_str)
-
-        if not isinstance(ai_generated_list, list):
-             raise Exception("AIの回答がJSON配列(リスト)ではありません。")
-
-        # --- (★) 4. Python側での後処理 (画像のマージ) ---
-        final_report_list = []
-        
-        for slide in ai_generated_list:
-            if not isinstance(slide, dict): continue
+        start = response_str.find('{')
+        end = response_str.rfind('}')
             
-            task_key = slide.get("analysis_task_key")
+        if start != -1 and end != -1 and end > start:
+            json_str = response_str[start:end+1]
+            report_slides_list.append(json.loads(json_str))
+            log_messages_ui.append(f"  -> SUCCESS: 結論スライドを生成しました。")
+        else:
+            raise Exception("AIが結論スライドのJSONを返しませんでした。")
             
-            # (★) AIが指定したキーに基づき、退避させていた画像をマージ
-            if task_key and task_key in image_map:
-                image_data = image_map[task_key]
-                slide["image_base64"] = image_data
-                
-                # (★) 画像があるのにレイアウトがテキストのみなら、強制的に画像レイアウトに変更
-                if image_data and slide.get("slide_layout") == "title_and_content":
-                    slide["slide_layout"] = "text_and_image"
-            
-            final_report_list.append(slide)
-
-        logger.info(f"AIレポート生成・画像マージ完了。{len(final_report_list)}枚のスライドを生成。")
-        progress_bar.progress(1.0, text="Step C: 完了！")
-        log_messages_ui.append(f"SUCCESS: {len(final_report_list)}枚のスライドを生成しました。")
-        log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key="step_c_log_done")
-        
-        return json.dumps(final_report_list, ensure_ascii=False, indent=2)
-
     except Exception as e:
-        logger.error(f"Step C (単一リクエスト) 実行エラー: {e}", exc_info=True)
-        st.error(f"AIレポート生成中にエラーが発生しました: {e}")
-        progress_bar.progress(1.0, text="エラーにより中断")
-        log_messages_ui.append(f"ERROR: {e}")
-        log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key="step_c_log_error")
-        return "[]"
+         logger.error(f"結論スライドの生成に失敗: {e}")
+         log_messages_ui.append(f"  -> ERROR: 結論スライドの生成に失敗。{e}")
+         report_slides_list.append({
+                "slide_title": "結論と戦略的提言 (生成失敗)",
+                "slide_layout": "title_and_content",
+                "slide_content": [f"結論スライドの自動生成に失敗しました。", f"エラー: {e}"],
+                "image_base64": None
+            })
+
+    # (★) 5. 最終的なJSON文字列を返す
+    progress_bar.progress(1.0, text="Step C: 完了！")
+    log_placeholder.text_area("実行ログ:", "\n".join(log_messages_ui[::-1]), height=250, key="step_c_log_done")
+    
+    return json.dumps(report_slides_list, ensure_ascii=False, indent=2)
 
 def render_step_c():
     """(Step C) AIレポート生成UIを描画する"""
@@ -3755,9 +4011,9 @@ def render_step_c():
     if 'step_c_report_json' not in st.session_state:
         st.session_state.step_c_report_json = None
         
-    # (★) 廃止: step_c_model
-    # if 'step_c_model' not in st.session_state:
-    #     st.session_state.step_c_model = MODEL_FLASH 
+    # (★) [修正] モデル選択ステートを復活
+    if 'step_c_model' not in st.session_state:
+        st.session_state.step_c_model = MODEL_FLASH 
         
     if 'current_file_id_C' not in st.session_state:
         st.session_state.current_file_id_C = None
@@ -3798,13 +4054,34 @@ def render_step_c():
     # --- 2. 分析レポートの実行 ---
     st.header("Step 2: AI分析レポートの実行")
 
-    # (★) --- [修正] モデル選択UIを削除し、Proモデル固定の警告を表示 ---
-    st.warning(
-        f"**`{MODEL_PRO}` (50 RPD / 2 RPM) を使用します。**\n"
-        f"RPD（1日あたりのリクエスト）を節約するため、AIへのリクエストは**1回**のみ実行されます。\n"
-        f"（生成には数分かかる場合があります）"
+    # (★) --- [修正] モデル選択UIを復活 ---
+    st.markdown("分析に使用するAIモデルを選択してください。")
+    
+    model_options = [MODEL_FLASH, MODEL_PRO]
+    try:
+        default_index = model_options.index(st.session_state.step_c_model)
+    except ValueError:
+        default_index = 0
+        
+    selected_model_name = st.radio(
+        "使用モデル",
+        options=model_options,
+        index=default_index,
+        key="step_c_model_radio",
+        horizontal=True,
     )
-    # (★) --- (L2701-L2731 の st.radio と if/else を削除) ---
+    st.session_state.step_c_model = selected_model_name
+
+    if selected_model_name == MODEL_PRO:
+        st.warning(
+            f"**`{MODEL_PRO}` (2 RPM) を使用します。**\n"
+            f"スライド1枚ごとに **30.5秒** の待機が発生するため、生成に時間がかかります。"
+        )
+    else:
+        st.info(
+            f"**`{MODEL_FLASH}` (10 RPM) を使用します。**\n"
+            f"スライド1枚ごとに **7.6秒** の待機が発生します。（推奨）"
+        )
     
     # (★) --- カスタム指示のUI (変更なし) ---
     st.markdown("---")
@@ -3828,13 +4105,13 @@ def render_step_c():
         progress_bar = st.progress(0.0, text="Step C: 分析待機中...")
         log_placeholder = st.empty()
 
-        # (★) [修正] selected_model を MODEL_PRO に固定
-        selected_model = MODEL_PRO
+        # (★) [修正] 選択されたモデルを渡す
+        selected_model = st.session_state.step_c_model
         
         try:
             st.session_state.step_c_report_json = run_step_c_analysis(
                 st.session_state.step_c_jsonl_data,
-                selected_model, # (★) Pro が渡される
+                selected_model,
                 progress_bar, 
                 log_placeholder,
                 st.session_state.step_c_custom_instruction 
@@ -3907,7 +4184,7 @@ def render_step_c():
             
         st.success("データをダウンロードし、Step D (PowerPoint生成) に進んでください。")
 
-# (★) ---Step D---
+# (★) ---Step D--- PowerPoint生成 ---
 try:
     import pptx
     from pptx import Presentation
