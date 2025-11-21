@@ -17,6 +17,8 @@ import json
 import logging
 import random  
 import time
+import boto3
+from botocore.exceptions import ClientError
 import spacy
 import altair as alt
 import networkx as nx
@@ -122,7 +124,22 @@ COLOR_PALETTE = [
     "#FF5733", "#33FF57", "#3357FF", "#FF33A1", "#33FFF6",
     "#F3FF33", "#FF8C33", "#8C33FF", "#33FF8C", "#FF338C"
 ]
+# AWS 設定 (環境変数から読み込み)
+AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
+AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
+AWS_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
 
+BEDROCK_S3_INPUT_BUCKET = os.getenv("BEDROCK_S3_INPUT_BUCKET")
+BEDROCK_S3_OUTPUT_BUCKET = os.getenv("BEDROCK_S3_OUTPUT_BUCKET")
+BEDROCK_ROLE_ARN = os.getenv("BEDROCK_ROLE_ARN")
+
+# バッチ推論に使用するモデル (Nova Lite)
+# ※ us-east-1 で利用可能なモデルID
+BATCH_MODEL_ID = "amazon.nova-lite-v1:0" 
+
+# Step B以降で使用するGeminiモデル
+MODEL_FLASH_LITE = "gemini-2.5-flash-lite"
+MODEL_PRO = "gemini-2.5-pro"
 # --- 3. ロガー設定 ---
 class StreamlitLogHandler(logging.Handler):
     """Streamlitのセッションステートにログメッセージを追加するハンドラ"""
@@ -143,10 +160,92 @@ if not logger.handlers:
     handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
     logger.addHandler(handler)
 
+# --- (★) AWS連携用ヘルパー関数 ---
 
+def get_aws_clients():
+    """AWSクライアント(s3, bedrock)を作成する"""
+    try:
+        session = boto3.Session(
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+            region_name=AWS_REGION
+        )
+        s3 = session.client('s3')
+        bedrock = session.client('bedrock')
+        return s3, bedrock
+    except Exception as e:
+        logger.error(f"AWSクライアント作成エラー: {e}")
+        return None, None
+
+def upload_jsonl_to_s3(jsonl_string: str, bucket_name: str, key: str):
+    """JSONL文字列をS3にアップロードする"""
+    s3, _ = get_aws_clients()
+    if not s3: return False
+    try:
+        s3.put_object(Bucket=bucket_name, Key=key, Body=jsonl_string)
+        logger.info(f"S3アップロード成功: s3://{bucket_name}/{key}")
+        return True
+    except Exception as e:
+        logger.error(f"S3アップロード失敗: {e}")
+        st.error(f"S3へのアップロードに失敗しました: {e}")
+        return False
+
+def create_batch_job(job_name: str, input_key: str, output_key: str):
+    """Bedrockバッチ推論ジョブを作成・送信する"""
+    _, bedrock = get_aws_clients()
+    if not bedrock: return None
+    
+    input_uri = f"s3://{BEDROCK_S3_INPUT_BUCKET}/{input_key}"
+    output_uri = f"s3://{BEDROCK_S3_OUTPUT_BUCKET}/{output_key}"
+    
+    try:
+        response = bedrock.create_model_invocation_job(
+            jobName=job_name,
+            roleArn=BEDROCK_ROLE_ARN,
+            modelId=BATCH_MODEL_ID,
+            inputDataConfig={'s3InputDataConfig': {'s3Uri': input_uri}},
+            outputDataConfig={'s3OutputDataConfig': {'s3Uri': output_uri}}
+        )
+        logger.info(f"ジョブ投入成功: {response.get('jobArn')}")
+        return response.get('jobArn')
+    except Exception as e:
+        logger.error(f"ジョブ投入失敗: {e}")
+        st.error(f"Bedrockジョブの開始に失敗しました: {e}")
+        return None
+
+def get_batch_job_status(job_arn: str):
+    """ジョブのステータスを確認する"""
+    _, bedrock = get_aws_clients()
+    if not bedrock: return "Unknown"
+    try:
+        response = bedrock.get_model_invocation_job(jobIdentifier=job_arn)
+        return response.get('status')
+    except Exception as e:
+        logger.error(f"ステータス確認失敗: {e}")
+        return "Error"
+
+def download_results_from_s3(output_key_prefix: str) -> str:
+    """S3から結果ファイル(JSONL)をダウンロードして結合する"""
+    s3, _ = get_aws_clients()
+    if not s3: return ""
+    
+    try:
+        # Bedrockの出力は <output_key>/<job_id>.jsonl.out のような構造になるためリストする
+        objects = s3.list_objects_v2(Bucket=BEDROCK_S3_OUTPUT_BUCKET, Prefix=output_key_prefix)
+        
+        full_result = ""
+        if 'Contents' in objects:
+            for obj in objects['Contents']:
+                if obj['Key'].endswith('.out'):
+                    response = s3.get_object(Bucket=BEDROCK_S3_OUTPUT_BUCKET, Key=obj['Key'])
+                    full_result += response['Body'].read().decode('utf-8') + "\n"
+        return full_result
+    except Exception as e:
+        logger.error(f"結果ダウンロード失敗: {e}")
+        return ""
+    
 # --- 4. (★) AIモデル・NLPモデルのキャッシュ管理 ---
 
-# (★) 要件に基づき、異なるモデル名を指定してLLMをロードする関数に刷新
 @st.cache_resource(ttl=3600)
 def get_llm(
     model_name: str, 

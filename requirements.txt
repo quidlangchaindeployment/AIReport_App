@@ -13,3 +13,4 @@ streamlit-sortables
 matplotlib
 python-dotenv
 wordcloud
+boto3
