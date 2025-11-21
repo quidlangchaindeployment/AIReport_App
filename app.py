@@ -552,8 +552,9 @@ def perform_ai_tagging(
     analysis_prompt: str = ""
 ) -> pd.DataFrame:
     """
-    (Step A) AIタグ付け (Flash Lite)
-    (★) 改善 v7: 部位・料理名・調理評価の徹底排除と、形容詞フレーズへの純化
+    (Step A) AIタグ付け (Flash Lite) - 修正版
+    改善点: 「カテゴリ（名詞）」と「特性（形容詞）」の抽出ルールを明確に分離し、
+           カテゴリが空になる問題と、特性に名詞が混ざる問題を解決。
     """
     llm = get_llm(model_name=MODEL_FLASH_LITE, temperature=0.0)
     if llm is None:
@@ -562,18 +563,17 @@ def perform_ai_tagging(
 
     nlp = load_spacy_model()
     
-    # (1) 動的除外リストの取得 (品目・部位・料理名)
+    # (1) 動的除外リスト (品目・部位・料理名)
     dynamic_targets = get_dynamic_exclusion_list(analysis_prompt)
     
-    # (2) 静的な除外リスト (感情・メタ記述)
+    # (2) 静的な除外リスト (感情・メタ記述・地名など特性に入れたくないもの)
     static_exclusion = set([
         "美味しい", "おいしい", "最高", "絶品", "うまい", "美味", "幸せ", "感動", "好き", "大好き", "満足",
-        "言及なし", "該当なし", "不明", "特になし", "記述なし"
+        "言及なし", "該当なし", "不明", "特になし", "記述なし", "栃木", "とちぎ", "那須", "日光"
     ])
 
-    # (3) 末尾一致で削除するNGパターン (料理名・セット名など)
-    # Regex: 〜丼, 〜膳, 〜定食, 〜コース, 〜のせ, 〜入り, 〜添え, 〜風, 〜味
-    suffix_ng_pattern = re.compile(r'(丼|膳|定食|コース|のせ|入り|添え|風|味|ランチ|ディナー|セット)$')
+    # (3) 末尾一致NGパターン
+    suffix_ng_pattern = re.compile(r'(丼|膳|定食|コース|のせ|入り|添え|風|味|ランチ|ディナー|セット|屋|店)$')
 
     input_texts_jsonl = df_batch.apply(
         lambda row: json.dumps(
@@ -583,46 +583,40 @@ def perform_ai_tagging(
         axis=1
     ).tolist()
 
-    # (★) プロンプトテンプレート
+    # (★) プロンプト修正: カテゴリ用と特性用のルールを分離
     prompt = PromptTemplate.from_template(
         """
-        あなたは厳格なデータ抽出AIです。
-        「分析指針」と「カテゴリ定義」に基づき、食材の**「状態・性質（Attributes）」**のみを抽出してください。
+        あなたはデータ抽出のスペシャリストです。
+        「分析指針」と「カテゴリ定義」に基づき、SNS投稿から情報を抽出してください。
 
         # 分析指針:
         {analysis_prompt}
 
-        # カテゴリ定義:
+        # カテゴリ定義（抽出ターゲット）:
         {categories}
 
-        # 【最重要】「農産物特性」の抽出ルール:
-        食材（肉、野菜など）の**「テクスチャ（食感）」「味覚」「見た目」「品質評価」を表す形容詞的フレーズ**のみを抽出してください。
+        # 【重要】抽出ルール（カテゴリごとの使い分け）:
 
-        **1. 思考プロセス（Thinking Process）:**
-           - 抽出候補が「メニュー名（～丼、～カレー）」や「部位名（タン、ヒレ）」などの**「名詞（物体）」**である場合は、特性ではないので**破棄**する。
-           - 「焼き加減」や「揚げたて」などの**「調理技術・状態」**である場合も、素材の特性ではないので**破棄**する。
-           - 残った**「柔らかい」「甘い」「香り高い」「サシが凄い」**のような、**状態を表す言葉**だけを残す。
-        
-        **2. NGルール（抽出禁止）:**
-           - × 料理名：ハンバーグ、ステーキ、ローストビーフ丼、カレー
-           - × 部位名：タン、ハラミ、ロース、ヒレ、モモ
-           - × 調理評価：焼き加減、レア、ウェルダン、熱々
-           - × 単なる主語：和牛、お肉、ビーフ
+        **1. 「カテゴリ」「品目名」「商品名」を抽出する場合 (例: 農産物カテゴリ)**
+           - 投稿で言及されている**「具体的な名詞（品目・品種・商品）」**を抽出してください。
+           - 例: "とちぎ和牛", "スカイベリー", "ローストビーフ丼", "ジェラート"
+           - ※ここでは名詞を捨てないでください。
 
-        # 出力例 (Few-Shot):
-        - テキスト: "焼き加減最高で、国産のローストビーフ丼。赤身の旨味が強くて丁度良い。"
-          -> {{ "categories": {{ "農産物特性": "赤身の旨味が強い" }} }}
-             (※「焼き加減」「ローストビーフ丼」は除外。「丁度良い」も具体性がないため除外推奨)
-
-        - テキスト: "柔らかいヒレ肉で感動した。"
-          -> {{ "categories": {{ "農産物特性": "柔らかい" }} }}
-             (※「ヒレ肉」という部位名は除外)
+        **2. 「特性」「特徴」「イメージ」を抽出する場合 (例: 農産物特性)**
+           - 対象の**「状態・性質・感覚（味、食感、見た目）」を表す言葉**を抽出してください。
+           - **× NG（除外対象）**: 
+             - 単なる品目名（例：和牛、肉、イチゴ）
+             - 地名（例：栃木、那須）
+             - メニュー名（例：ステーキ、ハンバーグ）
+             - 調理法・焼き加減（例：レア、焼き加減）
+           - **○ OK（抽出対象）**: 
+             - 形容詞的表現（例：柔らかい、甘い、サシが凄い、香り高い、ジューシー）
 
         # 対象テキストデータ (JSONL):
         {text_data_jsonl}
 
-        # 回答フォーマット (JSONL):
-        {{ "id": 123, "categories": {{ "カテゴリ名": "値" }} }}
+        # 回答フォーマット (JSONL形式のみ):
+        {{ "id": 123, "categories": {{ "カテゴリ名1": "値1", "カテゴリ名2": "値2" }} }}
         """
     )
     
@@ -660,47 +654,44 @@ def perform_ai_tagging(
                     elif raw_value:
                         processed_value = str(raw_value).strip()
                     
-                    # 1. メタ記述クリーニング
+                    # クリーニング処理
                     if processed_value.lower() in ["該当なし", "none", "null", "", "不明"]:
                         processed_value = ""
                     
-                    # 2. 地名正規化 (既存)
-                    if key == "市区町村キーワード" and processed_value:
-                         if processed_value in alias_map:
-                            processed_value = alias_map[processed_value]
-                    
-                    # 3. 【強化】特性カテゴリの強力クリーニング
-                    if key != "市区町村キーワード" and "カテゴリ" not in key and processed_value:
-                        phrases = re.split(r'[,、\s]+', processed_value) # スペースでも分割
+                    # 地名・カテゴリ名判定（簡易）
+                    is_category_col = "カテゴリ" in key or "品目" in key or "商品" in key
+                    is_location_col = "市区町村" in key or "地名" in key
+
+                    # 特性系カラムの場合のみ、強力なNGワード除去を行う
+                    if not is_category_col and not is_location_col and processed_value:
+                        phrases = re.split(r'[,、\s]+', processed_value)
                         clean_phrases = []
                         
                         for phrase in phrases:
                             phrase = phrase.strip()
                             if not phrase: continue
                             
-                            # A. 完全一致NG (感情など)
+                            # 静的NGリストチェック
                             if phrase in static_exclusion: continue
-
-                            # B. 末尾NGチェック (〜丼、〜膳など)
+                            # 末尾NGチェック
                             if suffix_ng_pattern.search(phrase): continue
-                            
-                            # C. 焼き加減・調理法チェック
+                            # 調理法チェック
                             if "焼き加減" in phrase or "揚げ" in phrase: continue
 
-                            # D. 動的NGワードの除去処理
-                            # フレーズ内に「NGワード(和牛など)」が含まれている場合、その単語だけを消す
+                            # 動的NGワード（品目名など）を除去
                             # 例: "柔らかいヒレ肉" -> "柔らかい"
                             temp_phrase = phrase
                             for target in dynamic_targets:
                                 temp_phrase = temp_phrase.replace(target, "")
                             
-                            # E. 助詞・記号のクリーニング (re.sub)
-                            # 先頭の「の」「な」「が」「は」などを削除
+                            # 地名も除去（念のため）
+                            for loc in ["栃木", "とちぎ", "那須", "日光", "宇都宮"]:
+                                temp_phrase = temp_phrase.replace(loc, "")
+
+                            # 助詞の除去
                             temp_phrase = re.sub(r'^[のにはがをな]+', '', temp_phrase).strip()
-                            # 末尾の「の」「な」などを削除
                             temp_phrase = re.sub(r'[のにはがをな]$', '', temp_phrase).strip()
 
-                            # F. 残った文字列が意味を成すかチェック
                             if len(temp_phrase) > 1:
                                 clean_phrases.append(temp_phrase)
                         
@@ -886,363 +877,201 @@ def update_progress_ui(
         logger.warning(f"UI update failed: {e}")
 
 def render_step_a():
-    """(Step A) タグ付け処理のUIを描画する"""
+    """(Step A) タグ付け処理UI (ID重複エラー修正版)"""
     st.title("🏷️ Step A: AIタグ付け & キュレーション")
 
-    # Step A 固有のセッションステートを初期化
-    if 'cancel_analysis' not in st.session_state:
-        st.session_state.cancel_analysis = False
-    if 'generated_categories' not in st.session_state:
-        st.session_state.generated_categories = {}
-    if 'selected_categories' not in st.session_state:
-        st.session_state.selected_categories = set()
-    if 'analysis_prompt_A' not in st.session_state:
-        st.session_state.analysis_prompt_A = ""
-    if 'selected_text_col' not in st.session_state:
-        st.session_state.selected_text_col = {}
-    if 'tagged_df_A' not in st.session_state:
-        st.session_state.tagged_df_A = pd.DataFrame()
+    if 'cancel_analysis' not in st.session_state: st.session_state.cancel_analysis = False
+    if 'generated_categories' not in st.session_state: st.session_state.generated_categories = {}
+    if 'selected_categories' not in st.session_state: st.session_state.selected_categories = set()
+    if 'analysis_prompt_A' not in st.session_state: st.session_state.analysis_prompt_A = ""
+    if 'tagged_df_A' not in st.session_state: st.session_state.tagged_df_A = pd.DataFrame()
 
-    st.header("Step 1: 分析対象ファイルのアップロード")
-    uploaded_files = st.file_uploader(
-        "分析したい Excel / CSV ファイル（複数可）",
-        type=['csv', 'xlsx', 'xls'],
-        accept_multiple_files=True,
-        key="uploader_A"
-    )
+    st.header("Step 1: ファイルアップロード")
+    uploaded_files = st.file_uploader("CSV/Excel", type=['csv', 'xlsx'], accept_multiple_files=True)
 
-    if not uploaded_files:
-        st.info("分析を開始するには、ExcelまたはCSVファイルをアップロードしてください。")
-        return
-
-    # ファイル読み込み処理
+    if not uploaded_files: return
+    
     valid_files_data = {}
-    error_messages = []
     for f in uploaded_files:
         df, err = read_file(f)
-        if err:
-            error_messages.append(f"**{f.name}**: {err}")
-        else:
-            valid_files_data[f.name] = df
-            
-    if error_messages:
-        st.error("以下のファイルは読み込めませんでした:\n" + "\n".join(error_messages))
-    if not valid_files_data:
-        st.warning("読み込み可能なファイルがありません。")
-        return
+        if df is not None: valid_files_data[f.name] = df
+    
+    if not valid_files_data: return
 
-    st.header("Step 2: 分析指針の入力とカテゴリ生成")
+    st.header("Step 2: 分析指針とカテゴリ生成")
     analysis_prompt = st.text_area(
-        "AIがタグ付けとキュレーションを行う際の指針を入力してください（必須）:",
+        "分析指針（必須）:",
         value=st.session_state.analysis_prompt_A,
-        height=100,
-        placeholder="例: 広島県の観光に関するInstagramの投稿。無関係な地域の投稿や、単なる挨拶・宣伝は除外したい。\n例: ①農産品カテゴリ（牛乳,チーズ,米） ②農産品特性（味、見た目、用途のサマリ）",
-        key="analysis_prompt_input_A"
+        placeholder="例: 栃木県のいちごに関する分析。①農産品カテゴリ（いちご,とちあいか） ②農産品特性（味、見た目）を抽出したい。",
+        height=100
     )
     st.session_state.analysis_prompt_A = analysis_prompt
-    
-    st.markdown(f"（(★) 使用モデル: `{MODEL_FLASH_LITE}`）")
-    if st.button("AIにカテゴリ候補を生成させる (Step 2)", key="gen_cat_button", type="primary"):
-        if not analysis_prompt.strip():
-            st.warning("分析指針は必須です。AIがデータを理解するために目的を入力してください。")
-        elif not os.getenv("GOOGLE_API_KEY"):
-            st.error("Google APIキーが設定されていません。（.envファイルを確認してください）")
-        else:
-            with st.spinner(f"AI ({MODEL_FLASH_LITE}) が分析指針を読み解き、カテゴリを考案中..."):
-                logger.info("AIカテゴリ生成ボタンクリック")
-                st.session_state.generated_categories = {"市区町村キーワード": "地名辞書(JAPAN_GEOGRAPHY_DB)から抽出された市区町村名"}
-                
-                ai_categories = get_dynamic_categories(analysis_prompt)
-                
-                if ai_categories:
-                    st.session_state.generated_categories.update(ai_categories)
-                    logger.info(f"AIカテゴリ生成成功: {list(ai_categories.keys())}")
-                    st.success("AIによるカテゴリ候補の生成が完了しました。Step 3 に進んでください。")
-                else:
-                    st.error("AIによるカテゴリ生成に失敗しました。AIの応答を確認してください。")
 
-    if not analysis_prompt.strip():
-        st.warning("分析指針は必須です。AIがデータを理解するために目的を入力してください。")
-        return
+    if st.button("カテゴリ候補を生成", type="primary"):
+        with st.spinner("カテゴリ生成中..."):
+            st.session_state.generated_categories = {"市区町村キーワード": "地名辞書から抽出"}
+            cats = get_dynamic_categories(analysis_prompt)
+            if cats: 
+                st.session_state.generated_categories.update(cats)
+                st.success("カテゴリ生成完了。Step 3へ。")
 
-    st.header("Step 3: 分析カテゴリの選択")
-    if not st.session_state.generated_categories:
-        st.info("Step 2 で「AIにカテゴリ候補を生成させる」ボタンを押してください。")
-        return
-        
-    st.markdown("タグ付けしたいカテゴリを以下から選択してください（「市区町村キーワード」は必須です）")
-    
-    selected_cats = []
-    cols = st.columns(3)
-    categories_to_show = st.session_state.generated_categories.items()
-    
-    for i, (cat, desc) in enumerate(categories_to_show):
-        with cols[i % 3]:
-            # (★ TypeError 修正)
-            is_checked = st.checkbox(
-                cat,
-                value=(cat == "市区町村キーワード" or cat in st.session_state.selected_categories),
-                help=str(desc), 
-                key=f"cat_cb_{cat}",
-                disabled=(cat == "市区町村キーワード")
-            )
-            if is_checked:
-                selected_cats.append(cat)
-    st.session_state.selected_categories = set(selected_cats)
+    st.header("Step 3: カテゴリ選択")
+    if st.session_state.generated_categories:
+        sel = []
+        cols = st.columns(3)
+        for i, (k, v) in enumerate(st.session_state.generated_categories.items()):
+            with cols[i%3]:
+                if st.checkbox(k, value=(k=="市区町村キーワード"), disabled=(k=="市区町村キーワード"), help=v, key=k):
+                    sel.append(k)
+        st.session_state.selected_categories = set(sel)
 
-    st.header("Step 4: 分析対象テキスト列の指定")
+    st.header("Step 4: テキスト列指定")
     selected_text_col_map = {}
-    st.markdown("ファイルごとに、タグ付け対象のテキストが含まれる列を指定してください。")
-    for f_name, df in valid_files_data.items():
-        cols_list = list(df.columns)
-        default_index = 0
-        
-        if st.session_state.selected_text_col.get(f_name) in cols_list:
-            default_index = cols_list.index(st.session_state.selected_text_col.get(f_name))
-        elif any(c in cols_list for c in ['text', 'body', 'content', '投稿', '本文']):
-            try:
-                default_index = next(i for i, c in enumerate(cols_list) if c in ['text', 'body', 'content', '投稿', '本文'])
-            except StopIteration:
-                default_index = 0
-                
-        selected_col = st.selectbox(f"**{f_name}** のテキスト列:", cols_list, index=default_index, key=f"col_select_{f_name}")
-        selected_text_col_map[f_name] = selected_col
-    st.session_state.selected_text_col = selected_text_col_map
+    for f, df in valid_files_data.items():
+        cols = list(df.columns)
+        idx = 0
+        for i, c in enumerate(cols):
+            if c in ['text', 'body', '本文']: idx = i
+        selected_text_col_map[f] = st.selectbox(f"{f} のテキスト列", cols, index=idx)
 
     st.header("Step 5: 分析実行")
-    st.markdown(f"（(★) 使用モデル: `{MODEL_FLASH_LITE}`）")
-    
-    col_run, col_cancel = st.columns([1, 1])
-    with col_cancel:
-        if st.button("キャンセル", key="cancel_button_A", use_container_width=True):
-            st.session_state.cancel_analysis = True
-            logger.warning("分析キャンセルボタンが押されました。")
-            st.warning("次のバッチ処理後に分析をキャンセルします...")
-    
-    with col_run:
-        if st.button("分析実行 (Step 5)", type="primary", key="run_analysis_A", use_container_width=True):
-            st.session_state.cancel_analysis = False
-            st.session_state.log_messages = []
-            st.session_state.tagged_df_A = pd.DataFrame()
+    if st.button("分析開始", type="primary"):
+        st.session_state.cancel_analysis = False
+        progress_bar = st.progress(0.0)
+        log_area = st.empty()
+        tip_area = st.empty()
+        
+        try:
+            # 1. Merge
+            dfs = []
+            for f, df in valid_files_data.items():
+                dfs.append(df.rename(columns={selected_text_col_map[f]: 'ANALYSIS_TEXT_COLUMN'}))
+            master_df = pd.concat(dfs, ignore_index=True)
+            master_df['id'] = master_df.index
+            master_df.drop_duplicates(subset=['ANALYSIS_TEXT_COLUMN'], inplace=True)
             
-            tip_placeholder = st.empty()
-            try:
-                with st.spinner("分析TIPSをAIで生成中..."):
-                    if 'tips_list' not in st.session_state or not st.session_state.tips_list:
-                        st.session_state.tips_list = get_analysis_tips_list_from_ai()
+            # 2. Curation
+            total = len(master_df)
+            filtered_res = []
+            for i in range(0, total, FILTER_BATCH_SIZE):
+                if st.session_state.cancel_analysis: break
+                batch = master_df.iloc[i:i+FILTER_BATCH_SIZE]
+                update_progress_ui(progress_bar, log_area, tip_area, min(i+FILTER_BATCH_SIZE, total), total, "キュレーション")
+                res = filter_relevant_data_by_ai(batch, analysis_prompt)
+                filtered_res.append(res)
+                time.sleep(1)
+            
+            filter_df = pd.concat(filtered_res)
+            target_ids = filter_df[filter_df['relevant']==True]['id']
+            target_df = master_df[master_df['id'].isin(target_ids)].copy()
+            
+            # 3. Tagging
+            tagged_res = []
+            tag_total = len(target_df)
+            cats = {k:v for k,v in st.session_state.generated_categories.items() if k in st.session_state.selected_categories}
+            
+            for i in range(0, tag_total, TAGGING_BATCH_SIZE):
+                if st.session_state.cancel_analysis: break
+                batch = target_df.iloc[i:i+TAGGING_BATCH_SIZE]
+                update_progress_ui(progress_bar, log_area, tip_area, min(i+TAGGING_BATCH_SIZE, tag_total), tag_total, "タグ付け")
+                res = perform_ai_tagging(batch, cats, analysis_prompt)
+                if not res.empty: tagged_res.append(res)
+                time.sleep(TAGGING_SLEEP_TIME)
                 
-                if not st.session_state.tips_list: 
-                    st.session_state.tips_list = ["データ分析TIPSの取得に失敗しました。"]
+            if tagged_res:
+                final_tags = pd.concat(tagged_res)
+                
+                # 4. Inference (Pass 2)
+                merged = pd.merge(target_df, final_tags, on='id', how='left')
+                needs_inf = merged[(merged['市区町村キーワード'].isnull()) | (merged['市区町村キーワード']=='')]
+                
+                if not needs_inf.empty:
+                     norm_maps = get_location_normalization_maps(JAPAN_GEOGRAPHY_DB, analysis_prompt)
+                     inf_res = []
+                     inf_total = len(needs_inf)
+                     for i in range(0, inf_total, TAGGING_BATCH_SIZE):
+                         batch = needs_inf.iloc[i:i+TAGGING_BATCH_SIZE]
+                         update_progress_ui(progress_bar, log_area, tip_area, min(i+TAGGING_BATCH_SIZE, inf_total), inf_total, "地名推論")
+                         res = perform_ai_location_inference(batch, analysis_prompt, norm_maps)
+                         if not res.empty: inf_res.append(res)
+                         time.sleep(TAGGING_SLEEP_TIME)
+                     
+                     if inf_res:
+                         inf_df = pd.concat(inf_res)
 
-                st.session_state.current_tip_index = random.randint(0, len(st.session_state.tips_list) - 1)
-                st.session_state.last_tip_time = time.time()
-                tip_placeholder.info(f"💡 データ分析TIPS: {st.session_state.tips_list[st.session_state.current_tip_index]}")
-            except Exception as e:
-                logger.error(f"Tips初期化エラー: {e}")
+                         # (★) --- [修正] ID重複エラーの完全対策 ---
+                         # IDを数値型に強制変換し、NaNを除外、int型に統一することで
+                         # 「文字列の"1"」と「数値の1」のような不一致による重複を防ぐ
+                         final_tags['id'] = pd.to_numeric(final_tags['id'], errors='coerce')
+                         final_tags = final_tags.dropna(subset=['id'])
+                         final_tags['id'] = final_tags['id'].astype(int)
+                         
+                         inf_df['id'] = pd.to_numeric(inf_df['id'], errors='coerce')
+                         inf_df = inf_df.dropna(subset=['id'])
+                         inf_df['id'] = inf_df['id'].astype(int)
 
-            try:
-                with st.spinner(f"Step A: AI分析処理中 ({MODEL_FLASH_LITE})..."):
-                    logger.info("Step A 分析実行ボタンクリック")
-                    progress_placeholder = st.progress(0.0, text="処理待機中...")
-                    log_placeholder = st.empty()
+                         # 重複削除 (keep='first'で最初のデータを正とする)
+                         final_tags = final_tags.drop_duplicates(subset=['id'], keep='first')
+                         inf_df = inf_df.drop_duplicates(subset=['id'], keep='first')
 
-                    # --- 1. ファイル結合 ---
-                    update_progress_ui(progress_placeholder, log_placeholder, tip_placeholder, 0, 100, "ファイル結合")
-                    temp_dfs = []
-                    for f_name, df in valid_files_data.items():
-                        col_name = selected_text_col_map[f_name]
-                        temp_df = df.rename(columns={col_name: 'ANALYSIS_TEXT_COLUMN'})
-                        temp_dfs.append(temp_df)
+                         # インデックスを設定してマージ
+                         final_tags = final_tags.set_index('id')
+                         inf_df = inf_df.set_index('id')
+
+                         # 欠損値を埋める (インデックスがユニークなのでエラーにならない)
+                         final_tags['市区町村キーワード'] = final_tags['市区町村キーワード'].fillna(inf_df['inferred_location'])
+                         
+                         # 空文字の場合も埋める
+                         mask_empty = final_tags['市区町村キーワード'] == ''
+                         if mask_empty.any():
+                             # combine_firstやupdateの代わりに、indexが合う箇所のみ代入
+                             # (inf_dfにあるIDのみが対象となる)
+                             common_idx = final_tags[mask_empty].index.intersection(inf_df.index)
+                             if not common_idx.empty:
+                                 final_tags.loc[common_idx, '市区町村キーワード'] = inf_df.loc[common_idx, 'inferred_location']
+
+                         final_tags = final_tags.reset_index()
+
+                st.session_state.tagged_df_A = pd.merge(target_df, final_tags, on='id', how='inner')
+                st.success("完了")
+
+                # (★) 自動ダウンロード処理
+                try:
+                    csv = st.session_state.tagged_df_A.to_csv(index=False, encoding='utf-8-sig')
+                    b64 = base64.b64encode(csv.encode('utf-8-sig')).decode()
                     
-                    master_df = pd.concat(temp_dfs, ignore_index=True, sort=False)
-                    master_df['id'] = master_df.index
-                    if master_df.empty:
-                        raise Exception("分析対象のデータがありません。")
+                    dl_html = f"""
+                    <html>
+                    <head>
+                    <script>
+                        function download() {{
+                            var element = document.getElementById('download_link');
+                            if(element) {{
+                                element.click();
+                            }}
+                        }}
+                        window.onload = download;
+                    </script>
+                    </head>
+                    <body>
+                        <a href="data:text/csv;base64,{b64}" download="Curated_Data.csv" id="download_link" style="display:none;">Download</a>
+                    </body>
+                    </html>
+                    """
+                    components.html(dl_html, height=0)
+                    st.info("自動ダウンロードを開始しました。")
+                    
+                except Exception as e:
+                    logger.error(f"自動ダウンロードエラー: {e}")
+                    st.warning("自動ダウンロードに失敗しました。下のボタンから手動でダウンロードしてください。")
 
-                    # --- 2. 重複削除 ---
-                    initial_row_count = len(master_df)
-                    master_df.drop_duplicates(subset=['ANALYSIS_TEXT_COLUMN'], keep='first', inplace=True)
-                    deduped_row_count = len(master_df)
-                    logger.info(f"重複削除 完了。 {initial_row_count}行 -> {deduped_row_count}行")
-
-                    # --- 3. (★) AI関連性フィルタリング (キュレーション) ---
-                    total_filter_rows = len(master_df)
-                    total_filter_batches = (total_filter_rows + FILTER_BATCH_SIZE - 1) // FILTER_BATCH_SIZE
-                    all_filtered_results = []
-                    
-                    for i in range(0, total_filter_rows, FILTER_BATCH_SIZE):
-                        if st.session_state.cancel_analysis:
-                            raise Exception("分析がキャンセルされました")
-                        
-                        batch_df = master_df.iloc[i:i + FILTER_BATCH_SIZE]
-                        current_batch_num = (i // FILTER_BATCH_SIZE) + 1
-                        
-                        update_progress_ui(
-                            progress_placeholder, log_placeholder, tip_placeholder,
-                            min(i + FILTER_BATCH_SIZE, total_filter_rows), total_filter_rows,
-                            f"AIキュレーション (バッチ {current_batch_num}/{total_filter_batches})"
-                        )
-                        
-                        filtered_df = filter_relevant_data_by_ai(batch_df, analysis_prompt)
-                        if filtered_df is not None and not filtered_df.empty:
-                            all_filtered_results.append(filtered_df)
-                        
-                        time.sleep(FILTER_SLEEP_TIME) 
-                    
-                    if not all_filtered_results:
-                        raise Exception("AIフィルタリング処理に失敗しました。")
-
-                    filter_results_df = pd.concat(all_filtered_results, ignore_index=True)
-                    relevant_ids = filter_results_df[filter_results_df['relevant'] == True]['id']
-                    filtered_master_df = master_df[master_df['id'].isin(relevant_ids)].copy()
-                    filtered_row_count = len(filtered_master_df)
-                    logger.info(f"AIフィルタリング 完了。 {deduped_row_count}行 -> {filtered_row_count}行")
-
-                    if filtered_master_df.empty:
-                        st.warning("AIキュレーションの結果、分析対象のデータが0件になりました。")
-                        st.session_state.tagged_df_A = pd.DataFrame()
-                        progress_placeholder.progress(1.0, text="処理完了 (対象データ0件)")
-                        return
-
-                    # --- 4. (★) AIタグ付け (Pass 1) ---
-                    selected_category_definitions = {
-                        cat: desc for cat, desc in st.session_state.generated_categories.items()
-                        if cat in st.session_state.selected_categories
-                    }
-                    
-                    master_df_for_tagging = filtered_master_df
-                    total_rows = len(master_df_for_tagging)
-                    all_tagged_results = []
-                    total_batches = (total_rows + TAGGING_BATCH_SIZE - 1) // TAGGING_BATCH_SIZE
-                    
-                    for i in range(0, total_rows, TAGGING_BATCH_SIZE):
-                        if st.session_state.cancel_analysis:
-                            raise Exception("分析がキャンセルされました")
-                        
-                        batch_df = master_df_for_tagging.iloc[i:i + TAGGING_BATCH_SIZE]
-                        current_batch_num = (i // TAGGING_BATCH_SIZE) + 1
-                        
-                        update_progress_ui(
-                            progress_placeholder, log_placeholder, tip_placeholder,
-                            min(i + TAGGING_BATCH_SIZE, total_rows), total_rows,
-                            f"AIタグ付け[1/2] (バッチ {current_batch_num}/{total_batches})"
-                        )
-
-                        tagged_df = perform_ai_tagging(batch_df, selected_category_definitions, analysis_prompt)
-                        if tagged_df is not None and not tagged_df.empty:
-                            all_tagged_results.append(tagged_df)
-                        
-                        time.sleep(TAGGING_SLEEP_TIME) 
-
-                    if not all_tagged_results:
-                        raise Exception("AIタグ付け処理(Pass 1)に失敗しました。")
-                    
-                    tagged_results_df = pd.concat(all_tagged_results, ignore_index=True)
-
-                    # --- (★) 5. AI地名推論 (Pass 2) ---
-                    
-                    temp_merged_df = pd.merge(master_df_for_tagging, tagged_results_df, on='id', how='left')
-                    
-                    rows_needing_inference = temp_merged_df[
-                        temp_merged_df['市区町村キーワード'].isnull() | (temp_merged_df['市区町村キーワード'] == '')
-                    ]
-                    
-                    all_inferred_results = []
-                    total_inference_rows = len(rows_needing_inference)
-                    
-                    if total_inference_rows > 0:
-                        logger.info(f"AI地名推論(Pass 2) 開始。対象: {total_inference_rows}件")
-                        norm_maps = get_location_normalization_maps(JAPAN_GEOGRAPHY_DB, analysis_prompt)
-                        
-                        total_inf_batches = (total_inference_rows + TAGGING_BATCH_SIZE - 1) // TAGGING_BATCH_SIZE
-                        
-                        for i in range(0, total_inference_rows, TAGGING_BATCH_SIZE):
-                            if st.session_state.cancel_analysis:
-                                raise Exception("分析がキャンセルされました")
-                            
-                            batch_df = rows_needing_inference.iloc[i:i + TAGGING_BATCH_SIZE]
-                            current_batch_num = (i // TAGGING_BATCH_SIZE) + 1
-                            
-                            update_progress_ui(
-                                progress_placeholder, log_placeholder, tip_placeholder,
-                                min(i + TAGGING_BATCH_SIZE, total_inference_rows), total_inference_rows,
-                                f"AI地名推論[2/2] (バッチ {current_batch_num}/{total_inf_batches})"
-                            )
-
-                            inferred_df = perform_ai_location_inference(batch_df, analysis_prompt, norm_maps)
-                            if inferred_df is not None and not inferred_df.empty:
-                                all_inferred_results.append(inferred_df)
-                            
-                            time.sleep(TAGGING_SLEEP_TIME) 
-                        
-                        if all_inferred_results:
-                            inferred_results_df = pd.concat(all_inferred_results, ignore_index=True)
-                            
-                            # (★) --- [修正] 重複ラベルエラー対策 ---
-                            # set_index('id') の前に、id 列で重複を削除する
-                            logger.info(f"Pass 1 (Tagging) 重複チェック前: {len(tagged_results_df)}件")
-                            tagged_results_df.drop_duplicates(subset=['id'], keep='first', inplace=True)
-                            logger.info(f"Pass 1 (Tagging) 重複チェック後: {len(tagged_results_df)}件")
-                            
-                            logger.info(f"Pass 2 (Inference) 重複チェック前: {len(inferred_results_df)}件")
-                            inferred_results_df.drop_duplicates(subset=['id'], keep='first', inplace=True)
-                            logger.info(f"Pass 2 (Inference) 重複チェック後: {len(inferred_results_df)}件")
-                            # (★) --- 修正ここまで ---
-                            
-                            tagged_results_df = tagged_results_df.set_index('id')
-                            inferred_results_df = inferred_results_df.set_index('id')
-                            
-                            tagged_results_df['市区町村キーワード'].fillna(inferred_results_df['inferred_location'], inplace=True)
-                            tagged_results_df.loc[tagged_results_df['市区町村キーワード'] == '', '市区町村キーワード'] = inferred_results_df['inferred_location']
-                            
-                            tagged_results_df = tagged_results_df.reset_index()
-                            logger.info("AI地名推論(Pass 2)の結果をマージしました。")
-
-                    # --- 6. 最終マージ ---
-                    logger.info("全AIタグ付け結果結合...");
-                    
-                    logger.info("最終マージ処理開始...");
-                    final_df = pd.merge(master_df_for_tagging, tagged_results_df, on='id', how='right')
-                    
-                    final_cols = list(master_df_for_tagging.columns) + [col for col in tagged_results_df.columns if col not in master_df_for_tagging.columns]
-                    final_df = final_df[final_cols]
-
-                    st.session_state.tagged_df_A = final_df
-                    logger.info("Step A 分析処理 正常終了");
-                    st.success("AIによる分析処理が完了しました。");
-                    progress_placeholder.progress(1.0, text="処理完了")
-                    
-                    update_progress_ui(
-                        progress_placeholder, log_placeholder, tip_placeholder, 
-                        total_rows, total_rows, "処理完了"
-                    )
-                    
-                    tip_placeholder.empty()
-
-            except Exception as e:
-                logger.error(f"Step A 分析実行中にエラー: {e}", exc_info=True)
-                st.error(f"分析実行中にエラーが発生しました: {e}")
-                if 'progress_placeholder' in locals():
-                    progress_placeholder.progress(1.0, text="エラーにより処理中断")
-                if 'tip_placeholder' in locals():
-                    tip_placeholder.empty()
+        except Exception as e:
+            st.error(f"Error: {e}")
 
     if not st.session_state.tagged_df_A.empty:
-        st.header("Step 6: 分析結果の確認とエクスポート")
-        st.dataframe(st.session_state.tagged_df_A.head(50))
-
-        @st.cache_data
-        def convert_df_to_csv(df: pd.DataFrame) -> bytes:
-            """DataFrameをUTF-8-SIGエンコードのCSV (bytes) に変換する"""
-            return df.to_csv(encoding="utf-8-sig", index=False).encode("utf-8-sig")
-
-        csv_data = convert_df_to_csv(st.session_state.tagged_df_A)
-        st.download_button(
-            label="分析結果CSV (Curated_Data.csv) をダウンロード",
-            data=csv_data,
-            file_name="Curated_Data.csv",
-            mime="text/csv",
-        )
+        st.dataframe(st.session_state.tagged_df_A.head())
+        csv = st.session_state.tagged_df_A.to_csv(index=False, encoding='utf-8-sig').encode('utf-8-sig')
+        st.download_button("CSVダウンロード (手動)", csv, "Curated_Data.csv", "text/csv")
         st.info("このCSVファイルを、Step B でアップロードして分析を続けてください。")
 
 import networkx as nx # (★) Step B (共起ネットワーク) で必要
