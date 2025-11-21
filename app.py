@@ -8,6 +8,7 @@
 # ---
 
 # --- 1. ライブラリのインポート ---
+# --- 1. ライブラリのインポート ---
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -15,55 +16,29 @@ import os
 import re
 import json
 import logging
-import random  
 import time
+import base64
+from io import StringIO, BytesIO
+from typing import Optional, Dict, List, Any
+from dotenv import load_dotenv
+
+# (★) AWS関連ライブラリ
 import boto3
 from botocore.exceptions import ClientError
+
+# 既存の可視化・分析ライブラリ
 import spacy
-import altair as alt
 import networkx as nx
 from networkx.algorithms import community
 from pyvis.network import Network
 import streamlit.components.v1 as components
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
-from io import StringIO, BytesIO
-from typing import Optional, Dict, List, Any, Union, Set
-from dotenv import load_dotenv  # (★) .env読み込みのために追加
 import matplotlib
-matplotlib.use('Agg') # (★) Streamlitのバックエンドで動作させるためのおまじない
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
-import base64
 from wordcloud import WordCloud
 
-# (★) --- matplotlib 日本語フォント設定 ---
-# DockerfileでインストールしたIPAフォントのパスを指定
-# (★) ご注意: ローカル環境で実行する場合、このフォントパスが異なる場合があります。
-# (★) Docker環境 (Debianベース) を前提としています。
-try:
-    # (★) Dockerfile内のパス
-    font_path = '/usr/share/fonts/opentype/ipafont-gothic/ipagp.ttf' 
-    if os.path.exists(font_path):
-        fm.fontManager.addfont(font_path)
-        plt.rcParams['font.family'] = 'IPAGothic'
-        # logger.info(f"日本語フォント '{font_path}' を読み込みました。")
-    else:
-        # (★) フォールバック (環境によって調整が必要)
-        logger.warning(f"日本語フォント '{font_path}' が見つかりません。グラフの日本語が文字化けする可能性があります。")
-        # (★) 代替フォントの検索 (やや時間がかかるが堅牢)
-        try:
-            jp_font = fm.findfont(fm.FontProperties(family='IPAexGothic'))
-            plt.rcParams['font.family'] = 'IPAexGothic'
-            logger.info(f"代替フォント '{jp_font}' を使用します。")
-        except:
-             logger.error("代替の日本語フォントも見つかりません。")
-             plt.rcParams['font.family'] = 'sans-serif'
-except Exception as e:
-    logger.error(f"matplotlib日本語フォント設定エラー: {e}")
-
-# (★) LangChain / Google Generative AI のインポート
-# ライセンス: Apache License 2.0
+# LangChain関連 (Step B以降で使用)
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import PromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -75,55 +50,25 @@ try:
     from pptx import Presentation
     from pptx.util import Inches, Pt
 except ImportError:
-    st.error(
-        "PowerPoint生成ライブラリ(python-pptx)が見つかりません。"
-        "pip install python-pptx を実行してください。"
-    )
+    st.error("pip install python-pptx を実行してください。")
 
-# (★) Step D (ドラッグ＆ドロップUI) で必要となるライブラリ
-# ライセンス: MIT License
+# UIライブラリ
 try:
     from streamlit_sortables import sort_items
 except ImportError:
-    st.error(
-        "UIライブラリ(streamlit-sortables)が見つかりません。"
-        "pip install streamlit-sortables を実行してください。"
-    )
+    st.error("pip install streamlit-sortables を実行してください。")
 
-# 既存のライブラリ (openpyxl, ja_core_news_sm) のインポート
+# Excel読み込み
 try:
     import openpyxl
 except ImportError:
-    st.error("Excel (openpyxl) がインストールされていません。`pip install openpyxl` してください。")
-try:
-    import ja_core_news_sm
-except ImportError:
-    st.error("spaCy日本語モデル (ja_core_news_sm) が見つかりません。`python -m spacy download ja_core_news_sm` してください。")
+    pass
 
-# --- 2. (★) 定数定義 ---
+# .env読み込み
+load_dotenv()
 
-# (★) 要件に基づき、使用するAIモデルを定数として定義
-MODEL_FLASH_LITE = "gemini-2.5-flash-lite" # Step A, B (高速・効率的)
-MODEL_FLASH = "gemini-2.5-flash"         # Step D (代替)
-MODEL_PRO = "gemini-2.5-pro"             # Step C, D (高品質)
+# --- 2. (★) 定数・AWS設定 ---
 
-# バッチサイズと待機時間 (KISS)
-FILTER_BATCH_SIZE = 50
-FILTER_SLEEP_TIME = 7.6# Rate Limit 対策 (10 requests per 60 seconds)
-TAGGING_BATCH_SIZE = 50  
-TAGGING_SLEEP_TIME = 7.6# Rate Limit 対策
-
-# 地名辞書
-try:
-    from geography_db import JAPAN_GEOGRAPHY_DB
-except ImportError:
-    st.error("地名辞書ファイル (geography_db.py) が見つかりません。")
-    JAPAN_GEOGRAPHY_DB = {}
-
-COLOR_PALETTE = [
-    "#FF5733", "#33FF57", "#3357FF", "#FF33A1", "#33FFF6",
-    "#F3FF33", "#FF8C33", "#8C33FF", "#33FF8C", "#FF338C"
-]
 # AWS 設定 (環境変数から読み込み)
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
@@ -134,20 +79,22 @@ BEDROCK_S3_OUTPUT_BUCKET = os.getenv("BEDROCK_S3_OUTPUT_BUCKET")
 BEDROCK_ROLE_ARN = os.getenv("BEDROCK_ROLE_ARN")
 
 # バッチ推論に使用するモデル (Nova Lite)
-# ※ us-east-1 で利用可能なモデルID
 BATCH_MODEL_ID = "amazon.nova-lite-v1:0" 
 
 # Step B以降で使用するGeminiモデル
 MODEL_FLASH_LITE = "gemini-2.5-flash-lite"
 MODEL_PRO = "gemini-2.5-pro"
+
+COLOR_PALETTE = [
+    "#FF5733", "#33FF57", "#3357FF", "#FF33A1", "#33FFF6",
+    "#F3FF33", "#FF8C33", "#8C33FF", "#33FF8C", "#FF338C"
+]
 # --- 3. ロガー設定 ---
 class StreamlitLogHandler(logging.Handler):
-    """Streamlitのセッションステートにログメッセージを追加するハンドラ"""
     def __init__(self):
         super().__init__()
         if 'log_messages' not in st.session_state:
             st.session_state.log_messages = []
-
     def emit(self, record):
         log_entry = self.format(record)
         st.session_state.log_messages.append(log_entry)
@@ -230,9 +177,7 @@ def download_results_from_s3(output_key_prefix: str) -> str:
     if not s3: return ""
     
     try:
-        # Bedrockの出力は <output_key>/<job_id>.jsonl.out のような構造になるためリストする
         objects = s3.list_objects_v2(Bucket=BEDROCK_S3_OUTPUT_BUCKET, Prefix=output_key_prefix)
-        
         full_result = ""
         if 'Contents' in objects:
             for obj in objects['Contents']:
@@ -247,130 +192,48 @@ def download_results_from_s3(output_key_prefix: str) -> str:
 # --- 4. (★) AIモデル・NLPモデルのキャッシュ管理 ---
 
 @st.cache_resource(ttl=3600)
-def get_llm(
-    model_name: str, 
-    temperature: float = 0.0,
-    timeout_seconds: int = 120  # (★) --- 修正: タイムアウト引数を追加 (デフォルト120秒) ---
-) -> Optional[ChatGoogleGenerativeAI]:
-    """
-    指定されたモデル名、温度、タイムアウトでLLM (Google Gemini) モデルをロード・キャッシュする。
-    """
+def get_llm(model_name: str, temperature: float = 0.0, timeout_seconds: int = 120) -> Optional[ChatGoogleGenerativeAI]:
     try:
         api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            logger.error(f"get_llm: GOOGLE_API_KEY がありません (Model: {model_name})")
-            return None
-
-        llm = ChatGoogleGenerativeAI(
-            model=model_name,
-            temperature=temperature,
-            convert_system_message_to_human=True,
-            api_key=api_key,
-            request_timeout=timeout_seconds # (★) --- 修正: タイムアウトを渡す ---
+        if not api_key: return None
+        return ChatGoogleGenerativeAI(
+            model=model_name, temperature=temperature, api_key=api_key, request_timeout=timeout_seconds
         )
-        logger.info(f"LLM Model ({model_name}) loaded successfully (Timeout: {timeout_seconds}s).")
-        return llm
-    except Exception as e:
-        logger.error(f"LLM ({model_name}) の初期化に失敗: {e}", exc_info=True)
-        st.error(f"AIモデル ({model_name}) のロードに失敗しました: {e}")
+    except Exception:
         return None
 
 @st.cache_resource
 def load_spacy_model() -> Optional[spacy.language.Language]:
-    """spaCyの日本語モデル(ja_core_news_sm)をロード・キャッシュする"""
     try:
-        logger.info("Loading spaCy model (ja_core_news_sm)...")
         nlp = spacy.load("ja_core_news_sm")
-        logger.info("spaCy model loaded successfully.")
         return nlp
-    except Exception as e:
-        logger.error(f"Failed to load spaCy model: {e}", exc_info=True)
+    except Exception:
         return None
 
-@st.cache_data(ttl=3600) # 1時間キャッシュ
+@st.cache_data(ttl=3600)
 def get_analysis_tips_list_from_ai() -> List[str]:
-    """
-    (★) 待機時間中に表示する「データ分析に関するTips」をAIで生成する。
-    モデル: MODEL_FLASH_LITE (gemini-2.5-flash-lite)
-    """
-    logger.info("get_analysis_tips_list_from_ai: AI (Flash Lite) でTIPSを生成します。")
     llm = get_llm(model_name=MODEL_FLASH_LITE, temperature=0.5)
-    if llm is None:
-        return ["AIモデルの読み込みに失敗しました。"]
-
-    prompt = PromptTemplate.from_template(
-        """
-        あなたはデータサイエンティストのメンターです。
-        データ分析の初心者から中級者に向けて、役立つ「ヒントやTIPS」を【10個】、JSONのリスト形式で生成してください。
-        
-        # 指示:
-        1. 各TIPSは、1〜2文の簡潔な日本語の文字列にすること。
-        2. 例: 「'平均値'だけでなく'中央値'も見ることで、外れ値の影響を把握できます。」
-        3. 例: 「データを可視化する前に、まずデータの'欠損値'と'型'を確認しましょう。」
-        4. 出力はJSONリスト形式（ ["TIPS1", "TIPS2", ...] ）のみ。
-        
-        # 回答 (JSONリスト形式のみ):
-        """
-    )
-    chain = prompt | llm | StrOutputParser()
-    
+    if llm is None: return ["AIモデルの読み込みに失敗しました。"]
     try:
+        chain = PromptTemplate.from_template("データ分析のTIPSを10個、JSONリスト形式で出力して。") | llm | StrOutputParser()
         response_str = chain.invoke({})
-        logger.debug(f"AI TIPS生成(生): {response_str}")
-        
-        # マークダウンや不要なテキストを除去し、JSONのみを抽出
         match = re.search(r'\[.*\]', response_str, re.DOTALL)
-        if not match:
-            logger.warning("AIがTIPSリスト(JSON)の生成に失敗しました。")
-            return ["分析TIPSの取得に失敗しました。"]
-        
-        json_str = match.group(0)
-        tips_list = json.loads(json_str)
-        
-        if isinstance(tips_list, list) and all(isinstance(tip, str) for tip in tips_list):
-            logger.info(f"AI TIPS {len(tips_list)}件の生成に成功。")
-            return tips_list
-        else:
-            raise Exception("AIの回答が文字列のリスト形式ではありません。")
-            
-    except Exception as e:
-        logger.error(f"AI TIPS生成中にエラー: {e}", exc_info=True)
-        return [
-            "TIPSの読み込みに失敗しました。",
-            "データ分析は、まず目的（KGI/KPI）を明確にすることから始まります。",
-            "「なぜ？」を5回繰り返すことで、分析の真の目的にたどり着くことがあります。",
-            "良い分析は、良い「問い」から生まれます。",
-            "データは「集める」ことより「どう使うか」が重要です。"
-        ]
+        if match: return json.loads(match.group(0))
+    except Exception: pass
+    return ["データを可視化する前に、まずデータの欠損値と型を確認しましょう。"]
 
 # --- 5. ファイル読み込みヘルパー ---
-def read_file(file: st.runtime.uploaded_file_manager.UploadedFile) -> (Optional[pd.DataFrame], Optional[str]):
-    """アップロードされたファイル(Excel/CSV)をPandas DataFrameとして読み込む"""
-    file_name = file.name
-    logger.info(f"ファイル読み込み開始: {file_name}")
+def read_file(file) -> (Optional[pd.DataFrame], Optional[str]):
     try:
-        if file_name.endswith('.csv'):
-            # 文字コードを自動判別
-            try:
-                content = file.getvalue().decode('utf-8-sig')
-            except UnicodeDecodeError:
-                logger.warning(f"UTF-8-SIGデコード失敗。CP932で再試行: {file_name}")
-                content = file.getvalue().decode('cp932')
-            df = pd.read_csv(StringIO(content))
-
-        elif file_name.endswith(('.xlsx', '.xls')):
-            df = pd.read_excel(BytesIO(file.getvalue()), engine='openpyxl')
-        else:
-            msg = f"サポート外のファイル形式: {file_name}"
-            logger.warning(msg)
-            return None, msg
-
-        logger.info(f"ファイル読み込み成功: {file_name}")
-        return df, None
+        if file.name.endswith('.csv'):
+            try: content = file.getvalue().decode('utf-8-sig')
+            except: content = file.getvalue().decode('cp932')
+            return pd.read_csv(StringIO(content)), None
+        elif file.name.endswith(('.xlsx', '.xls')):
+            return pd.read_excel(BytesIO(file.getvalue()), engine='openpyxl'), None
     except Exception as e:
-        logger.error(f"ファイル読み込みエラー ({file_name}): {e}", exc_info=True)
-        st.error(f"ファイル「{file_name}」の読み込み中にエラー: {e}")
-        return None, f"読み込みエラー: {e}"
+        return None, str(e)
+    return None, "未対応のファイル形式"
 
 
 # --- 6. (★) Step A: AIタグ付け関連関数 ---
